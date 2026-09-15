@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 本地数据库
+duty_system.db
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 导出文件（示例命名，避免误提交）
+值班排班表*.xlsx
+值班排班表*.csv
+值班排班表*.png
+请假记录.xlsx
+甘特图*.xlsx
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

@@ -237,6 +237,52 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py
 
 ---
 
+## 打包发布（GitHub Actions）
+
+仓库内置工作流 [`.github/workflows/build.yml`](.github/workflows/build.yml)：**测试门禁（Ubuntu）→ 构建 Windows / macOS → 发布**，任一环节失败即中止。
+
+| 产物 | 运行器 | 架构 | 说明 |
+| --- | --- | --- | --- |
+| `DutyScheduler.exe` | `windows-latest` | x86_64（Intel/AMD 64 位） | 单文件、无控制台窗口，双击运行 |
+| `DutyScheduler-macOS-arm64.dmg` | `macos-latest` | arm64（Apple Silicon 原生） | 含 Applications 拖拽安装 |
+
+**双轨发布（避免代码更新后的版本号问题）**：
+
+| 推送内容 | 发布结果 | 版本号 |
+| --- | --- | --- |
+| 日常推送 `main` | 滚动覆盖式 **nightly** 预发布（自动删除上一次 nightly，标题带 commit 短哈希，可追溯） | 无需打版本号 |
+| 推送 `v*` 标签（如 `v1.0.0`） | **正式 Release**（非预发布，自动生成变更说明） | tag 即版本号 |
+| PR / 手动触发 | 不发布，产物仅存 Artifacts（30 天） | — |
+
+即：代码更新不需要每次膨胀版本号——日常更新自动滚动进 nightly，只有正式发版才打 tag。
+
+**打包版数据目录**（与源码运行不同）：
+
+- Windows：数据库 `duty_system.db` 存放在 exe 同目录（绿色软件，随 exe 移动）；
+- macOS：存放在 `~/Library/Application Support/DutySystem/`（.app 包内容不可写、签名不可破坏）；该目录不可写时自动回退 `~/.dutysystem/`；
+- 界面左侧「数据存储」卡片在打包版中同样可用。
+
+**macOS 首次打开提示**：CI 打包的应用未经 Apple 开发者签名/公证，首次打开若提示"无法验证开发者"，请右键点击应用 →「打开」，或执行 `xattr -cr /Applications/DutyScheduler.app` 后再打开。
+
+**本地打包**（可选，CI 即执行以下命令）：
+
+```bash
+pip install -r requirements.txt pyinstaller
+
+# Windows（PowerShell）
+pyinstaller --noconfirm --clean --onefile --windowed --name DutyScheduler --hidden-import xlrd app.py
+
+# macOS（Apple Silicon 原生）
+pyinstaller --noconfirm --clean --windowed --name DutyScheduler --hidden-import xlrd app.py
+rm -rf dmg && mkdir dmg
+cp -R "dist/DutyScheduler.app" dmg/ && ln -s /Applications dmg/Applications
+hdiutil create -volname "DutyScheduler" -srcfolder dmg -ov -format UDZO "DutyScheduler-macOS-arm64.dmg"
+```
+
+> 注：如需 Intel Mac（x86_64）版本，在 workflow 的 macOS 作业中给 `setup-python` 增加 `architecture: x64`（Rosetta 2 构建），并把产物名与架构断言改为 x86_64 即可。
+
+---
+
 ## 项目结构
 
 ```
@@ -246,6 +292,7 @@ automatic_work_duty_system/
 ├── requirements.txt          # 依赖清单
 ├── duty_system.db            # SQLite 数据库（运行时自动创建）
 ├── samples/                  # 示例课表（.xls）
+├── .github/workflows/build.yml  # CI：打包 Windows exe / macOS dmg 并发布 Release
 └── duty_system/              # 核心包
     ├── parser.py             # 课表解析：.xls/.xlsx → 课程记录（周次/节次/姓名/学号）
     ├── database.py            # 数据层：members / courses / duty_assignments / leaves
