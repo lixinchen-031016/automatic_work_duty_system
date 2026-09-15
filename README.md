@@ -83,6 +83,7 @@
 - 修改参数或成员后，旧结果标记"⚠ 可能过期"，提示重新生成。
 - 双击成员列表直接跳转「成员课表」页并定位该成员。
 - 空数据时有引导提示（如何上传、如何生成）。
+- **数据库存储位置可自定义**：左侧「数据存储」卡片可更改数据库位置——现有数据自动复制到新位置（原文件保留）；若目标目录已有同名数据库文件，则安全切换为使用该文件（可用于恢复备份），不覆盖任何数据。
 - 固定随机种子可复现同一份排班，改种子可换一版均衡方案。
 
 ---
@@ -125,7 +126,7 @@ PySide6>=6.7     # 桌面界面
 
 > **注意（TRAE / 部分终端环境）**：若启动报 Qt 或 import 错误，请使用
 > `env -u PYTHONHOME -u PYTHONPATH .venv/bin/python app.py`
-> 以清除干扰的环境变量。
+> 以清除干扰的环境变量（仅 macOS/Linux 需要；Windows 正常执行 `.venv\Scripts\python app.py` 即可）。
 
 ---
 
@@ -162,6 +163,7 @@ PySide6>=6.7     # 桌面界面
 | | 值班时段（5 个节次块） | 1-2节 / 3-4节 / 5-6节 / 7-8节 / 9-11节 |
 | | 每时段人数 / 每周上限 / 每天上限 / 随机种子 | 种子固定可复现排班 |
 | | 学期起始日 | 第一周周一，用于日期换算 |
+| 数据存储 | 当前数据库路径（悬停查看完整路径）/ 更改位置… | 迁移数据或切换已有库，位置经 QSettings 记忆 |
 | 主按钮 | 生成排班表 | 按当前参数生成（增量：范围外周保留） |
 
 ### 右侧六个页签
@@ -208,7 +210,7 @@ PySide6>=6.7     # 桌面界面
 
 ## 数据存储
 
-单一 SQLite 文件 `duty_system.db`（项目根目录，自动创建）：
+单一 SQLite 文件 `duty_system.db`（默认位于程序目录，可通过左侧「数据存储」卡片自定义位置，自动创建）：
 
 | 表 | 字段 | 说明 |
 | --- | --- | --- |
@@ -217,6 +219,8 @@ PySide6>=6.7     # 桌面界面
 | `duty_assignments` | id, week, weekday, block, member_id, member_name；UNIQUE(week, weekday, block, member_id) | 值班安排 |
 | `leaves` | id, member_id, week, weekday, reason；UNIQUE(member_id, week, weekday) | 请假记录 |
 
+- **存储位置**：自定义位置记录于 QSettings（`database/path`），启动时优先使用；若该路径已不存在（如磁盘移除），自动回退到程序目录下的默认数据库。
+- **迁移安全**：更改位置时现有数据复制到新位置、原文件保留；所选目录已有同名数据库文件时，切换为使用该文件而不覆盖（可用于在多台设备间搬运/恢复数据）。
 - 删除成员时其课程、值班、请假记录级联删除。
 - 界面参数（不含排班结果）另存于 QSettings。
 - 备份：直接复制 `duty_system.db` 文件即可完整备份全部数据。
@@ -285,6 +289,22 @@ automatic_work_duty_system/
 
 **Q：随机种子是干什么的？**
 平手时决定分给谁。固定种子 = 同样参数生成完全相同的排班（可复现）；换一个种子 = 换一版同样均衡的方案。
+
+**Q：能在 Windows 上运行吗？**
+能，无需修改任何代码。已逐项验证：依赖（PySide6/pandas/xlrd/openpyxl）均提供 Windows 官方轮子；界面字体全部使用 Qt 默认字体（无 macOS 专用字体声明，Windows 自动回退 Segoe UI / 微软雅黑）；数据库路径基于 `Path(__file__)`，QSS 图标路径已做 `as_posix()` 处理；CSV 带 UTF-8 BOM，Windows Excel 双击打开不乱码；全项目无平台专用 API。安装与启动：
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+.venv\Scripts\python app.py
+```
+
+Windows 使用注意事项：
+
+1. **项目目录放在用户可写位置**（如 `D:\duty_system`，不要放 `C:\Program Files`）——数据库 `duty_system.db` 在程序目录下创建和写入；
+2. **参数持久化位置不同**：Windows 存于注册表 `HKCU\Software\DutySystem\DutyScheduler`（macOS 为偏好设置文件），功能一致，删除对应注册表项即可重置参数；
+3. Python 版本需 **3.10 及以上**（代码使用 `int | None` 联合类型语法）。
 
 **Q：如何在终端/TRAE 环境运行脚本？**
 若遇 Python 环境变量冲突（Qt 报错或 import 异常），使用：

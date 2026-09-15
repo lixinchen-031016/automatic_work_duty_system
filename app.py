@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 from collections import Counter
@@ -429,8 +430,11 @@ class BarChart(QFrame):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, db_path: str | Path = DB_PATH):
+    def __init__(self, db_path: str | Path | None = None):
         super().__init__()
+        if db_path is None:
+            stored = QSettings().value("database/path", "", type=str)
+            db_path = Path(stored) if stored and Path(stored).exists() else DB_PATH
         self.db = Database(db_path)
         self.result: ScheduleResult | None = None
         self.gantt_matrix: AvailabilityMatrix | None = None
@@ -583,6 +587,22 @@ class MainWindow(QMainWindow):
         self.btn_generate.setMinimumHeight(42)
         self.btn_generate.clicked.connect(self.generate)
         layout.addWidget(self.btn_generate)
+
+        grp_data = QGroupBox("数据存储")
+        dl = QHBoxLayout(grp_data)
+        dl.setContentsMargins(8, 4, 8, 8)
+        dl.setSpacing(8)
+        self.db_path_label = QLabel()
+        self.db_path_label.setToolTip("")
+        btn_change_db = QPushButton("更改位置…")
+        btn_change_db.setToolTip(
+            "更改数据库存储位置：现有数据自动复制到新位置（原文件保留）；\n"
+            "若所选目录已有同名数据库文件，则切换为使用该文件。")
+        btn_change_db.clicked.connect(self.change_db_location)
+        dl.addWidget(self.db_path_label, stretch=1)
+        dl.addWidget(btn_change_db)
+        layout.addWidget(grp_data)
+        self._update_db_path_label()
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -818,6 +838,62 @@ class MainWindow(QMainWindow):
         self._stale = False
         self.refresh_schedule_tabs()
         self.refresh_gantt()
+
+    # ---------- 数据存储位置 ----------
+
+    def _update_db_path_label(self) -> None:
+        path = Path(self.db.path)
+        fm = QFontMetrics(self.db_path_label.font())
+        text = fm.elidedText(f"{path.name} · {path.parent}", Qt.ElideMiddle, 230)
+        self.db_path_label.setText(text)
+        self.db_path_label.setToolTip(str(path))
+
+    def change_db_location(self) -> None:
+        """更改数据库存储位置：迁移现有数据或切换到已有数据库文件"""
+        current = Path(self.db.path)
+        folder = QFileDialog.getExistingDirectory(self, "选择数据库存储位置", str(current.parent))
+        if not folder:
+            return
+        new_path = Path(folder) / current.name
+        if new_path == current:
+            QMessageBox.information(self, "提示", "数据库已位于该位置。")
+            return
+        if new_path.exists():
+            ret = QMessageBox.question(
+                self, "切换到已有数据库",
+                f"所选目录已存在 {current.name}：\n{new_path}\n\n"
+                "是否切换为使用该数据库文件？其中的数据将替代当前界面内容；\n"
+                "当前数据库文件仍保留在原位置，不会被修改。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+            migrated = False
+        else:
+            shutil.copy2(current, new_path)
+            migrated = True
+        QSettings().setValue("database/path", str(new_path))
+        self.db = Database(new_path)
+        self._update_db_path_label()
+        self.result = None
+        self._last_config = None
+        self._stale = False
+        self.refresh_members()
+        self._restore_result()
+        if self.result is None:
+            self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
+            for tb in (self.pivot_table, self.detail_table, self.stats_table, self.gap_table):
+                fill_table(tb, pd.DataFrame())
+            self.btn_export_xlsx.setEnabled(False)
+            self.btn_export_csv.setEnabled(False)
+            self.btn_export_png.setEnabled(False)
+            self.gap_title.setText("无人可值时段")
+        self.refresh_gantt()
+        self.refresh_charts()
+        if migrated:
+            self.statusBar().showMessage(
+                f"数据库已迁移至：{new_path}（原文件保留在 {current}，可手动删除）")
+        else:
+            self.statusBar().showMessage(f"已切换数据库：{new_path}")
 
     # ---------- 参数持久化 ----------
 
