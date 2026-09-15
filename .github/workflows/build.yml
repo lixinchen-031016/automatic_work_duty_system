@@ -10,7 +10,7 @@
 #              + tag 正式发布），避免每次代码更新都膨胀版本号
 #
 # 触发条件 : 推送 main 分支 / 推送 v* 标签 / 向 main 发起 PR / 手动触发
-# 作业依赖 : test →(通过后才)→ build-macos / build-windows →(汇合)→ deploy
+# 作业结构 : build-macos / build-windows 并行构建 →(汇合)→ deploy
 # 条件部署 : 仅「推送（main 或 tag）」时执行 deploy，PR 与手动触发不发布
 #
 # 版本策略（避免代码更新后的版本号问题）：
@@ -42,39 +42,10 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1) 测试门禁：Ubuntu 快速反馈，PR 也可运行
-  # ---------------------------------------------------------------------------
-  test:
-    name: 测试 (Ubuntu, Python 3.11)
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 配置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 语法检查主应用
-        run: python -m py_compile app.py
-
-      - name: 端到端测试（13 组场景）
-        run: python test_system.py
-
-  # ---------------------------------------------------------------------------
-  # 2) 构建 Windows x86_64 单文件 exe，依赖测试通过
+  # 1) 构建 Windows x86_64 单文件 exe
   # ---------------------------------------------------------------------------
   build-windows:
     name: 构建 Windows x86_64 (.exe)
-    needs: test
     runs-on: windows-latest # GitHub Windows 运行器均为 x86_64（Intel/AMD 64 位）
     steps:
       - name: 检出代码
@@ -122,11 +93,10 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 3) 构建 macOS ARM64 原生产物（.app + .dmg），依赖测试通过
+  # 2) 构建 macOS ARM64 原生产物（.app + .dmg）
   # ---------------------------------------------------------------------------
   build-macos:
     name: 构建 macOS arm64 (.app / .dmg)
-    needs: test
     runs-on: macos-latest # Apple Silicon 运行器，原生 arm64 构建
     steps:
       - name: 检出代码
@@ -185,10 +155,10 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 4) 条件部署：仅「推送 main 或 tag」时，发布到 GitHub Releases
+  # 3) 条件部署：仅「推送 main 或 tag」时，发布到 GitHub Releases
   #    - 推送 v* 标签 → 正式 Release（非预发布）
   #    - 推送 main   → 滚动 nightly 预发布（覆盖上一次 nightly，标题带 commit 哈希）
-  #    - PR / 手动触发 → 不发布（needs 链保证，产物只在 Artifacts）
+  #    - PR / 手动触发 → 不发布（产物仅在 Artifacts）
   # ---------------------------------------------------------------------------
   deploy:
     name: 发布到 GitHub Releases

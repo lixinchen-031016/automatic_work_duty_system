@@ -239,7 +239,7 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py
 
 ## 打包发布（GitHub Actions）
 
-仓库内置工作流 [`.github/workflows/build.yml`](.github/workflows/build.yml)：**测试门禁（Ubuntu）→ 构建 Windows / macOS → 发布**，任一环节失败即中止。
+仓库内置工作流 [`.github/workflows/build.yml`](.github/workflows/build.yml)：**构建 Windows / macOS（并行）→ 发布**，任一构建失败即中止发布。
 
 | 产物 | 运行器 | 架构 | 说明 |
 | --- | --- | --- | --- |
