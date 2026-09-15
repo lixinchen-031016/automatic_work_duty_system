@@ -8,7 +8,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from .database import Assignment
+from .database import Assignment, Leave, Member
 from .parser import BLOCK_LABELS, WEEKDAY_LABELS
 
 
@@ -139,3 +139,39 @@ def export_csv(
 ) -> bytes:
     """导出 CSV（UTF-8 BOM，Excel 可直接打开）"""
     return build_detail_df(assignments, start_date=start_date).to_csv(index=False).encode("utf-8-sig")
+
+
+def build_leaves_df(
+    leaves: list[Leave],
+    members: list[Member],
+    start_date: date | None = None,
+) -> pd.DataFrame:
+    """请假记录表：每行一条，含成员、周次/星期/日期与原因"""
+    info_of = {m.id: m for m in members}
+    rows = []
+    for l in sorted(leaves, key=lambda x: (x.week, x.weekday)):
+        m = info_of.get(l.member_id)
+        rows.append({
+            "成员": m.name if m else "已删除成员",
+            "学号": m.student_id if m else "",
+            "周次": f"第{l.week}周",
+            "星期": WEEKDAY_LABELS[l.weekday],
+            "日期": _date_label(start_date, l.week, l.weekday) if start_date else "",
+            "原因": l.reason,
+        })
+    columns = ["成员", "学号", "周次", "星期"] + (["日期"] if start_date else []) + ["原因"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def export_leaves_excel(
+    leaves: list[Leave],
+    members: list[Member],
+    start_date: date | None = None,
+) -> bytes:
+    """导出请假记录 Excel（单表，供请假登记处一键导出）"""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        build_leaves_df(leaves, members, start_date=start_date).to_excel(
+            writer, sheet_name="请假记录", index=False)
+        _beautify(writer)
+    return buf.getvalue()

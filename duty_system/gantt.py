@@ -11,7 +11,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, field
 
-from .database import CourseRecord, Leave, Member
+from .database import Assignment, CourseRecord, Leave, Member
 from .parser import BLOCK_LABELS, BLOCK_SESSIONS, WEEKDAY_LABELS
 from .scheduler import build_busy_map
 
@@ -26,6 +26,7 @@ class AvailabilityMatrix:
     busy_courses: dict[tuple[int, int, int], list[str]]     # (行号, 星期, 时段) -> 忙时课程名
     free_counts: list[int]                                 # 各时段空闲人数
     leave_info: dict[tuple[int, int], str] = field(default_factory=dict)  # (行号, 星期) -> 请假原因
+    duty_cells: set[tuple[int, int, int]] = field(default_factory=set)  # (行号, 星期, 时段) -> 已排值班
 
     @property
     def member_count(self) -> int:
@@ -53,11 +54,14 @@ def build_availability(
     weekdays: list[int],
     blocks: list[int],
     leaves: list[Leave] | None = None,
+    assignments: list[Assignment] | None = None,
 ) -> AvailabilityMatrix:
-    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用）"""
+    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）"""
     busy = build_busy_map(members, courses)
     leave_map = {(l.member_id, l.weekday): l.reason
                  for l in (leaves or []) if l.week == week}
+    duty_set = {(a.member_id, a.weekday, a.block)
+                for a in (assignments or []) if a.week == week}
     # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）
     course_index: dict[tuple[int, int, int], set[str]] = {}
     member_ids = {m.id for m in members}
@@ -71,6 +75,7 @@ def build_availability(
     free: list[list[bool]] = []
     busy_courses: dict[tuple[int, int, int], list[str]] = {}
     leave_info: dict[tuple[int, int], str] = {}
+    duty_cells: set[tuple[int, int, int]] = set()
     for m in members:
         row = len(free)  # 当前行号
         row_free: list[bool] = []
@@ -78,6 +83,10 @@ def build_availability(
             if (m.id, d) in leave_map:
                 row_free.append(False)
                 leave_info[(row, d)] = leave_map[(m.id, d)]
+                continue
+            if (m.id, d, b) in duty_set:
+                row_free.append(False)
+                duty_cells.add((row, d, b))
                 continue
             names: set[str] = set()
             is_free = True
@@ -99,6 +108,7 @@ def build_availability(
         busy_courses=busy_courses,
         free_counts=free_counts,
         leave_info=leave_info,
+        duty_cells=duty_cells,
     )
 
 
@@ -112,6 +122,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
     BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
     ALL_FREE_FILL = PatternFill("solid", fgColor="FFD9A8")
     LEAVE_FILL = PatternFill("solid", fgColor="FFD6D2")
+    DUTY_FILL = PatternFill("solid", fgColor="B8D9FF")
     HEADER_FILL = PatternFill("solid", fgColor="007AFF")
     THIN = Side(style="thin", color="FFFFFF")
 
@@ -142,7 +153,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 成员行：空闲绿色、有课灰色、请假红色
+    # 成员行：空闲绿色、有课灰色、请假红色、值班蓝色
     border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
     for r, name in enumerate(matrix.member_names):
         row = 3 + r
@@ -158,6 +169,10 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
                                value=f"请假：{leave_reason}" if leave_reason else "请假")
                 cell.fill = LEAVE_FILL
                 cell.font = Font(color="B3261E")
+            elif (r, d, b) in matrix.duty_cells:
+                cell = ws.cell(row=row, column=2 + i, value="值班")
+                cell.fill = DUTY_FILL
+                cell.font = Font(bold=True, color="0A5AA8")
             else:
                 cell = ws.cell(row=row, column=2 + i, value="" if is_free else "、".join(names))
                 cell.fill = FREE_FILL if is_free else BUSY_FILL

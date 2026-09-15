@@ -61,7 +61,10 @@ def generate_schedule(
     courses: list[CourseRecord],
     config: ScheduleConfig,
     leaves: list[Leave] | None = None,
+    base_assignments: list[Assignment] | None = None,
 ) -> ScheduleResult:
+    """base_assignments：排班范围外的已有安排（按周增量模式），
+    作为总次数均衡基数计入，且与新排班合并进返回结果。"""
     busy = build_busy_map(members, courses)
     leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
     rng = random.Random(config.seed)
@@ -71,13 +74,20 @@ def generate_schedule(
     week_cnt: Counter = Counter()   # (member_id, week) -> n
     day_cnt: Counter = Counter()    # (member_id, week, weekday) -> n
 
+    result = ScheduleResult()
+    for a in base_assignments or []:
+        result.assignments.append(a)
+        total[a.member_id] += 1
+        week_cnt[(a.member_id, a.week)] += 1
+        day_cnt[(a.member_id, a.week, a.weekday)] += 1
+        assigned_slots.add((a.member_id, a.week, a.weekday, a.block))
+
     def available(member_id: int, week: int, weekday: int, block: int) -> bool:
         return all(
             (week, weekday, s) not in busy.get(member_id, ())
             for s in BLOCK_SESSIONS[block]
         )
 
-    result = ScheduleResult()
     for week in config.weeks:
         # 本周任务池（每时段 per_slot 人）
         pending = [

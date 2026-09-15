@@ -11,7 +11,8 @@ from pathlib import Path
 
 from duty_system.database import Assignment, Database
 from duty_system.exporter import (
-    build_detail_df, build_pivot_df, export_csv, export_excel, week_date,
+    build_detail_df, build_leaves_df, build_pivot_df, export_csv, export_excel,
+    export_leaves_excel, week_date,
 )
 from duty_system.gantt import build_availability, export_gantt_excel
 from duty_system.parser import BLOCK_SESSIONS, WEEKDAY_LABELS, parse_schedule_path
@@ -222,8 +223,19 @@ def test_leaves(db: Database, members: list) -> None:
 
     db.remove_leave(mine[0].id)
     assert db.list_leaves(mid) == [], "删除请假失败"
+
+    # 请假记录导出：请假登记处按钮的数据源
+    db.add_leave(mid, 2, 3, "生病")
+    db.add_leave(members[1].id, 5, 1, "家中有事")
+    leaves = db.list_leaves()
+    xlsx = export_leaves_excel(leaves, members, start_date=date(2026, 9, 14))
+    assert xlsx[:2] == b"PK" and len(xlsx) > 4000, "请假记录 Excel 导出错误"
+    df = build_leaves_df(leaves, members, start_date=date(2026, 9, 14))
+    assert len(df) == len(leaves) and set(df.columns) >= {"成员", "周次", "星期", "日期", "原因"}
+    assert df.iloc[0]["成员"] == members[0].name and df.iloc[0]["日期"] == "9月23日", "请假记录内容错误"
+
     print(f"[7] 请假登记: 通过（排班避开请假日 {WEEKDAY_LABELS[3]}，甘特图当天标红，"
-          "登记幂等、可删除）")
+          f"登记幂等、可删除，导出 {len(leaves)} 条含日期/原因）")
 
 
 def test_manual_tweak(db: Database, members: list) -> None:
@@ -308,6 +320,101 @@ def test_week_dates(result) -> None:
     print("[9] 周次换算: 通过（起始日+(周-1)*7+(星期-1) 正确跨月/跨年；明细/透视/Excel 含日期列）")
 
 
+def test_incremental(db: Database, members: list):
+    """按周增量排班：只重排所选周，范围外历史作均衡基数保留"""
+    db.clear_assignments()
+    courses = db.get_courses()
+    cfg = dict(weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5],
+               per_slot=1, max_per_week=3, max_per_day=1)
+    first = generate_schedule(members, courses, ScheduleConfig(weeks=range(1, 4), **cfg))
+    db.save_assignments(first.assignments)
+
+    wk2 = ScheduleConfig(weeks=range(2, 3), **cfg)
+    existing = db.load_assignments()
+    base = [a for a in existing if a.week not in wk2.weeks]
+    second = generate_schedule(members, courses, wk2, base_assignments=base)
+    fresh = [a for a in second.assignments if a.week in wk2.weeks]
+
+    key = lambda a: (a.week, a.weekday, a.block, a.member_id)  # noqa: E731
+    assert sorted(key(a) for a in second.assignments if a.week != 2) == \
+        sorted(key(a) for a in base), "范围外历史排班应原样保留在合并结果中"
+
+    busy = build_busy_map(members, courses)
+    for a in fresh:
+        for s in BLOCK_SESSIONS[a.block]:
+            assert (a.week, a.weekday, s) not in busy.get(a.member_id, ()), "增量排班出现课程冲突"
+    day_cnt = Counter((a.member_id, a.week, a.weekday) for a in second.assignments)
+    assert all(v <= 1 for v in day_cnt.values()), "增量排班超出每天上限"
+    week_cnt = Counter((a.member_id, a.week) for a in second.assignments)
+    assert all(v <= 3 for v in week_cnt.values()), "增量排班超出每周上限"
+    stats = rebuild_member_stats(members, second.assignments)
+    assert sum(s["total"] for s in stats.values()) == len(second.assignments), \
+        "增量统计应包含历史基数"
+
+    db.delete_assignments_for_weeks(list(wk2.weeks))
+    db.save_assignments(fresh)
+    loaded = db.load_assignments()
+    assert sorted(key(a) for a in loaded if a.week == 1) == \
+        sorted(key(a) for a in base if a.week == 1), "第1周历史排班被破坏"
+    assert sorted(key(a) for a in loaded if a.week == 2) == \
+        sorted(key(a) for a in fresh), "第2周应替换为新排班"
+    assert len(loaded) == len(base) + len(fresh), "按周删除不应影响其他周"
+    print(f"[10] 按周增量: 通过（第2周单独重排 {len(fresh)} 人次，"
+          f"第1/3周历史 {len(base)} 人次保留，删周落库互不影响）")
+    return second
+
+
+def test_persistence(db: Database, members: list) -> None:
+    """模拟程序重启：从库恢复排班结果（app._restore_result 同款逻辑）"""
+    assignments = db.load_assignments()
+    assert assignments, "应已有排班数据"
+    config = ScheduleConfig(weeks=range(1, 4), weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5])
+    stats = rebuild_member_stats(members, assignments)
+    grid = {(w, d, b) for w in config.weeks for d in config.weekdays for b in config.blocks}
+    covered = {(a.week, a.weekday, a.block) for a in assignments}
+    gaps = sorted(g for g in grid if g not in covered)
+    assert sum(s["total"] for s in stats.values()) == len(assignments), "恢复后统计总数错误"
+    assert all(g not in covered for g in gaps), "缺口不应包含已覆盖时段"
+    names = {m.name for m in members}
+    assert all(a.member_name in names for a in assignments), "恢复的值班人姓名缺失"
+    print(f"[11] 结果恢复: 通过（{len(assignments)} 人次从库恢复，统计/缺口重算一致）")
+
+
+def test_week_export(assignments: list, members: list) -> None:
+    """按周导出：过滤某一周后透视/明细/Excel/CSV 只含该周"""
+    sel = [a for a in assignments if a.week == 2]
+    assert sel, "第2周应有排班"
+    stats = rebuild_member_stats(members, sel)
+    xlsx = export_excel(sel, stats, [], start_date=date(2026, 9, 14))
+    assert xlsx[:2] == b"PK", "单周 Excel 导出错误"
+    pivot = build_pivot_df(sel, start_date=date(2026, 9, 14))
+    assert all("第2周" in str(idx) for idx in pivot.index), "透视表应只含所选周"
+    detail = build_detail_df(sel, start_date=date(2026, 9, 14))
+    assert set(detail["周次"]) == {"第2周"}, "明细应只含所选周"
+    csv_bytes = export_csv(sel)
+    assert "第2周".encode() in csv_bytes, "CSV 应只含所选周"
+    print(f"[12] 按周导出: 通过（单周 {len(sel)} 人次，透视/明细/Excel/CSV 只含第2周）")
+
+
+def test_gantt_duty(db: Database, members: list) -> None:
+    """甘特图值班标记：已排值班格标蓝、不占空闲统计、Excel 同步"""
+    courses = db.get_courses()
+    assignments = [a for a in db.load_assignments() if a.week == 2]
+    assert assignments, "第2周应有排班"
+    m = build_availability(members, courses, week=2, weekdays=[1, 2, 3, 4, 5],
+                          blocks=[1, 2, 3, 4, 5], assignments=assignments)
+    row_of = {mem.id: r for r, mem in enumerate(members)}
+    for a in assignments:
+        r = row_of[a.member_id]
+        assert (r, a.weekday, a.block) in m.duty_cells, "值班格未标记"
+        assert m.free[r][m.slots.index((a.weekday, a.block))] is False, "值班格不应判为空闲"
+    data = export_gantt_excel(m)
+    assert data[:2] == b"PK" and len(data) > 4000, "甘特图 Excel 导出错误"
+    m2 = build_availability(members, courses, week=2, weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5])
+    assert not m2.duty_cells, "未传排班时不应有值班格"
+    print(f"[13] 甘特图值班标记: 通过（{len(assignments)} 个值班格标蓝且不占空闲统计，Excel 同步）")
+
+
 if __name__ == "__main__":
     test_parser()
     db, members = test_database()
@@ -317,5 +424,9 @@ if __name__ == "__main__":
     test_leaves(db, members)
     test_manual_tweak(db, members)
     test_week_dates(result)
+    second = test_incremental(db, members)
+    test_persistence(db, members)
+    test_week_export(second.assignments, members)
+    test_gantt_duty(db, members)
     print()
     print("全部测试通过 ✓")

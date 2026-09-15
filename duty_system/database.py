@@ -214,6 +214,14 @@ class Database:
         with self._connect() as conn:
             conn.execute("DELETE FROM duty_assignments")
 
+    def delete_assignments_for_weeks(self, weeks: list[int]) -> None:
+        """删除指定周的值班安排（按周增量重排时清空所选范围）"""
+        if not weeks:
+            return
+        ph = ",".join("?" * len(weeks))
+        with self._connect() as conn:
+            conn.execute(f"DELETE FROM duty_assignments WHERE week IN ({ph})", weeks)
+
     def save_assignments(self, assignments: list[Assignment]) -> None:
         with self._connect() as conn:
             conn.executemany(
