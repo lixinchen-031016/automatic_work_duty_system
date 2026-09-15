@@ -39,7 +39,23 @@ from duty_system.scheduler import (
     rebuild_member_stats, replacement_candidates,
 )
 
-DB_PATH = Path(__file__).parent / "duty_system.db"
+# 数据库默认位置：
+#   源码运行 → 程序目录；打包运行（PyInstaller）→ Windows 在 exe 旁（绿色软件），
+#   macOS 写入用户应用支持目录（.app 包内容不可写、签名不可破坏）；
+#   应用支持目录不可写时回退到家目录 ~/.dutysystem，避免启动即崩溃
+if getattr(sys, "frozen", False):
+    if sys.platform == "darwin":
+        _BASE = Path.home() / "Library" / "Application Support" / "DutySystem"
+        try:
+            _BASE.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _BASE = Path.home() / ".dutysystem"
+            _BASE.mkdir(parents=True, exist_ok=True)
+        DB_PATH = _BASE / "duty_system.db"
+    else:
+        DB_PATH = Path(sys.executable).resolve().parent / "duty_system.db"
+else:
+    DB_PATH = Path(__file__).parent / "duty_system.db"
 
 # 类苹果设计语言（macOS 浅色模式）：
 #   背景 #f5f5f7 / 卡片白色圆角 / 系统蓝 #007aff / 文字 #1d1d1f·#86868b
