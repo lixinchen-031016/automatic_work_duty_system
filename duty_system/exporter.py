@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from collections import defaultdict
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -11,7 +12,21 @@ from .database import Assignment
 from .parser import BLOCK_LABELS, WEEKDAY_LABELS
 
 
-def build_detail_df(assignments: list[Assignment], per_slot: int = 1) -> pd.DataFrame:
+def week_date(start_date: date, week: int, weekday: int) -> date:
+    """学期第 week 周 weekday（1=周一..7=周日）对应的日期"""
+    return start_date + timedelta(days=(week - 1) * 7 + (weekday - 1))
+
+
+def _date_label(start_date: date, week: int, weekday: int) -> str:
+    d = week_date(start_date, week, weekday)
+    return f"{d.month}月{d.day}日"
+
+
+def build_detail_df(
+    assignments: list[Assignment],
+    per_slot: int = 1,
+    start_date: date | None = None,
+) -> pd.DataFrame:
     """明细表：每行一个值班任务（周次 x 星期 x 时段），多人在岗合并显示"""
     grouped: dict[tuple[int, int, int], list[str]] = defaultdict(list)
     for a in assignments:
@@ -22,14 +37,19 @@ def build_detail_df(assignments: list[Assignment], per_slot: int = 1) -> pd.Data
         rows.append({
             "周次": f"第{week}周",
             "星期": WEEKDAY_LABELS[weekday],
+            "日期": _date_label(start_date, week, weekday) if start_date else "",
             "值班时段": BLOCK_LABELS[block],
             "值班人": "、".join(sorted(names)),
             "人数": len(names),
         })
-    return pd.DataFrame(rows, columns=["周次", "星期", "值班时段", "值班人", "人数"])
+    columns = ["周次", "星期"] + (["日期"] if start_date else []) + ["值班时段", "值班人", "人数"]
+    return pd.DataFrame(rows, columns=columns)
 
 
-def build_pivot_df(assignments: list[Assignment]) -> pd.DataFrame:
+def build_pivot_df(
+    assignments: list[Assignment],
+    start_date: date | None = None,
+) -> pd.DataFrame:
     """透视表：行=周次x星期，列=值班时段（多人用顿号连接），适合界面展示与打印"""
     grouped: dict[tuple[int, int, int], list[str]] = defaultdict(list)
     for a in assignments:
@@ -50,6 +70,8 @@ def build_pivot_df(assignments: list[Assignment]) -> pd.DataFrame:
 
     df = pd.DataFrame(data, index=pd.MultiIndex.from_tuples(
         index, names=["周次", "星期"]))
+    if start_date:
+        df.insert(0, "日期", [_date_label(start_date, w, d) for (w, d) in index])
     df.index = df.index.map(lambda t: (f"第{t[0]}周", WEEKDAY_LABELS[t[1]]))
     return df
 
@@ -69,14 +91,15 @@ def export_excel(
     assignments: list[Assignment],
     member_stats: dict[int, dict],
     gaps: list[tuple[int, int, int]],
+    start_date: date | None = None,
 ) -> bytes:
     """导出 Excel：排班总表(透视) + 值班明细 + 值班统计，返回文件字节"""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pivot = build_pivot_df(assignments)
+        pivot = build_pivot_df(assignments, start_date=start_date)
         pivot.to_excel(writer, sheet_name="排班总表", merge_cells=False)
 
-        detail = build_detail_df(assignments)
+        detail = build_detail_df(assignments, start_date=start_date)
         detail.to_excel(writer, sheet_name="值班明细", index=False)
 
         stats = build_stats_df(member_stats)
@@ -110,6 +133,9 @@ def _beautify(writer: pd.ExcelWriter) -> None:
             cell.fill = PatternFill("solid", fgColor="4472C4")
 
 
-def export_csv(assignments: list[Assignment]) -> bytes:
+def export_csv(
+    assignments: list[Assignment],
+    start_date: date | None = None,
+) -> bytes:
     """导出 CSV（UTF-8 BOM，Excel 可直接打开）"""
-    return build_detail_df(assignments).to_csv(index=False).encode("utf-8-sig")
+    return build_detail_df(assignments, start_date=start_date).to_csv(index=False).encode("utf-8-sig")

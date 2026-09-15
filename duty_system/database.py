@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS duty_assignments (
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(week, weekday, block, member_id)
 );
+
+CREATE TABLE IF NOT EXISTS leaves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    week INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(member_id, week, weekday)
+);
 """
 
 
@@ -84,6 +94,16 @@ class Assignment:
     block: int
     member_id: int
     member_name: str = ""
+
+
+@dataclass
+class Leave:
+    """请假/临时占用：某成员第 week 周 weekday 全天不可值班"""
+    id: int
+    member_id: int
+    week: int
+    weekday: int
+    reason: str = ""
 
 
 class Database:
@@ -212,4 +232,33 @@ class Database:
             return [Assignment(
                 week=r["week"], weekday=r["weekday"], block=r["block"],
                 member_id=r["member_id"], member_name=r["member_name"],
+            ) for r in rows]
+
+    # ---------- 请假 ----------
+
+    def add_leave(self, member_id: int, week: int, weekday: int, reason: str = "") -> None:
+        """登记请假（同成员同周同星期重复登记则覆盖）"""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO leaves (member_id, week, weekday, reason)
+                   VALUES (?, ?, ?, ?)""",
+                (member_id, week, weekday, reason),
+            )
+
+    def remove_leave(self, leave_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM leaves WHERE id = ?", (leave_id,))
+
+    def list_leaves(self, member_id: int | None = None) -> list[Leave]:
+        sql = "SELECT * FROM leaves"
+        params: tuple = ()
+        if member_id is not None:
+            sql += " WHERE member_id = ?"
+            params = (member_id,)
+        sql += " ORDER BY week, weekday, member_id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [Leave(
+                id=r["id"], member_id=r["member_id"], week=r["week"],
+                weekday=r["weekday"], reason=r["reason"],
             ) for r in rows]

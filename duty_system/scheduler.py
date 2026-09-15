@@ -3,7 +3,8 @@
 硬约束：
   - 值班时刻内（时段块的每一节）不能有任何课程；
   - 每人每天最多值一次（max_per_day，默认 1）；
-  - 每人每周值班不超过 max_per_week 次。
+  - 每人每周值班不超过 max_per_week 次；
+  - 请假/临时占用的 (成员, 周, 星期) 不安排值班。
 软目标：按 累计总次数 -> 本周次数 -> 当天次数 三级均衡贪心分配，
         随机种子固定可复现，平手时随机打散。
 """
@@ -14,7 +15,7 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-from .database import Assignment, CourseRecord, Member
+from .database import Assignment, CourseRecord, Leave, Member
 from .parser import BLOCK_LABELS, BLOCK_SESSIONS, WEEKDAY_LABELS
 
 
@@ -59,8 +60,10 @@ def generate_schedule(
     members: list[Member],
     courses: list[CourseRecord],
     config: ScheduleConfig,
+    leaves: list[Leave] | None = None,
 ) -> ScheduleResult:
     busy = build_busy_map(members, courses)
+    leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
     rng = random.Random(config.seed)
     assigned_slots: set[tuple] = set()  # 已占用的 (成员, 周, 星期, 时段)
 
@@ -93,6 +96,7 @@ def generate_schedule(
             candidates = [
                 m for m in members
                 if available(m.id, week, weekday, block)
+                and (m.id, week, weekday) not in leave_set
                 and week_cnt[(m.id, week)] < config.max_per_week
                 and day_cnt[(m.id, week, weekday)] < config.max_per_day
                 and (m.id, week, weekday, block) not in assigned_slots
@@ -120,10 +124,56 @@ def generate_schedule(
             ))
 
     result.gaps.sort()
-
-    for m in members:
-        weeks_served = sorted({a.week for a in result.assignments if a.member_id == m.id})
-        result.member_stats[m.id] = {
-            "name": m.name, "total": total[m.id], "weeks": weeks_served,
-        }
+    result.member_stats = rebuild_member_stats(members, result.assignments)
     return result
+
+
+def rebuild_member_stats(
+    members: list[Member],
+    assignments: list[Assignment],
+) -> dict[int, dict]:
+    """按 assignments 重算各成员统计（手动微调后复用）"""
+    total = Counter(a.member_id for a in assignments)
+    stats: dict[int, dict] = {}
+    for m in members:
+        stats[m.id] = {
+            "name": m.name, "total": total[m.id],
+            "weeks": sorted({a.week for a in assignments if a.member_id == m.id}),
+        }
+    return stats
+
+
+def replacement_candidates(
+    members: list[Member],
+    busy: dict[int, set],
+    leave_set: set[tuple[int, int, int]],
+    assignments: list[Assignment],
+    week: int,
+    weekday: int,
+    block: int,
+    max_per_week: int,
+    max_per_day: int,
+) -> list[tuple[Member, str]]:
+    """手动微调候选：返回 (成员, 不可用原因)，原因为空串表示可值班。
+    排除该时段已在岗的成员；校验课程冲突、请假、每天/每周上限。"""
+    current = {a.member_id for a in assignments
+               if a.week == week and a.weekday == weekday and a.block == block}
+    day_cnt = Counter(a.member_id for a in assignments
+                      if a.week == week and a.weekday == weekday and a.block != block)
+    week_cnt = Counter(a.member_id for a in assignments if a.week == week)
+
+    out: list[tuple[Member, str]] = []
+    for m in members:
+        if m.id in current:
+            continue
+        if any((week, weekday, s) in busy.get(m.id, ()) for s in BLOCK_SESSIONS[block]):
+            out.append((m, "该时段有课"))
+        elif (m.id, week, weekday) in leave_set:
+            out.append((m, "请假"))
+        elif day_cnt[m.id] >= max_per_day:
+            out.append((m, "当天已值班"))
+        elif week_cnt[m.id] + 1 > max_per_week:
+            out.append((m, "本周已达上限"))
+        else:
+            out.append((m, ""))
+    return out

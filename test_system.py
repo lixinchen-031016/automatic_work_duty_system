@@ -1,4 +1,4 @@
-"""端到端测试：解析 -> 入库 -> 排班(无冲突+均衡) -> 导出"""
+"""端到端测试：解析 -> 入库 -> 排班(无冲突+均衡) -> 导出 -> 甘特/请假/微调/日期"""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ import copy
 import random
 import tempfile
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
-from duty_system.database import Database
-from duty_system.exporter import build_detail_df, build_pivot_df, export_csv, export_excel
+from duty_system.database import Assignment, Database
+from duty_system.exporter import (
+    build_detail_df, build_pivot_df, export_csv, export_excel, week_date,
+)
 from duty_system.gantt import build_availability, export_gantt_excel
 from duty_system.parser import BLOCK_SESSIONS, WEEKDAY_LABELS, parse_schedule_path
-from duty_system.scheduler import ScheduleConfig, build_busy_map, generate_schedule
+from duty_system.scheduler import (
+    ScheduleConfig, build_busy_map, generate_schedule, rebuild_member_stats,
+    replacement_candidates,
+)
 
 SAMPLE = Path(__file__).parent / "samples" / "学生个人课表_2307724110.xls"
 
@@ -190,11 +196,126 @@ def test_gantt(db: Database, members: list) -> None:
           f"导出 xlsx {len(data)}B）")
 
 
+def test_leaves(db: Database, members: list) -> None:
+    mid = members[0].id
+    db.add_leave(mid, 2, 3, "生病")
+    db.add_leave(mid, 2, 3, "重复登记应覆盖")
+    mine = db.list_leaves(mid)
+    assert len(mine) == 1 and mine[0].reason == "重复登记应覆盖", "请假登记应按(成员,周,星期)幂等覆盖"
+
+    courses = db.get_courses()
+    config = ScheduleConfig(
+        weeks=range(1, 4), weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5],
+        per_slot=1, max_per_week=3, max_per_day=1)
+    result = generate_schedule(members, courses, config, leaves=db.list_leaves())
+    hit = [a for a in result.assignments if a.member_id == mid and a.week == 2 and a.weekday == 3]
+    assert not hit, "排班未避开请假成员"
+
+    m = build_availability(members, courses, week=2, weekdays=[1, 2, 3, 4, 5],
+                          blocks=[1, 2, 3, 4, 5], leaves=db.list_leaves())
+    assert (0, 3) in m.leave_info, "甘特图未标记请假"
+    for i, (d, b) in enumerate(m.slots):
+        if d == 3:
+            assert m.free[0][i] is False, "请假成员当天不应判为空闲"
+    wed_cols = [i for i, (d, _) in enumerate(m.slots) if d == 3]
+    assert all(m.free_counts[i] < m.member_count for i in wed_cols), "请假应影响空闲人数"
+
+    db.remove_leave(mine[0].id)
+    assert db.list_leaves(mid) == [], "删除请假失败"
+    print(f"[7] 请假登记: 通过（排班避开请假日 {WEEKDAY_LABELS[3]}，甘特图当天标红，"
+          "登记幂等、可删除）")
+
+
+def test_manual_tweak(db: Database, members: list) -> None:
+    courses = db.get_courses()
+    busy = build_busy_map(members, courses)
+
+    # 场景1：有富余的排班（容量>需求）→ 存在完全合规的换人候选
+    config = ScheduleConfig(
+        weeks=range(1, 3), weekdays=[1, 2], blocks=[1, 2, 3],
+        per_slot=1, max_per_week=3, max_per_day=1)
+    result = generate_schedule(members, courses, config)
+
+    target, cands = None, []
+    for a in result.assignments:
+        c = replacement_candidates(members, busy, set(), result.assignments,
+                                   a.week, a.weekday, a.block,
+                                   config.max_per_week, config.max_per_day)
+        if any(not reason for _, reason in c):
+            target, cands = a, c
+            break
+    assert target is not None, "应存在可微调的时段"
+    eligible = [m for m, reason in cands if not reason]
+    assert all(m.id != target.member_id for m, _ in cands), "在岗成员不应出现在候选中"
+
+    # 不可用原因与忙时表/安排一致
+    for m0 in (m for m, r in cands if r == "该时段有课"):
+        assert any((target.week, target.weekday, s) in busy.get(m0.id, ())
+                   for s in BLOCK_SESSIONS[target.block]), "有课原因与忙时表不一致"
+    for m0 in (m for m, r in cands if r == "当天已值班"):
+        assert any(a.member_id == m0.id and a.week == target.week
+                   and a.weekday == target.weekday and a.block != target.block
+                   for a in result.assignments), "当天已值班原因与安排不一致"
+
+    # 换入后仍满足全部硬约束
+    new = eligible[0]
+    kept = [a for a in result.assignments if a is not target]
+    kept.append(Assignment(target.week, target.weekday, target.block, new.id, new.name))
+    for a in kept:
+        for s in BLOCK_SESSIONS[a.block]:
+            assert (a.week, a.weekday, s) not in busy.get(a.member_id, ()), "微调后出现课程冲突"
+    day_cnt = Counter((a.member_id, a.week, a.weekday) for a in kept)
+    assert all(v <= config.max_per_day for v in day_cnt.values()), "微调后超出每天上限"
+    week_cnt = Counter((a.member_id, a.week) for a in kept)
+    assert all(v <= config.max_per_week for v in week_cnt.values()), "微调后超出每周上限"
+    stats = rebuild_member_stats(members, kept)
+    assert sum(s["total"] for s in stats.values()) == len(kept), "统计重算总数错误"
+
+    # 场景2：饱和排班（容量=需求，默认配置即如此）→ 剩余候选仅"本周已达上限"，
+    # 手动微调允许知情越限换人（课程/请假/每天一次仍必须满足）
+    sat = ScheduleConfig(
+        weeks=range(1, 3), weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5],
+        per_slot=1, max_per_week=3, max_per_day=1)
+    result2 = generate_schedule(members, courses, sat)
+    target2 = result2.assignments[0]
+    cands2 = replacement_candidates(members, busy, set(), result2.assignments,
+                                    target2.week, target2.weekday, target2.block,
+                                    sat.max_per_week, sat.max_per_day)
+    soft = [m for m, r in cands2 if r == "本周已达上限"]
+    assert soft, "饱和排班应存在仅超周上限的可换候选"
+    for m0 in (m for m, r in cands2 if r in ("", "本周已达上限")):
+        for s in BLOCK_SESSIONS[target2.block]:
+            assert (target2.week, target2.weekday, s) not in busy.get(m0.id, ()), "软候选仍须无课程冲突"
+        assert (m0.id, target2.week, target2.weekday) not in (
+            (a.member_id, a.week, a.weekday) for a in result2.assignments
+            if a.block != target2.block), "软候选仍须满足每天一次"
+    print(f"[8] 手动微调: 通过（合规候选 {len(eligible)} 人换入后 0 冲突、上限合规、统计重算；"
+          f"饱和排班下 {len(soft)} 人仅超周上限可知情换入）")
+
+
+def test_week_dates(result) -> None:
+    assert week_date(date(2026, 9, 14), 1, 1) == date(2026, 9, 14)
+    assert week_date(date(2026, 9, 14), 1, 7) == date(2026, 9, 20)
+    assert week_date(date(2026, 9, 14), 2, 5) == date(2026, 9, 25)
+    assert week_date(date(2026, 9, 14), 18, 5) == date(2027, 1, 15), "跨年换算错误"
+
+    detail = build_detail_df(result.assignments, start_date=date(2026, 9, 14))
+    pivot = build_pivot_df(result.assignments, start_date=date(2026, 9, 14))
+    assert "日期" in detail.columns and "日期" in pivot.columns, "导出应含日期列"
+    xlsx = export_excel(result.assignments, result.member_stats, result.gaps,
+                        start_date=date(2026, 9, 14))
+    assert xlsx[:2] == b"PK", "带日期 Excel 导出错误"
+    print("[9] 周次换算: 通过（起始日+(周-1)*7+(星期-1) 正确跨月/跨年；明细/透视/Excel 含日期列）")
+
+
 if __name__ == "__main__":
     test_parser()
     db, members = test_database()
     result = test_scheduler(db, members)
     test_exporter(result)
     test_gantt(db, members)
+    test_leaves(db, members)
+    test_manual_tweak(db, members)
+    test_week_dates(result)
     print()
     print("全部测试通过 ✓")

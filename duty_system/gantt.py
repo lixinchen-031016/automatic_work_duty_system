@@ -9,9 +9,9 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from .database import CourseRecord, Member
+from .database import CourseRecord, Leave, Member
 from .parser import BLOCK_LABELS, BLOCK_SESSIONS, WEEKDAY_LABELS
 from .scheduler import build_busy_map
 
@@ -25,6 +25,7 @@ class AvailabilityMatrix:
     free: list[list[bool]]                                  # [成员行][时段列] 是否空闲
     busy_courses: dict[tuple[int, int, int], list[str]]     # (行号, 星期, 时段) -> 忙时课程名
     free_counts: list[int]                                 # 各时段空闲人数
+    leave_info: dict[tuple[int, int], str] = field(default_factory=dict)  # (行号, 星期) -> 请假原因
 
     @property
     def member_count(self) -> int:
@@ -51,9 +52,12 @@ def build_availability(
     week: int,
     weekdays: list[int],
     blocks: list[int],
+    leaves: list[Leave] | None = None,
 ) -> AvailabilityMatrix:
-    """计算第 week 周各成员忙闲矩阵"""
+    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用）"""
     busy = build_busy_map(members, courses)
+    leave_map = {(l.member_id, l.weekday): l.reason
+                 for l in (leaves or []) if l.week == week}
     # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）
     course_index: dict[tuple[int, int, int], set[str]] = {}
     member_ids = {m.id for m in members}
@@ -66,10 +70,15 @@ def build_availability(
     slots = [(d, b) for d in sorted(weekdays) for b in sorted(blocks)]
     free: list[list[bool]] = []
     busy_courses: dict[tuple[int, int, int], list[str]] = {}
+    leave_info: dict[tuple[int, int], str] = {}
     for m in members:
         row = len(free)  # 当前行号
         row_free: list[bool] = []
         for d, b in slots:
+            if (m.id, d) in leave_map:
+                row_free.append(False)
+                leave_info[(row, d)] = leave_map[(m.id, d)]
+                continue
             names: set[str] = set()
             is_free = True
             for s in BLOCK_SESSIONS[b]:
@@ -89,6 +98,7 @@ def build_availability(
         free=free,
         busy_courses=busy_courses,
         free_counts=free_counts,
+        leave_info=leave_info,
     )
 
 
@@ -101,6 +111,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
     FREE_FILL = PatternFill("solid", fgColor="C9F2CF")
     BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
     ALL_FREE_FILL = PatternFill("solid", fgColor="FFD9A8")
+    LEAVE_FILL = PatternFill("solid", fgColor="FFD6D2")
     HEADER_FILL = PatternFill("solid", fgColor="007AFF")
     THIN = Side(style="thin", color="FFFFFF")
 
@@ -131,7 +142,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 成员行：空闲绿色、有课灰色
+    # 成员行：空闲绿色、有课灰色、请假红色
     border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
     for r, name in enumerate(matrix.member_names):
         row = 3 + r
@@ -139,10 +150,17 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         head.font = Font(bold=True)
         head.alignment = Alignment(horizontal="center", vertical="center")
         for i, (d, b) in enumerate(matrix.slots):
+            leave_reason = matrix.leave_info.get((r, d))
             is_free = matrix.free[r][i]
             names = matrix.busy_courses.get((r, d, b), [])
-            cell = ws.cell(row=row, column=2 + i, value="" if is_free else "、".join(names))
-            cell.fill = FREE_FILL if is_free else BUSY_FILL
+            if leave_reason is not None:
+                cell = ws.cell(row=row, column=2 + i,
+                               value=f"请假：{leave_reason}" if leave_reason else "请假")
+                cell.fill = LEAVE_FILL
+                cell.font = Font(color="B3261E")
+            else:
+                cell = ws.cell(row=row, column=2 + i, value="" if is_free else "、".join(names))
+                cell.fill = FREE_FILL if is_free else BUSY_FILL
             cell.border = border
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
 
