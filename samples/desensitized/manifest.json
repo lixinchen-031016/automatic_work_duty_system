@@ -1,0 +1,32 @@
+[
+  {
+    "file": "学生个人课表_9999800598.xls",
+    "name": "赵明明",
+    "student_id": "9999800598",
+    "term": "2026-2027-1",
+    "class_name": "24国际商务双语4班",
+    "major": "国际商务双语",
+    "department": "管理工程学院",
+    "course_count": 37
+  },
+  {
+    "file": "学生个人课表_9999832478.xls",
+    "name": "钱明明",
+    "student_id": "9999832478",
+    "term": "2026-2027-1",
+    "class_name": "24电信3班",
+    "major": "电子信息工程",
+    "department": "电气与电子工程学院",
+    "course_count": 57
+  },
+  {
+    "file": "学生个人课表_9999453245(1).xls",
+    "name": "郑明明",
+    "student_id": "9999453245",
+    "term": "2026-2027-1",
+    "class_name": "25材科4班",
+    "major": "材料科学与工程",
+    "department": "材料与环境工程学院",
+    "course_count": 49
+  }
+]

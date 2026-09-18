@@ -267,7 +267,9 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py   # 只看端到
 
 | 文件 | 覆盖内容 |
 | --- | --- |
-| `test_parser_robustness.py` | 课表解析：三份真实样例（37/57/49 门）元信息与课程数基线 + 备注行反查、多人授课、职称括号换行、学号文件名后缀、单双周/表头写法/全角字符/空行异常/无空行多课程/合并单元格、格式嗅探与损坏文件报错 |
+| `test_parser_robustness.py` | 课表解析：三份样例（37/57/49 门）元信息与课程数基线 + 备注行反查、多人授课、职称括号换行、学号文件名后缀、单双周/表头写法/全角字符/空行异常/无空行多课程/合并单元格、格式嗅探与损坏文件报错 |
+| `test_sample_privacy.py` | 样例隐私门禁：脱敏样例已随仓库提交、manifest 与样例一致、学号为 9999 段虚构号、课程数据保真（地点/跨节次课程仍在）、原始课表被 `.gitignore` 忽略 |
+| `test_workflow_config.py` | CI 工作流静态校验：YAML 可解析、每个 bash 步骤过 `bash -n`、引号成对、Qt 安装失败可容忍、测试步骤用 offscreen |
 | `test_system.py` | 13 组端到端场景：解析器（37 门课程格式）、数据库幂等、排班硬约束与均衡、导出（xlsx/csv/日期列）、甘特图一致性、请假避让、手动微调候选、周次换算（跨月/跨年）、按周增量、结果恢复、按周导出、甘特图值班标记 |
 | `test_scheduler_optimized.py` | 约束判定单一入口一致性、缺口修复效果与硬约束、缺口口径统一、稀缺度排序收益、同种子可复现、`assign/unassign` 对称性 |
 | `test_database_layer.py` | 幂等写入不膨胀 id、按周增量同步保持未变化行、槽位替换只动目标、索引/WAL/`user_version` 迁移、老库兼容、级联删除 |
@@ -341,7 +343,10 @@ automatic_work_duty_system/
 ├── requirements-dev.txt      # 开发依赖（pytest）
 ├── pytest.ini                # 测试发现配置
 ├── duty_system.db            # SQLite 数据库（运行时自动创建）
-├── samples/                  # 示例课表（.xls）
+├── samples/                  # 课表示例
+│   ├── *.xls                 #   同学提供的原始课表（含个人信息，.gitignore 忽略）
+│   └── desensitized/         #   脱敏副本（随仓库提交，测试与 CI 用）
+└── tools/desensitize_samples.py  # 原始课表 -> 脱敏样例（等长字节替换）
 ├── .github/workflows/build.yml  # CI：测试门禁 → 打包 Windows exe / macOS dmg → 发布 Release
 └── duty_system/              # 核心包
     ├── parser.py             # 课表解析：.xls/.xlsx → 课程记录（周次/节次/姓名/学号）
@@ -388,14 +393,32 @@ automatic_work_duty_system/
 
 ### 修改课表解析器（parser.py）
 
-**改之前先读这句话**：`samples/` 下的三份 `.xls` 都是真实教务系统导出文件
-（刘雨昂 37 门 / 冯海洋 57 门 / 王明阳 49 门），`test_parser_robustness.py` 里有它们的黄金基线
+**改之前先读这句话**：`samples/desensitized/` 下的三份 `.xls` 来自真实教务系统导出
+（37 门国际商务 / 57 门电信 / 49 门材科），`test_parser_robustness.py` 里有它们的黄金基线
 （姓名/学号/学期/班级/院系 + 每条课程记录逐字段校验）。
 改动解析器后必须保证这些基线不变——它们是判断「优化」还是「改坏」的唯一依据。
 
-每份真实课表末尾还有一行教务系统自带的备注（`课程名 教师 周次周;` 清单），
+每份课表末尾还有一行教务系统自带的备注（`课程名 教师 周次周;` 清单），
 `test_real_samples_note_row_agrees_with_parsed_courses` 会用它反查解析结果，
 所以「少读一门课」「教师读错」这类问题会自动被测试抓住。
+
+**关于样例的隐私处理**：原始课表含姓名与学号，只留在本地
+（`.gitignore` 忽略 `samples/*.xls`）。提交进仓库的是 `samples/desensitized/`
+下的脱敏副本——由 `tools/desensitize_samples.py` 用**等长 UTF-16LE 字节替换**
+生成，只改姓名与学号，课程名/周次/节次/地点/课程数与原文件逐字段一致，
+因此仍保留真实布局（合并单元格、SST 共享、换行方式）带来的解析难度。
+
+拿到新的原始课表后：
+
+```bash
+python tools/desensitize_samples.py          # 生成/刷新脱敏样例
+python tools/desensitize_samples.py --check   # 校验脱敏样例与原始文件一致
+pytest -q                                    # 确认基线
+```
+
+脚本会自动断言：文件长度不变（结构未坏）、真实姓名/学号零残留、
+脱敏样例可解析且课程数据与原始文件一致，并刷新 `manifest.json`。
+**不要手工改脱敏样例**——`test_sample_privacy.py` 会拿 manifest 校验并在不一致时失败。
 
 排查解析问题时按这个顺序看：
 
@@ -407,7 +430,7 @@ automatic_work_duty_system/
 5. `parse_weekdays` 用 `parse_weekday_header` 的别名规则，表头识别不到会导致整份课表 0 条。
 
 新增一种写法时：先在 `test_parser_robustness.py` 加一条失败用例（跑一遍确认它是红的），
-再改解析器让用例通过，最后跑 `pytest -q` 确认三份真实样例的基线没有漂移。
+再改解析器让用例通过，最后跑 `pytest -q` 确认三份样例的基线没有漂移。
 
 ### 新增一个数据库字段或表
 

@@ -16,6 +16,13 @@ build/
 dist/
 *.spec
 
+# 真实课表（含姓名/学号等个人信息，绝不入库）
+#   samples/*.xls          -> 同学提供的原始文件，仅留在本地
+#   samples/desensitized/  -> 由 tools/desensitize_samples.py 生成的脱敏样例，正常提交
+samples/*.xls
+samples/*.xlsx
+!samples/desensitized/
+
 # 导出文件（示例命名，避免误提交）
 值班排班表*.xlsx
 值班排班表*.csv

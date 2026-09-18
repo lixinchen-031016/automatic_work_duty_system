@@ -75,6 +75,13 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
             || echo "Qt 运行库安装未完成，继续运行测试"
 
+      - name: 校验测试样例（脱敏样例与原始课表一致）
+        run: |
+          # 仓库里提交的是 samples/desensitized/（真实课表的脱敏副本）。
+          # 本地若存在原始课表，这一步会逐字段比对，防止样例与真实格式漂移；
+          # CI 上没有原始文件时脚本直接返回 0，属于正常情况。
+          python tools/desensitize_samples.py --check
+
       - name: 运行测试
         env:
           QT_QPA_PLATFORM: offscreen

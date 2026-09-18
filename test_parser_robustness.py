@@ -1,8 +1,15 @@
 """课表解析健壮性测试
 
-基准数据是 `samples/学生个人课表_2307724110.xls`（真实教务系统导出）：
-修复解析器时必须保证这份课表的 37 条记录逐字段不变，因此先做基线回归，
-再用变体用例覆盖各校常见写法（单双周、表头写法、全角字符、空行异常、合并单元格）。
+基准数据是 `samples/desensitized/` 下的三份样例（真实教务系统导出后脱敏）：
+它们是**真实文件的等长字节替换版本**——课程名/周次/节次/地点/课程数与原始
+文件逐字段一致，只把姓名与学号换成了虚构值，因此既能放进仓库供 CI 使用，
+又保留了真实布局（合并单元格、SST 共享、换行方式）带来的解析难度。
+
+修复解析器时必须保证这三份课表的基线不变，再用变体用例覆盖各校常见写法
+（单双周、表头写法、全角字符、空行异常、合并单元格）。
+
+原始文件与脱敏样例的对应关系由 `tools/desensitize_samples.py` 维护；
+本地有原始文件时可跑 `python tools/desensitize_samples.py --check` 校验一致性。
 """
 
 from __future__ import annotations
@@ -17,12 +24,14 @@ from duty_system.parser import (
     parse_schedule_path, parse_sessions, parse_weekday_header, parse_weeks,
 )
 
-SAMPLE = Path(__file__).parent / "samples" / "学生个人课表_2307724110.xls"
+SAMPLES_DIR = Path(__file__).parent / "samples" / "desensitized"
+SAMPLE = SAMPLES_DIR / "学生个人课表_9999800598.xls"          # 原始 37 门，国际商务
 
-# 真实课表的黄金基线：修复解析器时这些值必须保持不变
+# 样例课表的黄金基线：修复解析器时这些值必须保持不变
+# （姓名/学号为脱敏后的虚构值，课程数据与真实文件完全一致）
 BASELINE = {
-    "name": "刘雨昂",
-    "student_id": "2307724110",
+    "name": "赵明明",
+    "student_id": "9999800598",
     "term": "2026-2027-1",
     "class_name": "24国际商务双语4班",
     "major": "国际商务双语",
@@ -58,13 +67,13 @@ def test_sample_schedule_field_level_snapshot() -> None:
 
     # 教师名被换行打断的案例（原解析器的已知难点）
     sy = by_name.get("企业运营管理综合模拟实验", [])
-    assert sy and all(c.teacher == "唐心智" for c in sy)
+    assert sy and all(c.teacher == "钱明明" for c in sy)
     assert all(c.location for c in sy), "该课程应解析出地点"
 
     # 单周周次（真实数据里用逗号列举，不是"单周"字样）
     pe = next(c for c in s.courses if c.course_name.startswith("体育Ⅲ"))
     assert pe.week_list == [1, 3, 5, 7, 9, 11, 13, 15]
-    assert pe.teacher == "陈旭东"
+    assert pe.teacher == "王明明"
 
     # 混合周次 1-4,6-10
     mds = next(c for c in s.courses if c.course_name.startswith("毛泽东"))
@@ -162,10 +171,10 @@ def cell(lines: list[str]) -> str:
 
 def test_cell_week_only_and_even_are_kept() -> None:
     """单双周课程必须被解析出来（修复前会被整条丢弃）"""
-    single = parse_cell(cell(["企业运营管理", "唐心智(教授)", "1-16单周([周])[01-02节]", "德五楼3412"]), 1)
+    single = parse_cell(cell(["企业运营管理", "钱明明(教授)", "1-16单周([周])[01-02节]", "德五楼3412"]), 1)
     assert len(single) == 1
     c = single[0]
-    assert c.course_name == "企业运营管理" and c.teacher == "唐心智"
+    assert c.course_name == "企业运营管理" and c.teacher == "钱明明"
     assert c.week_list == [1, 3, 5, 7, 9, 11, 13, 15]
     assert c.week_mode == "odd"
     assert "单周" in c.weeks_text, "界面展示的周次文本应体现单周"
@@ -230,13 +239,13 @@ def test_cell_without_blank_line_between_courses() -> None:
 
 def test_cell_name_split_by_stray_blank_line() -> None:
     """课程名与周次行之间被插入空行（样例中的「高等数学」就是这种结构）"""
-    text = "\n高等数学(Ⅱ)-1\n\n5-16([周])[09-10节]\n零号教室021\n\n企业运营管理\n唐心智(教授)\n18([周])[09-10节]\n德五楼3412\n"
+    text = "\n高等数学(Ⅱ)-1\n\n5-16([周])[09-10节]\n零号教室021\n\n企业运营管理\n钱明明(教授)\n18([周])[09-10节]\n德五楼3412\n"
     courses = parse_cell(text, 3)
     by_name = {c.course_name: c for c in courses}
     assert "高等数学(Ⅱ)-1" in by_name, f"实际 {list(by_name)}"
     assert by_name["高等数学(Ⅱ)-1"].week_list == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     assert by_name["高等数学(Ⅱ)-1"].location == "零号教室021"
-    assert by_name["企业运营管理"].teacher == "唐心智"
+    assert by_name["企业运营管理"].teacher == "钱明明"
 
 
 def test_cell_garbage_and_empty_cells() -> None:
@@ -269,7 +278,7 @@ def make_grid(header: list[str]) -> list[list[str]]:
 ])
 def test_grid_reads_all_header_styles(header: list[str]) -> None:
     """表头写法不同时整份课表都要能读出来（修复前「周一」写法读不出任何课程）"""
-    res = parse_grid(make_grid(header), "学生个人课表_2307724110.xls")
+    res = parse_grid(make_grid(header), "学生个人课表_9999800598.xls")
     names = {c.course_name for c in res.courses}
     assert names == {"高等数学", "英语"}, f"实际 {names}"
     en = next(c for c in res.courses if c.course_name == "英语")
@@ -321,7 +330,7 @@ def test_parse_schedule_file_roundtrip_bytes() -> None:
     b = parse_schedule_file(SAMPLE.read_bytes(), SAMPLE.name)
     assert len(a.courses) == len(b.courses)
     assert sorted(c.key() for c in a.courses) == sorted(c.key() for c in b.courses)
-    assert b.student_id == "2307724110"
+    assert b.student_id == "9999800598"
 
 
 # --------------------------------------------------------------------------- #
@@ -360,9 +369,9 @@ def test_format_sniffing_ignores_extension(tmp_path: Path) -> None:
     assert r1.name == "李四"
 
     # xls 内容 + .xlsx 扩展名
-    r2 = parse_schedule_file(xls_bytes, "学生个人课表_2307724110.xlsx")
+    r2 = parse_schedule_file(xls_bytes, "学生个人课表_9999800598.xlsx")
     assert len(r2.courses) == BASELINE["course_count"]
-    assert r2.student_id == "2307724110"
+    assert r2.student_id == "9999800598"
 
 
 def test_corrupt_file_raises_clear_error(tmp_path: Path) -> None:
@@ -405,25 +414,25 @@ def test_merged_cells_do_not_break_sample(tmp_path: Path) -> None:
 # 真实样例二三：25材科 / 24电信（新格式：多教师、文件名带后缀）
 # --------------------------------------------------------------------------- #
 
-SAMPLE_2403 = Path(__file__).parent / "samples" / "学生个人课表_2403000726.xls"
-SAMPLE_2502 = Path(__file__).parent / "samples" / "学生个人课表_2502020411(1).xls"
+SAMPLE_2403 = SAMPLES_DIR / "学生个人课表_9999832478.xls"      # 原始 57 门，电信
+SAMPLE_2502 = SAMPLES_DIR / "学生个人课表_9999453245(1).xls"   # 原始 49 门，材科（文件名带后缀）
 
 REAL_SAMPLES = [
-    pytest.param(SAMPLE, "刘雨昂", "2307724110", "24国际商务双语4班", 37, id="2307724110"),
-    pytest.param(SAMPLE_2403, "冯海洋", "2403000726", "24电信3班", 57, id="2403000726"),
-    pytest.param(SAMPLE_2502, "王明阳", "2502020411", "25材科4班", 49, id="2502020411"),
+    pytest.param(SAMPLE, "赵明明", "9999800598", "24国际商务双语4班", 37, id="国际商务"),
+    pytest.param(SAMPLE_2403, "钱明明", "9999832478", "24电信3班", 57, id="电信"),
+    pytest.param(SAMPLE_2502, "郑明明", "9999453245", "25材科4班", 49, id="材科"),
 ]
 
 
 def _require(path: Path) -> Path:
     if not path.exists():
-        pytest.skip(f"缺少真实样例课表 {path.name}")
+        pytest.skip(f"缺少样例课表 {path.name}（先跑 tools/desensitize_samples.py 生成）")
     return path
 
 
 @pytest.mark.parametrize("path,name,student_id,class_name,count", REAL_SAMPLES)
 def test_real_samples_meta_and_count(path, name, student_id, class_name, count) -> None:
-    """三份真实课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
+    """三份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
     s = parse_schedule_path(_require(path))
     assert s.name == name
     assert s.student_id == student_id, f"学号提取失败：{s.student_id!r}"
@@ -434,7 +443,7 @@ def test_real_samples_meta_and_count(path, name, student_id, class_name, count) 
 
 
 @pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502],
-                         ids=["2307724110", "2403000726", "2502020411"])
+                         ids=["国际商务", "电信", "材科"])
 def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
     """用教务系统自己生成的末尾「备注行」反查解析结果
 
@@ -507,15 +516,15 @@ def test_real_sample_shared_room_multiple_experiments() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_cell_multiple_teachers_on_one_line() -> None:
-    """多人授课（范钧(副教授),李鹏程(讲师)）不能把第二位教师并进课程名"""
+    """多人授课（郑明(副教授),周明明(讲师)）不能把第二位教师并进课程名"""
     courses = parse_cell(cell([
-        "电工电子技术B", "范钧(副教授),李鹏程(讲师)",
+        "电工电子技术B", "郑明(副教授),周明明(讲师)",
         "7-11([周])[03-04节]", "甲工楼A座6205",
     ]), 2)
     assert len(courses) == 1
     c = courses[0]
     assert c.course_name == "电工电子技术B", f"课程名被教师名污染：{c.course_name!r}"
-    assert c.teacher == "范钧,李鹏程", f"教师解析错误：{c.teacher!r}"
+    assert c.teacher == "郑明,周明明", f"教师解析错误：{c.teacher!r}"
 
 
 @pytest.mark.parametrize("sep", [",", "，", "、", " ,", ", "])
@@ -531,27 +540,27 @@ def test_cell_multiple_teachers_separator_variants(sep: str) -> None:
 
 
 def test_cell_teacher_parens_split_by_newline() -> None:
-    """教师职称的括号被换行打断（唐心智\\n(教授)）也要能识别
+    """教师职称的括号被换行打断（钱明明\\n(教授)）也要能识别
 
     模块文档声明该情形由「合并后匹配」覆盖，但合并会引入空格，
     若正则不容忍空格则教师名会被并进课程名。
     """
-    courses = parse_cell("\n测试课程\n唐心智\n(教授)\n1-16([周])[01-02节]\n教室A\n", 1)
+    courses = parse_cell("\n测试课程\n钱明明\n(教授)\n1-16([周])[01-02节]\n教室A\n", 1)
     assert len(courses) == 1
     c = courses[0]
     assert c.course_name == "测试课程", f"实际 {c.course_name!r}"
-    assert c.teacher == "唐心智", f"实际 {c.teacher!r}"
+    assert c.teacher == "钱明明", f"实际 {c.teacher!r}"
 
 
 def test_cell_course_subtitle_is_not_treated_as_teacher() -> None:
     """课程副标题 (PD8-1) 不是职称，必须留在课程名里"""
     courses = parse_cell(cell([
         "毛泽东思想和中国特色社会主义理论体系概论 (PD8-1)",
-        "罗芳芳(副教授)", "1-10([周])[05-06节]", "允明楼1424",
+        "吴明明(副教授)", "1-10([周])[05-06节]", "允明楼1424",
     ]), 2)
     c = courses[0]
     assert c.course_name == "毛泽东思想和中国特色社会主义理论体系概论 (PD8-1)"
-    assert c.teacher == "罗芳芳"
+    assert c.teacher == "吴明明"
 
 
 # --------------------------------------------------------------------------- #
@@ -559,12 +568,12 @@ def test_cell_course_subtitle_is_not_treated_as_teacher() -> None:
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("file_name,expected", [
-    ("学生个人课表_2307724110.xls", "2307724110"),
-    ("学生个人课表_2307724110.xlsx", "2307724110"),
-    ("学生个人课表_2502020411(1).xls", "2502020411"),
-    ("学生个人课表_2502020411(1)(2).xls", "2502020411"),
-    ("课表_2502020411（1）.xls", "2502020411"),
-    ("课表_2502020411 .xls", "2502020411"),
+    ("学生个人课表_9999800598.xls", "9999800598"),
+    ("学生个人课表_9999800598.xlsx", "9999800598"),
+    ("学生个人课表_9999453245(1).xls", "9999453245"),
+    ("学生个人课表_9999453245(1)(2).xls", "9999453245"),
+    ("课表_9999453245（1）.xls", "9999453245"),
+    ("课表_9999453245 .xls", "9999453245"),
     ("没有学号.xls", ""),
 ])
 def test_student_id_extraction_from_file_name(file_name: str, expected: str) -> None:

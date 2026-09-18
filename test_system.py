@@ -45,10 +45,11 @@ from duty_system.scheduler import (
     replacement_candidates,
 )
 
-SAMPLE = Path(__file__).parent / "samples" / "学生个人课表_2307724110.xls"
+SAMPLE = (Path(__file__).parent / "samples" / "desensitized"
+          / "学生个人课表_9999800598.xls")   # 真实课表脱敏后的样例
 
 TEST_NAMES = ["王思远", "李慧敏", "张承宇", "陈晓露"]
-TEST_STUDENT_IDS = ["2307724101", "2307724102", "2307724103", "2307724104"]
+TEST_STUDENT_IDS = ["9999000101", "9999000102", "9999000103", "9999000104"]
 
 
 def make_test_variants(base, count: int = 4, seed: int = 7) -> list:
@@ -72,8 +73,8 @@ def make_test_variants(base, count: int = 4, seed: int = 7) -> list:
 
 def test_parser() -> None:
     s = parse_schedule_path(SAMPLE)
-    assert s.name == "刘雨昂", f"姓名解析错误: {s.name}"
-    assert s.student_id == "2307724110"
+    assert s.name == "赵明明", f"姓名解析错误: {s.name}"
+    assert s.student_id == "9999800598"
     assert s.term == "2026-2027-1"
     assert s.class_name == "24国际商务双语4班"
     assert len(s.courses) == 37, f"课程数错误: {len(s.courses)}"
@@ -84,7 +85,7 @@ def test_parser() -> None:
 
     # 教师职称被换行打断的案例
     sy = [c for c in s.courses if "企业运营管理" in c.course_name]
-    assert sy and all(c.teacher == "唐心智" for c in sy), "断行教师名解析失败"
+    assert sy and all(c.teacher == "钱明明" for c in sy), "断行教师名解析失败"
     # 周次解析
     pe = next(c for c in s.courses if c.course_name.startswith("体育Ⅲ"))
     assert pe.week_list == [1, 3, 5, 7, 9, 11, 13, 15], f"单周周次解析错误: {pe.week_list}"

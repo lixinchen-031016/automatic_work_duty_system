@@ -183,7 +183,8 @@ def test_real_sample_flows_into_scheduling() -> None:
     from duty_system.parser import BLOCK_SESSIONS, parse_schedule_path
     from duty_system.scheduler import ScheduleConfig, build_busy_map, generate_schedule
 
-    sample = Path(__file__).parent / "samples" / "学生个人课表_2307724110.xls"
+    sample = (Path(__file__).parent / "samples" / "desensitized"
+              / "学生个人课表_9999800598.xls")
     db = Database(Path(tempfile.mkdtemp()) / "real.db")
     parsed = parse_schedule_path(sample)
     db.upsert_member(parsed)
