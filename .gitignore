@@ -4,8 +4,12 @@ __pycache__/
 .venv/
 .pytest_cache/
 
-# 本地数据库
+# 本地数据库（WAL 模式会生成 -wal/-shm 伴随文件，同样是本地产物）
 duty_system.db
+duty_system.db-wal
+duty_system.db-shm
+*.db-wal
+*.db-shm
 
 # PyInstaller 打包产物
 build/
