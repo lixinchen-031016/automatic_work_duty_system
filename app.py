@@ -9,15 +9,16 @@
 
 from __future__ import annotations
 
-import shutil
+import json
 import sys
 import tempfile
 from collections import Counter
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
-from PySide6.QtCore import QDate, QRect, QSettings, Qt
+from PySide6.QtCore import QDate, QObject, QRunnable, QRect, QSettings, Qt, QThreadPool, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
@@ -29,14 +30,15 @@ from PySide6.QtWidgets import (
 
 from duty_system.database import Assignment, Database
 from duty_system.exporter import (
-    build_detail_df, build_pivot_df, build_stats_df, export_csv, export_excel,
-    export_leaves_excel, week_date,
+    build_detail_df, build_gap_df, build_pivot_df, build_stats_df, export_csv,
+    export_excel, export_leaves_excel, week_date,
 )
 from duty_system.gantt import AvailabilityMatrix, build_availability, export_gantt_excel, slot_header
 from duty_system.parser import BLOCK_LABELS, WEEKDAY_LABELS, parse_schedule_file
 from duty_system.scheduler import (
-    ScheduleConfig, ScheduleResult, build_busy_map, generate_schedule,
-    rebuild_member_stats, replacement_candidates,
+    ScheduleConfig, ScheduleResult, build_busy_map, capacity_advice, compute_gaps,
+    diagnose_gaps, generate_schedule, rebuild_member_stats, replacement_candidates,
+    summarize_gap_causes,
 )
 
 # 数据库默认位置：
@@ -237,23 +239,43 @@ def _card(widget: QWidget) -> Card:
 
 
 def fill_table(table: QTableWidget, df: pd.DataFrame) -> None:
-    """把 DataFrame 填入只读 QTableWidget（苹果风格：无网格线、交替行、隐藏行号）"""
-    table.clearContents()
-    table.setColumnCount(len(df.columns))
-    table.setRowCount(len(df))
+    """把 DataFrame 填入只读 QTableWidget（苹果风格：无网格线、交替行、隐藏行号）
+
+    尺寸未变时复用既有单元格、只更新变化的文本：明细/统计等表格可能有数千个
+    单元格，反复重建 item 会让刷新明显变慢。
+    """
+    rows, cols = len(df), len(df.columns)
+    if table.rowCount() != rows or table.columnCount() != cols:
+        table.clearContents()
+        table.setRowCount(rows)
+        table.setColumnCount(cols)
     table.setHorizontalHeaderLabels([str(c) for c in df.columns])
     table.setShowGrid(False)
     table.setAlternatingRowColors(True)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(30)
-    for r in range(len(df)):
-        for c in range(len(df.columns)):
-            item = QTableWidgetItem(str(df.iat[r, c]))
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(r, c, item)
+    # 一次性把 DataFrame 取成字符串矩阵：pandas 的逐格标量访问（df.iat）
+    # 在单元格较多时开销极大，这里改成一次遍历后再写表。
+    values = [tuple(str(v) for v in row)
+              for row in df.itertuples(index=False, name=None)]
+    for r, row_values in enumerate(values):
+        for c, text in enumerate(row_values):
+            item = table.item(r, c)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(r, c, item)
+            if item.text() != text:
+                item.setText(text)
+    # 列宽：用「填完后一次性自适应」代替常驻 ResizeToContents。
+    # 后者在每次 setText/setItem 时都会重算列宽，表格越大越吃亏；
+    # 一次性 resizeColumnsToContents() 只在本次刷新结束时扫描一遍。
     header = table.horizontalHeader()
-    header.setSectionResizeMode(QHeaderView.ResizeToContents)
-    header.setStretchLastSection(True)
+    if cols and header.sectionResizeMode(0) != QHeaderView.Interactive:
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+    if cols:
+        table.resizeColumnsToContents()
 
 
 def render_table_png(df: pd.DataFrame, title: str, subtitle: str, path: Path) -> None:
@@ -445,6 +467,33 @@ class BarChart(QFrame):
         p.end()
 
 
+class _TaskSignals(QObject):
+    """后台任务的完成/失败信号（QRunnable 本身不能带信号，需 QObject 载体）"""
+
+    done = Signal(object)
+    failed = Signal(str)
+
+
+class _Task(QRunnable):
+    """把耗时操作（排班计算、Excel/PNG 生成）放到线程池执行，避免界面假死。
+
+    只负责执行纯计算与取数据；任何界面刷新与数据库写入都在主线程回调里做。
+    """
+
+    def __init__(self, fn: Callable[[], object]):
+        super().__init__()
+        self._fn = fn
+        self.signals = _TaskSignals()
+
+    def run(self) -> None:  # pragma: no cover - Qt 线程池调用
+        try:
+            result = self._fn()
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要回传主线程展示
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.signals.done.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db_path: str | Path | None = None):
         super().__init__()
@@ -459,6 +508,23 @@ class MainWindow(QMainWindow):
         self._pivot_rows: list[tuple[int, int]] = []
         self._pivot_blocks: list[int] = []
         self._pivot_date_offset: int = 1
+        # 数据缓存：成员 / 课程 / 请假在「读多写少」的界面上被反复全量查询，
+        # 统一从这里取，写操作后调用 invalidate_cache() 失效即可。
+        self._members_cache = None
+        self._courses_cache = None
+        self._leaves_cache = None
+        # 忙时表由「成员 + 课程」唯一决定，展开成本高（课程数 x 周次 x 节次），
+        # 甘特图与微调对话框都会用到，因此与课表缓存同生命周期
+        self._busy_cache = None
+        # 缺口诊断结果（按排班结果对象缓存，避免每次刷新重复诊断）
+        self._gap_cache: tuple | None = None
+        # 甘特图单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
+        self._gantt_cell_state: dict = {}
+        self._pool = QThreadPool.globalInstance()
+        self._busy = False
+        # 必须持有正在执行的任务引用：QRunnable 被 Python 回收后线程池就无法再执行它
+        self._active_task = None
+        self._closing = False
         self.setWindowTitle("自动值班排班系统")
         self.resize(1280, 800)
         self._build_ui()
@@ -467,6 +533,78 @@ class MainWindow(QMainWindow):
         self._restore_result()
         self.statusBar().showMessage(
             "已恢复上次的排班结果。" if self.result is not None else "就绪。请上传成员课表。")
+
+    # ---------- 数据缓存 ----------
+
+    def invalidate_cache(self) -> None:
+        """成员 / 课程 / 请假发生写入后调用，下次读取自动重查数据库"""
+        self._members_cache = None
+        self._courses_cache = None
+        self._leaves_cache = None
+        self._busy_cache = None
+        self._gap_cache = None
+
+    def members(self) -> list:
+        if self._members_cache is None:
+            self._members_cache = self.db.list_members()
+        return self._members_cache
+
+    def courses(self) -> list:
+        if self._courses_cache is None:
+            self._courses_cache = self.db.get_courses()
+        return self._courses_cache
+
+    def leaves(self) -> list:
+        if self._leaves_cache is None:
+            self._leaves_cache = self.db.list_leaves()
+        return self._leaves_cache
+
+    def busy_map(self) -> dict[int, set]:
+        """课程忙时表（按 成员 -> {(周, 星期, 节次)}）"""
+        if self._busy_cache is None:
+            self._busy_cache = build_busy_map(self.members(), self.courses())
+        return self._busy_cache
+
+    # ---------- 后台任务 ----------
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def run_async(self, label: str, fn: Callable[[], object],
+                  on_done: Callable[[object], None]) -> None:
+        """后台执行 fn()，完成或失败后在主线程回调，期间给出忙碌提示。
+
+        排班计算与 Excel/PNG 生成在成员较多时会阻塞主线程导致界面无响应，
+        统一走线程池；同一时刻只允许一个后台任务，避免结果互相覆盖。
+        """
+        if self._closing or self._busy:
+            if not self._closing:
+                self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
+            return
+        self._busy = True
+        self.btn_generate.setEnabled(False)
+        self.statusBar().showMessage(f"{label}…")
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        task = _Task(fn)
+        task.signals.done.connect(lambda result: self._finish_async(on_done, result))
+        task.signals.failed.connect(lambda msg: self._finish_async(None, None, msg))
+        self._active_task = task
+        self._pool.start(task)
+
+    def _finish_async(self, on_done, result, error: str | None = None) -> None:
+        self._active_task = None
+        if getattr(self, "_closing", False):
+            return
+        self._busy = False
+        self.btn_generate.setEnabled(True)
+        QApplication.restoreOverrideCursor()
+        if error is not None:
+            self.statusBar().showMessage(f"操作失败：{error}")
+            QMessageBox.warning(self, "操作失败", error)
+            return
+        if on_done is not None:
+            on_done(result)
 
     # ---------- 界面构建 ----------
 
@@ -762,6 +900,13 @@ class MainWindow(QMainWindow):
         self.gantt_hint.setWordWrap(True)
         v5.addWidget(self.gantt_hint)
         self.gantt_table = QTableWidget()
+        # 表头列宽/行高只设置一次：以前每次刷新甘特图都重设
+        # ResizeToContents，会触发整表列宽重算，成员多时明显拖慢刷新
+        gantt_header = self.gantt_table.horizontalHeader()
+        gantt_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        gantt_header.setStretchLastSection(False)
+        gantt_header.setMinimumHeight(44)
+        self.gantt_table.verticalHeader().setDefaultSectionSize(28)
         v5.addWidget(_card(self.gantt_table), stretch=1)
         self.tabs.addTab(tab5, "空闲甘特图")
 
@@ -797,7 +942,7 @@ class MainWindow(QMainWindow):
     # ---------- 数据刷新 ----------
 
     def refresh_members(self) -> None:
-        members = self.db.list_members()
+        members = self.members()
         self.member_list.clear()
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
@@ -839,16 +984,15 @@ class MainWindow(QMainWindow):
     def _restore_result(self) -> None:
         """启动时从数据库恢复上次的排班结果（关闭程序不会丢失）"""
         assignments = self.db.load_assignments()
-        members = self.db.list_members()
+        members = self.members()
         if not assignments or not members:
             return
-        config = self._current_config()
+        # 优先用「生成时保存的参数」判定缺口；没有记录（老版本数据）才退回当前界面参数
+        config = self._last_config or self._load_last_config() or self._current_config()
         result = ScheduleResult()
         result.assignments = assignments
         result.member_stats = rebuild_member_stats(members, assignments)
-        grid = {(w, d, b) for w in config.weeks for d in config.weekdays for b in config.blocks}
-        covered = {(a.week, a.weekday, a.block) for a in assignments}
-        result.gaps = sorted(g for g in grid if g not in covered)
+        result.gaps = compute_gaps(assignments, config)
         self.result = result
         self._last_config = config
         self._stale = False
@@ -885,10 +1029,13 @@ class MainWindow(QMainWindow):
                 return
             migrated = False
         else:
-            shutil.copy2(current, new_path)
+            # 用 SQLite 在线备份而非文件复制：WAL 模式下最新数据与 schema
+            # 可能还在 -wal 文件里，直接复制主库会得到损坏/缺失内容的副本
+            self.db.backup_to(new_path)
             migrated = True
         QSettings().setValue("database/path", str(new_path))
         self.db = Database(new_path)
+        self.invalidate_cache()
         self._update_db_path_label()
         self.result = None
         self._last_config = None
@@ -913,39 +1060,93 @@ class MainWindow(QMainWindow):
 
     # ---------- 参数持久化 ----------
 
+    def _param_specs(self) -> list[tuple[str, object, str, object]]:
+        """参数控件 -> QSettings 键 的登记表：(类型, 控件, 键, 默认值)。
+
+        新增一个可持久化参数只需在这里加一行：读写逻辑共用同一份声明，
+        避免以前「加了控件忘了加 _load_settings / _save_settings」的漏改问题。
+        """
+        specs: list[tuple[str, object, str, object]] = [
+            ("spin", self.week_from, "week_from", 1),
+            ("spin", self.week_to, "week_to", 18),
+            ("spin", self.per_slot, "per_slot", 1),
+            ("spin", self.max_week, "max_week", 3),
+            ("spin", self.max_day, "max_day", 1),
+            ("spin", self.seed, "seed", 42),
+            ("spin", self.gantt_week, "gantt_week", 1),
+            ("date", self.term_start, "term_start", None),
+        ]
+        specs += [("check", cb, f"weekday_{d}", d <= 5)
+                  for d, cb in self.weekday_checks.items()]
+        specs += [("check", cb, f"block_{b}", True)
+                  for b, cb in self.block_checks.items()]
+        return specs
+
     def _load_settings(self) -> None:
         s = QSettings()
-        if not s.contains("week_from"):
-            return
-        self.week_from.setValue(int(s.value("week_from", 1)))
-        self.week_to.setValue(int(s.value("week_to", 18)))
-        self.per_slot.setValue(int(s.value("per_slot", 1)))
-        self.max_week.setValue(int(s.value("max_week", 3)))
-        self.max_day.setValue(int(s.value("max_day", 1)))
-        self.seed.setValue(int(s.value("seed", 42)))
-        self.gantt_week.setValue(int(s.value("gantt_week", 1)))
-        ts = QDate.fromString(str(s.value("term_start", "")), "yyyy-MM-dd")
-        if ts.isValid():
-            self.term_start.setDate(ts)
-        for d, cb in self.weekday_checks.items():
-            cb.setChecked(int(s.value(f"weekday_{d}", 1 if d <= 5 else 0)) == 1)
-        for b, cb in self.block_checks.items():
-            cb.setChecked(int(s.value(f"block_{b}", 1)) == 1)
+        for kind, widget, key, default in self._param_specs():
+            if kind == "spin":
+                widget.setValue(int(s.value(key, default)))
+            elif kind == "check":
+                if s.contains(key):
+                    widget.setChecked(int(s.value(key, 1 if default else 0)) == 1)
+                else:
+                    widget.setChecked(bool(default))
+            elif kind == "date":
+                parsed = QDate.fromString(str(s.value(key, "") or ""), "yyyy-MM-dd")
+                if parsed.isValid():
+                    widget.setDate(parsed)
 
     def _save_settings(self) -> None:
         s = QSettings()
-        s.setValue("week_from", self.week_from.value())
-        s.setValue("week_to", self.week_to.value())
-        s.setValue("per_slot", self.per_slot.value())
-        s.setValue("max_week", self.max_week.value())
-        s.setValue("max_day", self.max_day.value())
-        s.setValue("seed", self.seed.value())
-        s.setValue("gantt_week", self.gantt_week.value())
-        s.setValue("term_start", self.term_start.date().toString("yyyy-MM-dd"))
-        for d, cb in self.weekday_checks.items():
-            s.setValue(f"weekday_{d}", 1 if cb.isChecked() else 0)
-        for b, cb in self.block_checks.items():
-            s.setValue(f"block_{b}", 1 if cb.isChecked() else 0)
+        for kind, widget, key, _default in self._param_specs():
+            if kind == "spin":
+                s.setValue(key, widget.value())
+            elif kind == "check":
+                s.setValue(key, 1 if widget.isChecked() else 0)
+            elif kind == "date":
+                s.setValue(key, widget.date().toString("yyyy-MM-dd"))
+
+    # ---------- 上次排班参数持久化 ----------
+    # 缺口判定依赖 per_slot/星期/时段等参数。只存排班结果的话，用户改过参数
+    # 再重启，缺口清单就会与实际排班对不上——因此把生成时的参数一并存下来。
+
+    def _config_key(self) -> str:
+        """上次排班参数的存储键：按数据库文件区分。
+
+        切换到另一个数据库（或恢复备份）时，各自的排班参数互不干扰，
+        否则会用 A 库的 per_slot 去判断 B 库的缺口。
+        """
+        return f"schedule/last_config/{self.db.path}"
+
+    def _save_last_config(self, config: ScheduleConfig) -> None:
+        QSettings().setValue(self._config_key(), json.dumps({
+            "weeks": [config.weeks.start, config.weeks.stop - 1],
+            "weekdays": list(config.weekdays),
+            "blocks": list(config.blocks),
+            "per_slot": config.per_slot,
+            "max_per_week": config.max_per_week,
+            "max_per_day": config.max_per_day,
+            "seed": config.seed,
+        }))
+
+    def _load_last_config(self) -> ScheduleConfig | None:
+        raw = QSettings().value(self._config_key(), "", type=str)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            lo, hi = int(data["weeks"][0]), int(data["weeks"][1])
+            return ScheduleConfig(
+                weeks=range(lo, hi + 1),
+                weekdays=[int(x) for x in data["weekdays"]],
+                blocks=[int(x) for x in data["blocks"]],
+                per_slot=int(data.get("per_slot", 1)),
+                max_per_week=int(data.get("max_per_week", 3)),
+                max_per_day=int(data.get("max_per_day", 1)),
+                seed=int(data.get("seed", 42)))
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
 
     def _on_term_start_changed(self) -> None:
         """学期起始日只影响日期显示，改完立即刷新结果表"""
@@ -953,6 +1154,8 @@ class MainWindow(QMainWindow):
             self.refresh_schedule_tabs()
 
     def closeEvent(self, event) -> None:
+        # 关闭时可能有后台任务在跑：置位后回调直接返回，避免回写到已关闭的界面
+        self._closing = True
         self._save_settings()
         super().closeEvent(event)
 
@@ -966,26 +1169,48 @@ class MainWindow(QMainWindow):
         fill_table(self.stats_table, build_stats_df(result.member_stats))
 
         n = len(result.assignments)
-        self.summary_label.setText(
+        summary = (
             f"排班完成：共 {n} 人次安排 | 参与成员 {len(result.member_stats)} 人 | "
             f"人均 {n / max(len(result.member_stats), 1):.1f} 次 | "
             f"总次数极差 {result.balanced_spread}（越小越均衡）| "
-            f"无人可用时段 {len(result.gaps)} 个（成员有课、请假、已达每周/每天上限或当天已值过）")
+            f"无人可用时段 {len(result.gaps)} 个")
+        if result.gaps:
+            # 区分「排不了」（课程/请假冲突）与「排不下」（上限不足）：
+            # 前者只能增加成员，后者提高上限即可，给出的建议必须能落地
+            summary += "。" + capacity_advice(
+                summarize_gap_causes(self._gap_diagnoses(result)), self._config_per_slot(result))
+        self.summary_label.setText(summary)
         has_data = bool(result.assignments)
         self.btn_export_xlsx.setEnabled(has_data)
         self.btn_export_csv.setEnabled(has_data)
         self.btn_export_png.setEnabled(has_data)
 
         if result.gaps:
-            self.gap_title.setText(f"无人可值时段（{len(result.gaps)} 个）")
-            gap_df = pd.DataFrame([{
-                "周次": f"第{w}周", "星期": WEEKDAY_LABELS[d], "时段": BLOCK_LABELS[b],
-            } for w, d, b in result.gaps])
-            fill_table(self.gap_table, gap_df)
+            self.gap_title.setText(
+                f"无人可值时段（{len(result.gaps)} 个，按成因分类，可对照处理）")
+            fill_table(self.gap_table, build_gap_df(self._gap_diagnoses(result)))
         else:
             self.gap_title.setText("所有值班时段均已安排到位，无缺口。")
-            fill_table(self.gap_table, pd.DataFrame(columns=["周次", "星期", "时段"]))
+            fill_table(self.gap_table, pd.DataFrame(
+                columns=["周次", "星期", "时段", "主要原因", "无课人数"]))
         self.refresh_charts()
+
+    # ---------- 缺口诊断 ----------
+
+    def _config_per_slot(self, result: ScheduleResult) -> int:
+        cfg = self._last_config or self._load_last_config()
+        return cfg.per_slot if cfg is not None else 1
+
+    def _gap_diagnoses(self, result: ScheduleResult) -> list:
+        """缺口成因诊断（带缓存：参数不变时同一结果只算一次）"""
+        cached = self._gap_cache
+        if cached is not None and cached[0] is result:
+            return cached[1]
+        cfg = self._last_config or self._load_last_config() or self._current_config()
+        diagnoses = diagnose_gaps(self.members(), self.busy_map(), self.leaves(),
+                                  result.assignments, cfg)
+        self._gap_cache = (result, diagnoses)
+        return diagnoses
 
     def _term_start(self) -> date:
         return self.term_start.date().toPython()
@@ -1048,7 +1273,7 @@ class MainWindow(QMainWindow):
         self.gantt_week.setValue(week)
 
     def refresh_gantt(self) -> None:
-        members = self.db.list_members()
+        members = self.members()
         weekdays = [d for d, cb in self.weekday_checks.items() if cb.isChecked()]
         blocks = [b for b, cb in self.block_checks.items() if cb.isChecked()]
         if not members or not weekdays or not blocks:
@@ -1061,10 +1286,11 @@ class MainWindow(QMainWindow):
             return
 
         matrix = build_availability(
-            members, self.db.get_courses(),
+            members, self.courses(),
             self.gantt_week.value(), weekdays, blocks,
-            leaves=self.db.list_leaves(),
-            assignments=self.result.assignments if self.result else None)
+            leaves=self.leaves(),
+            assignments=self.result.assignments if self.result else None,
+            busy=self.busy_map())
         self.gantt_matrix = matrix
         self._fill_gantt_table(matrix)
 
@@ -1081,69 +1307,110 @@ class MainWindow(QMainWindow):
                 "选择空闲人数最多的时段最容易凑齐人。")
         self.btn_export_gantt.setEnabled(True)
 
+    @staticmethod
+    def _apply_cell(item: QTableWidgetItem, state: tuple) -> None:
+        """把期望状态写入单元格（仅在状态变化时调用）"""
+        text, bg, fg, tooltip, centered = state
+        item.setText(text)
+        item.setBackground(QBrush(bg))
+        item.setForeground(QBrush(fg) if fg is not None else QBrush())
+        item.setToolTip(tooltip)
+        if centered:
+            item.setTextAlignment(Qt.AlignCenter)
+        else:
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    @staticmethod
+    def _cell_state(item: QTableWidgetItem) -> tuple:
+        """读取单元格当前状态，与 _apply_cell 的元组一一对应"""
+        brush = item.foreground()
+        fg = None if brush.style() == Qt.NoBrush else brush.color()
+        centered = bool(item.textAlignment() & Qt.AlignCenter)
+        return (item.text(), item.background().color(), fg, item.toolTip(), centered)
+
+    def _fill_cell(self, t: QTableWidget, r: int, c: int, state: tuple,
+                   cache: dict) -> None:
+        """带 Python 侧缓存地设置单元格
+
+        先在 Python 里比较期望状态与上次写入的状态：完全一致就直接跳过，
+        一次 Qt 属性访问都不做。读取 Qt 属性（text/background/foreground/
+        toolTip/alignment）看似便宜，但成员多时每帧要读数万次，实测是
+        甘特图刷新里最大的一块开销。
+        """
+        key = (r, c)
+        if cache.get(key) == state:
+            return
+        item = t.item(r, c)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled)
+            t.setItem(r, c, item)
+        elif item.flags() & Qt.ItemIsEditable:
+            item.setFlags(Qt.ItemIsEnabled)
+        self._apply_cell(item, state)
+        cache[key] = state
+
     def _fill_gantt_table(self, m: AvailabilityMatrix) -> None:
         """行=成员（末行为汇总），列=星期x时段；
-        空闲绿色、有课灰色、请假红色、值班蓝色、全员空闲橙色"""
+        空闲绿色、有课灰色、请假红色、值班蓝色、全员空闲橙色。
+
+        复用已有 QTableWidgetItem：成员多时表格有数千个单元格，
+        每次重建 item 会造成明显卡顿，因此只在结构变化时重建行列表头。
+        """
         t = self.gantt_table
         FREE, BUSY, ALL_FREE, LEAVE, DUTY = (
             QColor("#c9f2cf"), QColor("#f2f2f7"), QColor("#ffd9a8"),
             QColor("#ffd6d2"), QColor("#b8d9ff"))
-        t.clearContents()
-        t.setRowCount(m.member_count + 1)
-        t.setColumnCount(len(m.slots))
+        NO_COLOR = QColor("#1d1d1f")
+        BUSY_COLOR = QColor("#aeaeb2")
+        LEAVE_COLOR = QColor("#b3261e")
+        DUTY_COLOR = QColor("#0a5aa8")
+        ALL_FREE_COLOR = QColor("#b25e00")
+
+        rows, cols = m.member_count + 1, len(m.slots)
+        if t.rowCount() != rows or t.columnCount() != cols:
+            t.clearContents()
+            t.setRowCount(rows)
+            t.setColumnCount(cols)
+            cache = {}
+            self._gantt_cell_state = cache
+        else:
+            cache = self._gantt_cell_state
         t.setVerticalHeaderLabels(m.member_names + ["空闲人数"])
         t.setHorizontalHeaderLabels([slot_header(d, b) for d, b in m.slots])
 
+        week = m.week
         for r in range(m.member_count):
+            free_row = m.free[r]
             for i, (d, b) in enumerate(m.slots):
-                item = QTableWidgetItem("")
-                item.setFlags(Qt.ItemIsEnabled)
                 leave_reason = m.leave_info.get((r, d))
                 if leave_reason is not None:
-                    item.setBackground(LEAVE)
-                    item.setText("假")
-                    item.setForeground(QBrush(QColor("#b3261e")))
-                    item.setTextAlignment(Qt.AlignCenter)
                     reason = f"（{leave_reason}）" if leave_reason else ""
-                    item.setToolTip(f"第{m.week}周 {WEEKDAY_LABELS[d]}：请假{reason}")
+                    state = ("假", LEAVE, LEAVE_COLOR,
+                             f"第{week}周 {WEEKDAY_LABELS[d]}：请假{reason}", True)
                 elif (r, d, b) in m.duty_cells:
-                    item.setBackground(DUTY)
-                    item.setText("值")
-                    item.setForeground(QBrush(QColor("#0a5aa8")))
-                    item.setTextAlignment(Qt.AlignCenter)
-                    item.setToolTip(f"第{m.week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：已排值班")
-                elif m.free[r][i]:
-                    item.setBackground(FREE)
-                    item.setToolTip(f"第{m.week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：空闲")
+                    state = ("值", DUTY, DUTY_COLOR,
+                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：已排值班", True)
+                elif free_row[i]:
+                    state = ("", FREE, None,
+                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：空闲", False)
                 else:
                     names = m.busy_courses.get((r, d, b), [])
-                    item.setBackground(BUSY)
-                    item.setText("课")
-                    item.setForeground(QBrush(QColor("#aeaeb2")))
-                    item.setTextAlignment(Qt.AlignCenter)
-                    item.setToolTip(
-                        f"第{m.week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：\n"
-                        + "\n".join(names))
-                t.setItem(r, i, item)
+                    state = ("课", BUSY, BUSY_COLOR,
+                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：\n"
+                             + "\n".join(names), True)
+                self._fill_cell(t, r, i, state, cache)
 
         r = m.member_count
         for i, (d, b) in enumerate(m.slots):
             all_free = m.free_counts[i] == m.member_count
-            item = QTableWidgetItem(f"{m.free_counts[i]}/{m.member_count}")
-            item.setFlags(Qt.ItemIsEnabled)
-            item.setTextAlignment(Qt.AlignCenter)
-            if all_free:
-                item.setBackground(ALL_FREE)
-                item.setForeground(QBrush(QColor("#b25e00")))
-            t.setItem(r, i, item)
+            state = (f"{m.free_counts[i]}/{m.member_count}",
+                     ALL_FREE if all_free else QColor(0, 0, 0, 0),
+                     ALL_FREE_COLOR if all_free else NO_COLOR, "", True)
+            self._fill_cell(t, r, i, state, cache)
             head = t.horizontalHeaderItem(i)
-            head.setForeground(QBrush(QColor("#ff9500" if all_free else "#86868b")))
-
-        t.verticalHeader().setDefaultSectionSize(28)
-        header = t.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(False)
-        header.setMinimumHeight(44)
+            if head is not None:
+                head.setForeground(QBrush(QColor("#ff9500" if all_free else "#86868b")))
 
     def export_gantt(self) -> None:
         m = self.gantt_matrix
@@ -1153,14 +1420,17 @@ class MainWindow(QMainWindow):
             self, "导出甘特图 Excel", f"空闲甘特图_第{m.week}周.xlsx", "Excel 文件 (*.xlsx)")
         if not path:
             return
-        Path(path).write_bytes(export_gantt_excel(m))
-        self.statusBar().showMessage(f"已导出甘特图 Excel：{path}")
+        target = Path(path)
+        self.run_async(
+            "正在导出甘特图",
+            lambda: target.write_bytes(export_gantt_excel(m)),
+            lambda _r: self.statusBar().showMessage(f"已导出甘特图 Excel：{target}"))
 
     # ---------- 统计图表 ----------
 
     def refresh_charts(self) -> None:
         """刷新三张统计图：成员值班次数 / 每周值班人次 / 成员请假天数"""
-        members = self.db.list_members()
+        members = self.members()
         if self.result is not None:
             stats = rebuild_member_stats(members, self.result.assignments)
             self.chart_duty.set_data([(s["name"], s["total"]) for s in stats.values()])
@@ -1171,7 +1441,7 @@ class MainWindow(QMainWindow):
         else:
             self.chart_duty.set_data([])
             self.chart_weekly.set_data([])
-        leave_cnt = Counter(l.member_id for l in self.db.list_leaves())
+        leave_cnt = Counter(l.member_id for l in self.leaves())
         name_of = {m.id: m.name for m in members}
         self.chart_leave.set_data(sorted(
             ((name_of.get(mid, "已删除成员"), n) for mid, n in leave_cnt.items()),
@@ -1190,8 +1460,11 @@ class MainWindow(QMainWindow):
             self, "导出统计图", "值班请假统计图.png", "PNG 图片 (*.png)")
         if not path:
             return
-        render_charts_png(charts, Path(path))
-        self.statusBar().showMessage(f"已导出统计图：{path}")
+        target = Path(path)
+        self.run_async(
+            "正在导出统计图",
+            lambda: render_charts_png(charts, target),
+            lambda _r: self.statusBar().showMessage(f"已导出统计图：{target}"))
 
     # ---------- 请假登记 ----------
 
@@ -1237,6 +1510,7 @@ class MainWindow(QMainWindow):
             return
         m = self.db.get_member(member_id)
         self.db.add_leave(member_id, week.value(), wd.currentData(), reason.text().strip())
+        self.invalidate_cache()
         self._refresh_leaves(member_id)
         self.refresh_gantt()
         self.refresh_charts()
@@ -1253,6 +1527,7 @@ class MainWindow(QMainWindow):
         leave_id = self.leave_table.item(row, 0).data(Qt.UserRole)
         member_id = self.member_combo.currentData()
         self.db.remove_leave(leave_id)
+        self.invalidate_cache()
         self._refresh_leaves(member_id)
         self.refresh_gantt()
         self.refresh_charts()
@@ -1261,7 +1536,7 @@ class MainWindow(QMainWindow):
 
     def export_leaves(self) -> None:
         """导出所有成员的请假记录为 Excel（按钮位于请假登记卡片）"""
-        leaves = self.db.list_leaves()
+        leaves = self.leaves()
         if not leaves:
             QMessageBox.information(self, "提示", "暂无请假记录可导出。")
             return
@@ -1269,10 +1544,15 @@ class MainWindow(QMainWindow):
             self, "导出请假记录", "请假记录.xlsx", "Excel 文件 (*.xlsx)")
         if not path:
             return
-        members = self.db.list_members()
-        Path(path).write_bytes(
-            export_leaves_excel(leaves, members, start_date=self._term_start()))
-        self.statusBar().showMessage(f"已导出请假记录（{len(leaves)} 条）：{path}")
+        members = self.members()
+        start = self._term_start()
+        target = Path(path)
+        self.run_async(
+            "正在导出请假记录",
+            lambda: target.write_bytes(
+                export_leaves_excel(leaves, members, start_date=start)),
+            lambda _r: self.statusBar().showMessage(
+                f"已导出请假记录（{len(leaves)} 条）：{target}"))
 
     # ---------- 手动微调 ----------
 
@@ -1292,9 +1572,9 @@ class MainWindow(QMainWindow):
         slot_assignments = [a for a in self.result.assignments
                             if a.week == week and a.weekday == weekday and a.block == block]
         current = {a.member_id: a for a in slot_assignments}
-        members = self.db.list_members()
-        busy = build_busy_map(members, self.db.get_courses())
-        leave_set = {(l.member_id, l.week, l.weekday) for l in self.db.list_leaves()}
+        members = self.members()
+        busy = self.busy_map()
+        leave_set = {(l.member_id, l.week, l.weekday) for l in self.leaves()}
         cands = replacement_candidates(
             members, busy, leave_set, self.result.assignments,
             week, weekday, block, cfg.max_per_week, cfg.max_per_day)
@@ -1378,11 +1658,11 @@ class MainWindow(QMainWindow):
         """执行微调：out_id 换出（None=纯新增），in_id 换入（None=纯移除）"""
         if self.result is None or self._last_config is None:
             return
-        members = {m.id: m for m in self.db.list_members()}
+        members = {m.id: m for m in self.members()}
         cfg = self._last_config
         if in_id is not None:
-            busy = build_busy_map(list(members.values()), self.db.get_courses())
-            leave_set = {(l.member_id, l.week, l.weekday) for l in self.db.list_leaves()}
+            busy = self.busy_map()
+            leave_set = {(l.member_id, l.week, l.weekday) for l in self.leaves()}
             # 硬约束（课程/请假/每天一次）必须满足；周上限允许手动越限
             eligible = {m.id for m, reason in replacement_candidates(
                 list(members.values()), busy, leave_set, self.result.assignments,
@@ -1403,11 +1683,11 @@ class MainWindow(QMainWindow):
                 member_id=in_id, member_name=members[in_id].name))
         self.result.assignments = kept
         self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
-        grid = {(w, d, b) for w in cfg.weeks for d in cfg.weekdays for b in cfg.blocks}
-        covered = {(a.week, a.weekday, a.block) for a in kept}
-        self.result.gaps = sorted(g for g in grid if g not in covered)
-        self.db.clear_assignments()
-        self.db.save_assignments(kept)
+        self.result.gaps = compute_gaps(kept, cfg)
+        # 只重写被调整的那一个时段，避免全表清空 + 全量重写
+        self.db.replace_slot(week, weekday, block,
+                             [a.member_id for a in kept
+                              if (a.week, a.weekday, a.block) == (week, weekday, block)])
         self._stale = False
         self.refresh_schedule_tabs()
         out_name = members[out_id].name if out_id is not None else None
@@ -1429,7 +1709,7 @@ class MainWindow(QMainWindow):
             "课表文件 (*.xls *.xlsx);;所有文件 (*)")
         if not files:
             return
-        known = {(m.student_id, m.name) for m in self.db.list_members()}
+        known = {(m.student_id, m.name) for m in self.members()}
         added, updated, errors = 0, 0, []
         for f in files:
             try:
@@ -1445,6 +1725,7 @@ class MainWindow(QMainWindow):
             known.add((schedule.student_id, schedule.name))
             added += 0 if is_update else 1
             updated += 1 if is_update else 0
+        self.invalidate_cache()
         self.refresh_members()
         if errors:
             QMessageBox.warning(self, "部分文件导入失败", "\n".join(errors))
@@ -1454,7 +1735,7 @@ class MainWindow(QMainWindow):
         if updated:
             parts.append(f"更新 {updated} 份课表（同学号同名，课程整体替换）")
         if parts:
-            self.statusBar().showMessage("、".join(parts) + f"；当前共 {len(self.db.list_members())} 名成员。")
+            self.statusBar().showMessage("、".join(parts) + f"；当前共 {len(self.members())} 名成员。")
         else:
             self.statusBar().showMessage("未导入任何文件。")
 
@@ -1472,6 +1753,7 @@ class MainWindow(QMainWindow):
                 f"确定删除成员「{m.name}」？其课程与排班记录将一并移除。",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             self.db.delete_member(member_id)
+            self.invalidate_cache()
             self.refresh_members()
             self.statusBar().showMessage(f"已删除成员 {m.name}。")
 
@@ -1500,7 +1782,7 @@ class MainWindow(QMainWindow):
         )
 
     def generate(self) -> None:
-        members = self.db.list_members()
+        members = self.members()
         if not members:
             QMessageBox.information(self, "提示", "请先上传成员课表。")
             return
@@ -1516,26 +1798,48 @@ class MainWindow(QMainWindow):
         # 按周增量：只重排所选周范围，范围外的历史排班保留并作为均衡基数
         existing = self.db.load_assignments()
         base = [a for a in existing if a.week not in config.weeks]
-        result = generate_schedule(
-            members, self.db.get_courses(), config,
-            leaves=self.db.list_leaves(), base_assignments=base)
-        fresh = [a for a in result.assignments if a.week in config.weeks]
-        self.db.delete_assignments_for_weeks(list(config.weeks))
-        self.db.save_assignments(fresh)
+        courses, leaves = self.courses(), self.leaves()
+
+        def work() -> dict:
+            # 后台线程内自行构建忙时表：避免跨线程读取主线程缓存
+            result = generate_schedule(members, courses, config,
+                                       leaves=leaves, base_assignments=base)
+            return {
+                "result": result,
+                "fresh": [a for a in result.assignments if a.week in config.weeks],
+                "base_n": len(base),
+                "leaves_n": len(leaves),
+            }
+
+        self.run_async("正在排班",
+                       work,
+                       lambda payload: self._apply_generation(payload, config))
+
+    def _apply_generation(self, payload: dict, config: ScheduleConfig) -> None:
+        """排班计算完成后回到主线程：落库 + 刷新界面"""
+        result = payload["result"]
+        fresh = payload["fresh"]
+        # 只同步发生变化的行：未变动的历史安排保持原行，避免整周删除重建
+        added, removed = self.db.sync_assignments_for_weeks(list(config.weeks), fresh)
         self.result = result
         self._last_config = config
         self._stale = False
+        self._save_last_config(config)
         self.refresh_schedule_tabs()
         self.refresh_gantt()
         self.tabs.setCurrentIndex(0)
-        leave_n = len(self.db.list_leaves())
         scope = (f"第{config.weeks.start}–{config.weeks.stop - 1}周" if len(config.weeks) > 1
                  else f"第{config.weeks.start}周")
-        kept = f"，范围外历史排班 {len(base)} 人次保留" if base else ""
+        kept = f"，范围外历史排班 {payload['base_n']} 人次保留" if payload["base_n"] else ""
+        repaired = f"，缺口修复补上 {result.repaired} 个时段" if getattr(result, "repaired", 0) else ""
+        advice = capacity_advice(
+            summarize_gap_causes(self._gap_diagnoses(result)), config.per_slot)
         self.statusBar().showMessage(
-            f"已重新排班 {scope}：本次安排 {len(fresh)} 人次{kept}，"
-            f"无人可用时段 {len(result.gaps)} 个，总次数极差 {result.balanced_spread}"
-            + (f"，已避让 {leave_n} 条请假记录。" if leave_n else "。"))
+            f"已重新排班 {scope}：本次安排 {len(fresh)} 人次（新增 {added} / 移除 {removed}）"
+            f"{kept}，无人可用时段 {len(result.gaps)} 个{repaired}，"
+            f"总次数极差 {result.balanced_spread}"
+            + (f"，已避让 {payload['leaves_n']} 条请假记录。" if payload["leaves_n"] else "。")
+            + (advice if advice else ""))
 
     def _export_scope(self) -> tuple | None:
         """导出前选择周数：返回 (assignments, stats, gaps, 周次文本) 或 None（取消导出）"""
@@ -1557,38 +1861,54 @@ class MainWindow(QMainWindow):
             return self.result.assignments, self.result.member_stats, self.result.gaps, weeks_txt
         week = int(sel[1:-1])
         assignments = [a for a in self.result.assignments if a.week == week]
-        members = self.db.list_members()
+        members = self.members()
         stats = rebuild_member_stats(members, assignments)
         gaps = [g for g in self.result.gaps if g[0] == week]
         return assignments, stats, gaps, f"第{week}周"
 
-    def export_xlsx(self) -> None:
-        if self.result is None:
+    def _export_bytes(self, label: str, filename: str, suffix: str, filt: str,
+                      weeks_txt: str, build: Callable[[], bytes]) -> None:
+        """导出通用流程：选路径（主线程）-> 生成字节并写盘（后台线程）。
+
+        openpyxl 生成大表、PNG 渲染在成员多时耗时明显，放到线程池避免界面卡顿。
+        周次选择已由调用方完成，这里不再弹窗（否则会重复询问）。
+        """
+        path, _ = QFileDialog.getSaveFileName(self, label, filename, filt)
+        if not path:
             return
+        target = Path(path)
+
+        def work() -> bytes:
+            data = build()
+            target.write_bytes(data)
+            return data
+
+        self.run_async(f"正在导出{suffix}",
+                       work,
+                       lambda _data: self.statusBar().showMessage(
+                           f"已导出{suffix}（{weeks_txt}）：{target}"))
+
+    def export_xlsx(self) -> None:
         scope = self._export_scope()
         if scope is None:
             return
         assignments, stats, gaps, weeks_txt = scope
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 Excel", f"值班排班表_{weeks_txt}.xlsx", "Excel 文件 (*.xlsx)")
-        if not path:
-            return
-        Path(path).write_bytes(export_excel(assignments, stats, gaps, start_date=self._term_start()))
-        self.statusBar().showMessage(f"已导出 Excel（{weeks_txt}）：{path}")
+        # 界面控件只能在主线程读：先生成函数参数，再交给后台线程
+        start = self._term_start()
+        self._export_bytes(
+            "导出 Excel", f"值班排班表_{weeks_txt}.xlsx", "Excel", "Excel 文件 (*.xlsx)",
+            weeks_txt,
+            lambda: export_excel(assignments, stats, gaps, start_date=start))
 
     def export_csv(self) -> None:
-        if self.result is None:
-            return
         scope = self._export_scope()
         if scope is None:
             return
         assignments, _, _, weeks_txt = scope
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 CSV", f"值班排班表_{weeks_txt}.csv", "CSV 文件 (*.csv)")
-        if not path:
-            return
-        Path(path).write_bytes(export_csv(assignments, start_date=self._term_start()))
-        self.statusBar().showMessage(f"已导出 CSV（{weeks_txt}）：{path}")
+        start = self._term_start()
+        self._export_bytes(
+            "导出 CSV", f"值班排班表_{weeks_txt}.csv", "CSV", "CSV 文件 (*.csv)", weeks_txt,
+            lambda: export_csv(assignments, start_date=start))
 
     def export_png(self) -> None:
         if self.result is None:
@@ -1602,6 +1922,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         start = self._term_start()
+        frame = self._pivot_frame(assignments)
         if weeks_txt.startswith("第") and "–" not in weeks_txt:
             week = int(weeks_txt[1:-1])
             weekdays = sorted({a.weekday for a in assignments}) or [1]
@@ -1610,8 +1931,12 @@ class MainWindow(QMainWindow):
             subtitle = f"{weeks_txt}（{fd.month}月{fd.day}日–{ld.month}月{ld.day}日）"
         else:
             subtitle = (f"{weeks_txt} · {start.year}年{start.month}月{start.day}日起")
-        render_table_png(self._pivot_frame(assignments), "值班排班表", subtitle, Path(path))
-        self.statusBar().showMessage(f"已导出图片（{weeks_txt}）：{path}")
+        target = Path(path)
+        # QImage/QPainter 在非 GUI 线程绘到图片是允许的，这里直接写入目标文件
+        self.run_async(
+            "正在生成图片",
+            lambda: render_table_png(frame, "值班排班表", subtitle, target),
+            lambda _r: self.statusBar().showMessage(f"已导出图片（{weeks_txt}）：{target}"))
 
 
 def main() -> None:

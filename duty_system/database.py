@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .parser import Course, ParsedSchedule
+from .parser import ParsedSchedule
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -56,7 +56,24 @@ CREATE TABLE IF NOT EXISTS leaves (
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(member_id, week, weekday)
 );
+
+CREATE INDEX IF NOT EXISTS idx_courses_member ON courses(member_id);
+CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week);
+CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id);
+CREATE INDEX IF NOT EXISTS idx_leaves_week ON leaves(week);
 """
+
+# 结构迁移：只对已有数据库执行增量 DDL。
+# 每条迁移用 (版本号, SQL 列表)；执行后写入 PRAGMA user_version，
+# 避免「CREATE TABLE IF NOT EXISTS 对老库静默跳过」导致新字段不生效。
+MIGRATIONS: list[tuple[int, list[str]]] = [
+    (1, [
+        "CREATE INDEX IF NOT EXISTS idx_courses_member ON courses(member_id)",
+        "CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week)",
+        "CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id)",
+        "CREATE INDEX IF NOT EXISTS idx_leaves_week ON leaves(week)",
+    ]),
+]
 
 
 @dataclass
@@ -111,12 +128,50 @@ class Database:
         self.path = str(path)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """按 PRAGMA user_version 增量升级老数据库结构"""
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        for target, statements in MIGRATIONS:
+            if version >= target:
+                continue
+            for sql in statements:
+                conn.execute(sql)
+            conn.execute(f"PRAGMA user_version = {target}")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        # WAL：桌面单用户场景下读写并发更稳、写入更快；
+        # busy_timeout 避免与后台线程同时写时直接抛「database is locked」
+        conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
+
+    # ---------- 备份 / 迁移 ----------
+
+    def backup_to(self, target: str | Path) -> None:
+        """把当前数据库完整复制到 target（供「更改数据库位置」使用）。
+
+        必须用 SQLite 的在线备份 API，不能用 shutil.copy2：
+        启用 WAL 后最新数据与 schema 可能仍在 -wal 文件里，
+        只复制主库文件会得到一个打不开或丢数据的副本。
+        """
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        src = self._connect()
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        # 备份结果自带完整数据，清掉目标可能存在的伴随文件避免混淆
+        for suffix in ("-wal", "-shm"):
+            Path(f"{target}{suffix}").unlink(missing_ok=True)
 
     # ---------- 成员 ----------
 
@@ -223,11 +278,73 @@ class Database:
             conn.execute(f"DELETE FROM duty_assignments WHERE week IN ({ph})", weeks)
 
     def save_assignments(self, assignments: list[Assignment]) -> None:
+        """幂等写入：唯一键冲突时不做任何改动。
+        不再使用 INSERT OR REPLACE（那会先删后插，使自增 id 每轮膨胀）。"""
         with self._connect() as conn:
             conn.executemany(
-                """INSERT OR REPLACE INTO duty_assignments
-                   (week, weekday, block, member_id) VALUES (?, ?, ?, ?)""",
+                """INSERT INTO duty_assignments (week, weekday, block, member_id)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(week, weekday, block, member_id) DO NOTHING""",
                 [(a.week, a.weekday, a.block, a.member_id) for a in assignments],
+            )
+
+    def sync_assignments_for_weeks(
+        self,
+        weeks: list[int],
+        assignments: list[Assignment],
+    ) -> tuple[int, int]:
+        """把指定周的排班同步成 assignments：只删该周多余的行、只插新增的行。
+
+        相比「先删整周再全量插入」，未变化的安排保持原行不动——
+        自增 id 不膨胀，写入量也更小。返回 (新增数, 删除数)。
+        """
+        if not weeks:
+            return 0, 0
+        want = {(a.week, a.weekday, a.block, a.member_id) for a in assignments}
+        ph = ",".join("?" * len(weeks))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT week, weekday, block, member_id FROM duty_assignments
+                    WHERE week IN ({ph})""",
+                weeks,
+            ).fetchall()
+            have = {(r["week"], r["weekday"], r["block"], r["member_id"]) for r in rows}
+            stale = have - want
+            if stale:
+                conn.executemany(
+                    """DELETE FROM duty_assignments
+                       WHERE week = ? AND weekday = ? AND block = ? AND member_id = ?""",
+                    [tuple(x) for x in stale],
+                )
+            fresh = want - have
+            if fresh:
+                conn.executemany(
+                    """INSERT INTO duty_assignments (week, weekday, block, member_id)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(week, weekday, block, member_id) DO NOTHING""",
+                    [tuple(x) for x in fresh],
+                )
+        return len(fresh), len(stale)
+
+    def replace_slot(
+        self,
+        week: int,
+        weekday: int,
+        block: int,
+        member_ids: list[int],
+    ) -> None:
+        """只重写单个 (周, 星期, 时段) 的安排——手动微调用，
+        避免全表 clear + 全量重写的开销与中途失败风险。"""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM duty_assignments WHERE week = ? AND weekday = ? AND block = ?",
+                (week, weekday, block),
+            )
+            conn.executemany(
+                """INSERT INTO duty_assignments (week, weekday, block, member_id)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(week, weekday, block, member_id) DO NOTHING""",
+                [(week, weekday, block, mid) for mid in member_ids],
             )
 
     def load_assignments(self) -> list[Assignment]:

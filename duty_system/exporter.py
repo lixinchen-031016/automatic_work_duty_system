@@ -76,6 +76,22 @@ def build_pivot_df(
     return df
 
 
+def build_gap_df(diagnoses: list) -> pd.DataFrame:
+    """无人可值时段表：周次/星期/时段 + 成因与无课人数（诊断结果的展示层）
+
+    diagnoses 为 scheduler.GapDiagnosis 列表；只用属性访问，
+    避免 exporter 依赖 scheduler 造成循环导入。
+    """
+    rows = [{
+        "周次": f"第{d.week}周",
+        "星期": WEEKDAY_LABELS[d.weekday],
+        "时段": BLOCK_LABELS[d.block],
+        "主要原因": d.cause,
+        "无课人数": d.free_members,
+    } for d in diagnoses]
+    return pd.DataFrame(rows, columns=["周次", "星期", "时段", "主要原因", "无课人数"])
+
+
 def build_stats_df(member_stats: dict[int, dict]) -> pd.DataFrame:
     """值班统计表：每人总次数与值班周分布"""
     rows = [{

@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
 
 # 本地数据库
 duty_system.db

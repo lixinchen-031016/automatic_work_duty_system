@@ -4,6 +4,10 @@
 空闲判定与排班算法完全一致（时段块内每一节均无课才算空闲）。
 展示：app.py 用 QTableWidget 染色绘制甘特图；本模块提供导出
 带填充色的 Excel 甘特图（行=成员，列=星期x时段，绿=空闲）。
+
+性能：build_availability 接受调用方传入的 busy 忙时表（缓存后按周切换
+无需重建）；课程名索引复用忙时表判断「本周是否上课」，避免在 week_list
+上做线性查找。
 """
 
 from __future__ import annotations
@@ -55,21 +59,36 @@ def build_availability(
     blocks: list[int],
     leaves: list[Leave] | None = None,
     assignments: list[Assignment] | None = None,
+    busy: dict[int, set] | None = None,
 ) -> AvailabilityMatrix:
-    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）"""
-    busy = build_busy_map(members, courses)
+    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）
+
+    busy 可传入调用方缓存的忙时表（见 scheduler.build_busy_map）：
+    该表展开成本高，界面按周切换甘特图时无需重复构建。
+    """
+    if busy is None:
+        busy = build_busy_map(members, courses)
     leave_map = {(l.member_id, l.weekday): l.reason
                  for l in (leaves or []) if l.week == week}
     duty_set = {(a.member_id, a.weekday, a.block)
                 for a in (assignments or []) if a.week == week}
     # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）
+    # 用忙时表判断「这门课本周是否上课」：忙时表里存在 (周, 星期, 节次) 就等价于
+    # 本周有这门课，比在 week_list 里做线性查找快得多（课程多时差异明显）
     course_index: dict[tuple[int, int, int], set[str]] = {}
     member_ids = {m.id for m in members}
     for c in courses:
-        if c.member_id not in member_ids or week not in c.week_list:
+        if c.member_id not in member_ids:
             continue
-        for s in c.session_list:
-            course_index.setdefault((c.member_id, c.weekday, s), set()).add(c.course_name)
+        member_busy = busy.get(c.member_id)
+        if not member_busy:
+            continue
+        weekday = c.weekday
+        active = [sec for sec in c.session_list if (week, weekday, sec) in member_busy]
+        if not active:
+            continue
+        for session in active:
+            course_index.setdefault((c.member_id, weekday, session), set()).add(c.course_name)
 
     slots = [(d, b) for d in sorted(weekdays) for b in sorted(blocks)]
     free: list[list[bool]] = []
@@ -78,6 +97,7 @@ def build_availability(
     duty_cells: set[tuple[int, int, int]] = set()
     for m in members:
         row = len(free)  # 当前行号
+        member_busy = busy.get(m.id, ())
         row_free: list[bool] = []
         for d, b in slots:
             if (m.id, d) in leave_map:
@@ -91,7 +111,7 @@ def build_availability(
             names: set[str] = set()
             is_free = True
             for s in BLOCK_SESSIONS[b]:
-                if (week, d, s) in busy.get(m.id, ()):
+                if (week, d, s) in member_busy:
                     is_free = False
                     names |= course_index.get((m.id, d, s), set())
             row_free.append(is_free)

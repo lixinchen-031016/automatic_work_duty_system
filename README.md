@@ -171,7 +171,9 @@ PySide6>=6.7     # 桌面界面
 1. **值班排班表**：周×星期透视总表（含日期列）。双击任一值班单元格手动微调；下方为 Excel / CSV / 图片导出按钮（导出前选周）。
 2. **值班明细**：每行一个值班任务（周次、星期、日期、时段、值班人、人数）。
 3. **成员课表**：查看单个成员的逐周课表网格；下方为请假登记表格（添加 / 删除 / 导出请假记录）。
-4. **值班统计**：各成员值班次数（总/周/天）统计 + 无人可用时段缺口清单。
+4. **值班统计**：各成员值班次数（总/周/天）统计 + 无人可用时段缺口清单（带**成因分类**：
+   「成员均有课或请假」只能靠增加成员解决，「受每天/每周上限限制」提高上限即可排满，
+   摘要区会直接给出对应建议）。
 5. **空闲甘特图**：全员忙闲矩阵，颜色标记空闲/有课/值班/请假/全员空闲，可按周切换，导出 Excel。
 6. **统计图表**：值班次数 / 每周人次 / 请假天数三张柱状图，导出 PNG。
 
@@ -190,7 +192,25 @@ PySide6>=6.7     # 桌面界面
 
 - 安排顺序按三级优先级挑选成员：**累计总次数最少 → 本周次数最少 → 当天次数最少**。
 - 任务处理顺序采用**动态覆盖均衡**：优先安排当前覆盖最少的（星期 × 时段）组合，确保每天都排满、避免某天整天空缺。
-- 平手时按随机种子决定，保证同参数可复现。
+- 同覆盖度时再按**时段稀缺度**排序（可选人数少的时段先占），最后按随机种子决定，保证同参数可复现。
+- 贪心结束后对剩余缺口做**链式挪动修复**：把已排成员挪到缺人时段、再回填其原时段（深度 2，预算受限），实测在「人多班少」场景可把缺口从 50 降到 19 个；容量本身不足时不做无意义搜索。
+- 缺口口径统一由 `compute_gaps()` 计算（排班范围内人数不足 `每时段人数` 的时段），生成、重启恢复、手动微调三处完全一致。
+
+### 算法质量认证（为什么不改成网络流）
+
+`test_optimality.py` 用最大流建模求出**覆盖最优值**（该值本身对应一个合法排班），
+以此为基准对比生产算法：
+
+| 场景（18 周 × 5 天 × 5 时段） | 需求 | 最优 | 生产算法 | 覆盖率 | 成员次数极差 |
+| --- | --- | --- | --- | --- | --- |
+| 20 人 · 每时段 2 人 | 900 | 874 | 873 | 99.9% | **4**（纯最大流解 36） |
+| 15 人 · 每时段 2 人 | 900 | 793 | 787 | 99.2% | 6（纯最大流解 6） |
+| 25 人 · 每时段 3 人 | 1350 | 1289 | 1276 | 99.0% | 14 |
+| 30 人 · 每时段 2 人 | 900 | 899 | 899 | **100%** | — |
+
+结论：覆盖率已达最优值的 99% 以上，而**纯最大流解会严重破坏均衡**（同一网络有大量等价最优解，
+取到的解可能有人 54 次、有人 18 次）。要让网络流同时保证均衡，必须写成带凸费用的最小费用流，
+实现复杂度大幅上升，换来的覆盖率收益不足 1% —— 因此保留现有启发式，并用测试把这个结论固化。
 
 ### 按周增量排班
 
@@ -210,7 +230,9 @@ PySide6>=6.7     # 桌面界面
 
 ## 数据存储
 
-单一 SQLite 文件 `duty_system.db`（默认位于程序目录，可通过左侧「数据存储」卡片自定义位置，自动创建）：
+单一 SQLite 文件 `duty_system.db`（默认位于程序目录，可通过左侧「数据存储」卡片自定义位置，自动创建）。
+数据库启用 **WAL** 模式并带索引；「更改位置」走 SQLite 在线备份 API（`Database.backup_to()`），
+不是文件复制——WAL 模式下最新数据与 schema 可能还在 `-wal` 文件里，直接复制主库会得到损坏副本。
 
 | 表 | 字段 | 说明 |
 | --- | --- | --- |
@@ -230,10 +252,24 @@ PySide6>=6.7     # 桌面界面
 ## 测试
 
 ```bash
-env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py
+pip install -r requirements-dev.txt      # 含 pytest
+pytest -q                                # 全部测试（约 2 秒）
+env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py   # 只看端到端链路
 ```
 
-覆盖 13 组端到端场景：解析器（37 门课程格式）、数据库幂等、排班算法硬约束与均衡、导出（xlsx/csv/日期列）、甘特图一致性、请假登记与避让、手动微调候选、周次换算（跨月/跨年）、按周增量、结果恢复、按周导出、甘特图值班标记。
+| 文件 | 覆盖内容 |
+| --- | --- |
+| `test_system.py` | 13 组端到端场景：解析器（37 门课程格式）、数据库幂等、排班硬约束与均衡、导出（xlsx/csv/日期列）、甘特图一致性、请假避让、手动微调候选、周次换算（跨月/跨年）、按周增量、结果恢复、按周导出、甘特图值班标记 |
+| `test_scheduler_optimized.py` | 约束判定单一入口一致性、缺口修复效果与硬约束、缺口口径统一、稀缺度排序收益、同种子可复现、`assign/unassign` 对称性 |
+| `test_database_layer.py` | 幂等写入不膨胀 id、按周增量同步保持未变化行、槽位替换只动目标、索引/WAL/`user_version` 迁移、老库兼容、级联删除 |
+| `test_app_ui.py` | offscreen 界面：参数持久化往返、重启按「生成时参数」算缺口、数据缓存命中与失效、后台排班不阻塞且落库一致、甘特表单元格复用、手动微调只写目标槽位、过期提示 |
+| `test_gap_diagnosis.py` | 缺口成因分类（课程/请假冲突 vs 每天/每周上限）、建议可落地性、诊断口径与排班算法一致 |
+| `test_optimality.py` | 用最大流求出覆盖最优值作基准，认证启发式覆盖率 ≥97%，并量化「纯最优覆盖会破坏公平性」 |
+| `test_performance.py` | 关键路径耗时上限（300 人排班、密集修复、甘特矩阵、课表查询、批量写入、界面刷新预算），用于拦截数量级退化 |
+
+`conftest.py` 负责：把仓库根加入 `sys.path`、强制 `QT_QPA_PLATFORM=offscreen`（无显示器也能跑界面测试）、把 `QSettings` 重定向到临时目录（不污染用户真实配置）。
+
+CI 中 **测试是打包的前置门禁**：`test` 作业不通过则不会构建/发布任何产物。
 
 ---
 
@@ -288,15 +324,20 @@ hdiutil create -volname "DutyScheduler" -srcfolder dmg -ov -format UDZO "DutySch
 ```
 automatic_work_duty_system/
 ├── app.py                    # 主应用：PySide6 界面（六页签 + 参数面板 + 导出/微调/图表）
+├── conftest.py               # pytest 公共配置（offscreen + QSettings 隔离）
 ├── test_system.py            # 端到端测试（13 组场景）
-├── requirements.txt          # 依赖清单
+├── test_scheduler_optimized.py / test_database_layer.py
+├── test_app_ui.py / test_performance.py   # 算法 / 存储 / 界面 / 性能回归
+├── requirements.txt          # 运行依赖
+├── requirements-dev.txt      # 开发依赖（pytest）
+├── pytest.ini                # 测试发现配置
 ├── duty_system.db            # SQLite 数据库（运行时自动创建）
 ├── samples/                  # 示例课表（.xls）
-├── .github/workflows/build.yml  # CI：打包 Windows exe / macOS dmg 并发布 Release
+├── .github/workflows/build.yml  # CI：测试门禁 → 打包 Windows exe / macOS dmg → 发布 Release
 └── duty_system/              # 核心包
     ├── parser.py             # 课表解析：.xls/.xlsx → 课程记录（周次/节次/姓名/学号）
-    ├── database.py            # 数据层：members / courses / duty_assignments / leaves
-    ├── scheduler.py          # 排班算法：约束过滤 + 三级均衡 + 动态覆盖 + 微调候选
+    ├── database.py           # 数据层：建表+迁移、幂等/增量写入、WAL 与索引
+    ├── scheduler.py          # 排班算法：约束上下文 + 三级均衡 + 覆盖/稀缺度排序 + 缺口修复
     ├── exporter.py           # 导出：明细/透视/统计 DataFrame → Excel/CSV、周次换算日期
     └── gantt.py              # 空闲甘特图：忙闲矩阵构建 + 带填充色 Excel 导出
 ```
@@ -306,11 +347,64 @@ automatic_work_duty_system/
 ```
 上传课表 → parser.parse_schedule_file() → database.upsert_member()
 生成排班 → scheduler.generate_schedule(members, courses, config, leaves, base)
-         → database.save_assignments()（增量：先 delete_assignments_for_weeks）
+         → compute_gaps() 统一缺口口径 → repair_gaps() 链式挪动补缺口
+         → database.sync_assignments_for_weeks()（只增删差异行）
 展示     → exporter.build_pivot_df / build_detail_df / build_stats_df
 甘特图   → gantt.build_availability(members, courses, week, leaves, assignments)
 导出     → exporter.export_excel / export_csv；app.render_table_png / render_charts_png
 ```
+
+---
+
+## 扩展与维护指南
+
+### 新增一条排班约束（如「同一成员不连续两天值班」）
+
+1. 在 `duty_system/scheduler.py` 的 `ScheduleContext` 中补充计数与 `reason()` 判定，
+   并新增一个原因常量（如 `REASON_CONSECUTIVE`）。
+2. 若属于「可手动越限」的软约束，把常量加入 `SOFT_REASONS`；硬约束不必登记。
+
+**不需要**再改第二处：自动排班、缺口修复、手动微调候选、界面校验都走同一个
+`reason()`，这是本次重构收敛掉的主要风险（此前三处各写一套过滤条件）。
+
+### 新增一个可持久化参数
+
+在 `MainWindow._param_specs()` 里加一行 `("spin", self.xxx, "xxx", 默认值)` 即可，
+读写共用同一份声明；同时把该参数接进 `_current_config()` 才会参与排班。
+
+### 新增一种导出格式
+
+在 `exporter.py` 加纯函数返回 `bytes`，界面按钮改用
+`MainWindow._export_bytes(...)`，即自动获得「后台生成 + 状态栏提示」。
+
+### 新增一个数据库字段或表
+
+1. 修改 `duty_system/database.py` 的 `SCHEMA`（新库直接建）。
+2. 在 `MIGRATIONS` 追加 `(版本号, [DDL 列表])`——**必须**，否则已存在的用户库不会变更
+   （老写法 `CREATE TABLE IF NOT EXISTS` 对既有库静默跳过，字段加了也不生效）。
+
+### 性能注意事项（有实测数据支撑）
+
+实测环境：macOS / Apple Silicon，300 名成员 × 40 门课 × 18 周。
+
+| 环节 | 优化前 | 优化后 | 手段 |
+| --- | --- | --- | --- |
+| 排班（20 人 / 每时段 2 人） | 50 个缺口 | **19 个缺口** | 时段稀缺度排序 + 缺口链式修复 |
+| 排班（300 人） | 0.085s | 0.139s | 增加了覆盖优化，仍在 0.2s 内 |
+| 排班页刷新（300 人） | 134ms | **19ms** | 单元格复用 + 用 `itertuples` 批量取数替代逐格 `df.iat` |
+| 甘特刷新（300 人） | 96ms | **16ms** | 复用 `QTableWidgetItem`；忙时表随课表缓存；单元格写入前先用 Python 侧状态缓存比对，无变化则完全不碰 Qt 属性（Qt 属性读取是原瓶颈） |
+| 甘特刷新（30 人） | — | **1.4ms** | 同上 |
+| 重建忙时表 | 每次刷新都建（54ms） | 缓存命中即 0ms | `MainWindow.busy_map()`，写操作后失效 |
+| 窗口卡顿 | 生成/导出期间界面无响应 | 无阻塞 | `run_async()` 线程池 + 忙碌提示 |
+| 重复生成写入 | 整周删除重建 | 只增删差异行 | `sync_assignments_for_weeks()` |
+| 缺口诊断 | 无此能力 | 一次诊断 + 缓存 | `diagnose_gaps()`，按排班结果缓存，重复刷新 0 开销 |
+| 统计重算 | O(成员 × 排班) | O(排班)（300 人 0.13ms） | 一次遍历 + `Counter` |
+
+剩余可做项（当前规模下不构成问题，且已有测试兜住回退）：
+
+- 甘特图仍是 `QTableWidget`，成员数到千级（>1000）时可改用 `QTableView` + 自定义 model/委托；
+- 排班算法是启发式，覆盖率已认证 ≥99%（见上文），无需改成最小费用流；
+- 排班计算仍在内存里全量进行，若将来支持跨学期超大跨度可考虑分周流式计算。
 
 ---
 
