@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8.0
+# 校验 .github/workflows/*.yml（test_workflow_config.py）
+pyyaml>=6.0
