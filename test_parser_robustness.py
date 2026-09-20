@@ -1,11 +1,11 @@
 """课表解析健壮性测试
 
-基准数据是 `samples/desensitized/` 下的五份样例（真实教务系统导出后脱敏）：
+基准数据是 `samples/desensitized/` 下的九份样例（真实教务系统导出后脱敏）：
 它们是**真实文件的等长字节替换版本**——课程名/周次/节次/地点/课程数与原始
 文件逐字段一致，只把姓名与学号换成了虚构值，因此既能放进仓库供 CI 使用，
 又保留了真实布局（合并单元格、SST 共享、换行方式）带来的解析难度。
 
-修复解析器时必须保证这五份课表的基线不变，再用变体用例覆盖各校常见写法
+修复解析器时必须保证这九份课表的基线不变，再用变体用例覆盖各校常见写法
 （单双周、表头写法、全角字符、空行异常、合并单元格）。
 
 原始文件与脱敏样例的对应关系由 `tools/desensitize_samples.py` 维护；
@@ -20,8 +20,14 @@ from pathlib import Path
 import pytest
 
 from duty_system.parser import (
-    parse_cell, parse_grid, parse_schedule_file,
-    parse_schedule_path, parse_sessions, parse_weekday_header, parse_weeks,
+    WHOLE_WEEK_WEEKDAY,
+    parse_cell,
+    parse_grid,
+    parse_schedule_file,
+    parse_schedule_path,
+    parse_sessions,
+    parse_weekday_header,
+    parse_weeks,
 )
 
 SAMPLES_DIR = Path(__file__).parent / "samples" / "desensitized"
@@ -416,18 +422,47 @@ def test_merged_cells_do_not_break_sample(tmp_path: Path) -> None:
 #   单元格内某门课没有地点行、跨节次课程重复出现、全角括号课程名。
 # --------------------------------------------------------------------------- #
 
-SAMPLE_2403 = SAMPLES_DIR / "学生个人课表_9999832478.xls"      # 原始 57 门，电信
-SAMPLE_2502 = SAMPLES_DIR / "学生个人课表_9999453245(1).xls"   # 原始 49 门，材科（文件名带后缀）
-SAMPLE_2501 = SAMPLES_DIR / "学生个人课表_9999125207.xls"      # 原始 39 门，机器人
-SAMPLE_2507 = SAMPLES_DIR / "学生个人课表_9999713269.xls"      # 原始 40 门，物流管理
+# 其余样例（脱敏后的假名/假学号，课程数据与原始文件逐字段一致）
+SAMPLE_2402 = SAMPLES_DIR / "学生个人课表_9999543676.xls"      # 材控 57 门
+SAMPLE_2403 = SAMPLES_DIR / "学生个人课表_9999832478.xls"      # 电信 57 门
+SAMPLE_2502 = SAMPLES_DIR / "学生个人课表_9999453245(1).xls"   # 材科 49 门（文件名带后缀）
+SAMPLE_2501 = SAMPLES_DIR / "学生个人课表_9999125207.xls"      # 机器人 39 门
+SAMPLE_2506 = SAMPLES_DIR / "学生个人课表_9999502942.xls"      # 计科 45 门
+SAMPLE_2507 = SAMPLES_DIR / "学生个人课表_9999713269.xls"      # 物流管理 40 门
+SAMPLE_2601 = SAMPLES_DIR / "学生个人课表_9999214566(1).xls"   # 机械电子 30 门（带整周军训）
+SAMPLE_2605 = SAMPLES_DIR / "学生个人课表_9999408638.xls"      # 电信 36 门（带整周军训）
+
+ALL_SAMPLE_PATHS = [SAMPLE, SAMPLE_2402, SAMPLE_2403, SAMPLE_2502, SAMPLE_2501,
+                    SAMPLE_2506, SAMPLE_2507, SAMPLE_2601, SAMPLE_2605]
 
 REAL_SAMPLES = [
     pytest.param(SAMPLE, "赵明明", "9999800598", "24国际商务双语4班", 37, id="国际商务"),
+    pytest.param(SAMPLE_2402, "褚明明", "9999543676", "24材控3班", 57, id="材控"),
     pytest.param(SAMPLE_2403, "钱明明", "9999832478", "24电信3班", 57, id="电信"),
     pytest.param(SAMPLE_2502, "郑明明", "9999453245", "25材科4班", 49, id="材科"),
     pytest.param(SAMPLE_2501, "郑明明", "9999125207", "25机器人1班", 39, id="机器人"),
+    pytest.param(SAMPLE_2506, "吴明", "9999502942", "25计科4班", 45, id="计科"),
     pytest.param(SAMPLE_2507, "周明明", "9999713269", "25物流管理1班", 40, id="物流管理"),
+    pytest.param(SAMPLE_2601, "孙明明", "9999214566", "26机械电子1班", 30, id="机械电子"),
+    pytest.param(SAMPLE_2605, "孙明明", "9999408638", "26电信4班", 36, id="电信26"),
 ]
+
+
+def split_note_item(item: str) -> tuple[str, str, str]:
+    """把备注条目拆成 (课程名, 教师, 周次)
+
+    备注条目有两种写法：
+      "物流前沿讲座Ⅰ 景乔松,罗霞,王宁 18周"  -> 有教师
+      "大学军事技能训练  11-12周"            -> 没有教师（课程名与周次之间是空格）
+    判据：周次前的那一段若不含数字，才是教师名。
+    """
+    parts = item.split()
+    assert len(parts) >= 2, f"备注行格式异常：{item!r}"
+    weeks = parts[-1]
+    head = parts[:-1]
+    if len(head) >= 2 and not re.search(r"\d", head[-1]):
+        return " ".join(head[:-1]), head[-1], weeks
+    return " ".join(head), "", weeks
 
 
 def _require(path: Path) -> Path:
@@ -438,18 +473,22 @@ def _require(path: Path) -> Path:
 
 @pytest.mark.parametrize("path,name,student_id,class_name,count", REAL_SAMPLES)
 def test_real_samples_meta_and_count(path, name, student_id, class_name, count) -> None:
-    """五份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
+    """九份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
     s = parse_schedule_path(_require(path))
     assert s.name == name
     assert s.student_id == student_id, f"学号提取失败：{s.student_id!r}"
     assert s.class_name == class_name
     assert s.term == "2026-2027-1"
     assert len(s.courses) == count, f"课程数 {len(s.courses)} != {count}"
-    assert not s.warnings
+    # 警告只允许是「备注行里还有网格未覆盖的上课时间」这一类；
+    # 姓名/表头识别失败之类的警告说明解析有问题
+    for w in s.warnings:
+        assert "来自备注行" in w, f"出现非预期警告：{w}"
 
 
-@pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502, SAMPLE_2501, SAMPLE_2507],
-                         ids=["国际商务", "电信", "材科", "机器人", "物流管理"])
+@pytest.mark.parametrize("path", ALL_SAMPLE_PATHS,
+                         ids=["国际商务", "材控", "电信", "材科", "机器人", "计科",
+                              "物流管理", "机械电子", "电信26"])
 def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
     """用教务系统自己生成的末尾「备注行」反查解析结果
 
@@ -468,7 +507,9 @@ def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
 
     parsed = parse_schedule_path(path)
     by_name: dict[str, dict[str, set]] = {}
-    for c in parsed.courses:
+    # 整周集中安排（军训/思政实践）不在课表网格里，只在备注行出现，
+    # 解析结果把它们放在 whole_week_courses，反查时必须一并计入
+    for c in [*parsed.courses, *parsed.whole_week_courses]:
         bucket = by_name.setdefault(c.course_name, {"weeks": set(), "teachers": set()})
         bucket["weeks"] |= set(c.week_list)
         if c.teacher:
@@ -478,9 +519,8 @@ def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
         item = item.strip()
         if not item:
             continue
-        parts = item.split()
-        assert len(parts) >= 3, f"备注行格式异常：{item!r}"
-        course, teachers, weeks_token = " ".join(parts[:-2]), parts[-2], parts[-1]
+        course, teachers, weeks_token = split_note_item(item)
+        assert weeks_token.endswith("周"), f"备注行格式异常：{item!r}"
         key = course if course in by_name else next(
             (k for k in by_name if k.startswith(course) or course.startswith(k)), None)
         assert key is not None, f"备注行里的课程未解析出来：{course!r}"
@@ -861,3 +901,86 @@ def test_student_id_extraction_from_file_name(file_name: str, expected: str) -> 
     """学号取文件名中的数字；带 (1) 之类后缀时也不能丢"""
     grid = [["成都工业学院 张三 学生个人课表"]]
     assert parse_grid(grid, file_name).student_id == expected
+
+
+# --------------------------------------------------------------------------- #
+# 备注行里的整周集中安排（军训 / 思政实践 / 网格未覆盖的周）
+#   课表网格只画得出「有星期有节次」的课，军训这类集中实践只写在备注行里。
+#   漏掉它们会让排班把正在军训的人排进值班表。
+# --------------------------------------------------------------------------- #
+
+def test_note_row_whole_week_courses_are_extracted() -> None:
+    """26 级课表：军训 / 思政实践只出现在备注行，必须被解析出来"""
+    s = parse_schedule_path(_require(SAMPLE_2601))
+    got = {c.course_name: (c.weeks_text, tuple(c.week_list))
+           for c in s.whole_week_courses}
+    assert got["大学军事技能训练"] == ("11-13", (11, 12, 13)), \
+        f"军训周次应合并备注里的 11-12 与 12-13 两条，实际 {got.get('大学军事技能训练')}"
+    assert got["思想政治理论课实践教学"] == ("1", (1,))
+    for c in s.whole_week_courses:
+        assert c.whole_week is True
+        assert c.weekday == WHOLE_WEEK_WEEKDAY, "整周安排不能占用某个具体星期"
+        assert c.session_list == [], "整周安排没有具体节次"
+        assert c.location == ""
+
+
+def test_note_row_partial_weeks_are_flagged() -> None:
+    """备注行里比网格多出来的周（体育Ⅰ 2,4,6,8）要按整周避让并给出警告"""
+    s = parse_schedule_path(_require(SAMPLE_2601))
+    pe = [c for c in s.whole_week_courses if c.course_name.startswith("体育Ⅰ")]
+    assert pe, "备注行的体育Ⅰ 2,4,6,8 周未被解析出来"
+    assert pe[0].week_list == [2, 4, 6, 8]
+    assert pe[0].teacher == "赵明"
+    # 网格里的体育Ⅰ 仍然是它自己的星期与节次，没有被改写
+    grid_pe = [c for c in s.courses if c.course_name.startswith("体育Ⅰ")]
+    assert len(grid_pe) == 1 and grid_pe[0].week_list == [3, 5, 7, 9, 11, 15, 17, 19]
+    warn = " ".join(s.warnings)
+    assert "体育Ⅰ" in warn and "2,4,6,8" in warn, f"缺少体育Ⅰ 的整周避让提示：{s.warnings}"
+
+
+def test_samples_without_note_only_courses_are_unaffected() -> None:
+    """网格已覆盖全部备注条目时不应凭空产生整周安排（避免过度避让）"""
+    for path in [SAMPLE, SAMPLE_2402, SAMPLE_2403, SAMPLE_2501,
+                 SAMPLE_2502, SAMPLE_2506, SAMPLE_2507]:
+        s = parse_schedule_path(_require(path))
+        assert s.whole_week_courses == [], \
+            f"{path.name} 不应有整周安排：{[c.course_name for c in s.whole_week_courses]}"
+        assert s.warnings == [], f"{path.name} 不应有警告：{s.warnings}"
+
+
+def test_note_row_of_other_26_sample_matches_same_rule() -> None:
+    """另一份 26 级课表：同样是军训 + 思政实践，且没有多余的整周条目"""
+    s = parse_schedule_path(_require(SAMPLE_2605))
+    got = {c.course_name: (c.weeks_text, tuple(c.week_list))
+           for c in s.whole_week_courses}
+    assert got == {"大学军事技能训练": ("11-13", (11, 12, 13)),
+                   "思想政治理论课实践教学": ("1", (1,))}, got
+
+
+def test_find_note_text_ignores_body_cells() -> None:
+    """正文单元格（节次列的时间）不能被误认成备注行"""
+    from duty_system.parser import find_note_text
+
+    grid = [
+        ["成都工业学院 张三 学生个人课表"],
+        ["1-2节(8:30-10:05)\n(01,02)\n08:30-10:05"],
+        ["：认识实习 帅波 18周;"],
+    ]
+    assert find_note_text(grid) == "认识实习 帅波 18周;"
+    assert find_note_text([["1-2节"]] + [["无备注"]]) == ""
+
+
+@pytest.mark.parametrize("weeks,expected", [
+    ([1, 2, 3, 5, 6], "1-3,5-6"),
+    ([4], "4"),
+    ([1, 3, 5], "1,3,5"),
+    ([11, 12, 13], "11-13"),
+    ([], ""),
+])
+def test_compress_weeks_roundtrip(weeks: list[int], expected: str) -> None:
+    """_compress_weeks 与 parse_weeks 必须互逆（备注行的周次展示依赖它）"""
+    from duty_system.parser import _compress_weeks
+
+    assert _compress_weeks(weeks) == expected
+    if weeks:
+        assert parse_weeks(expected) == sorted(weeks)

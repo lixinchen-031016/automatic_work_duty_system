@@ -6,11 +6,21 @@ import random
 from collections import Counter
 
 from duty_system.database import CourseRecord, Member
-from duty_system.parser import BLOCK_SESSIONS
+from duty_system.gantt import build_availability
+from duty_system.parser import BLOCK_SESSIONS, WHOLE_WEEK_WEEKDAY
 from duty_system.scheduler import (
-    REASON_COURSE, REASON_DAY, REASON_LEAVE, REASON_SLOT, REASON_WEEK,
-    ScheduleConfig, ScheduleContext, build_busy_map, compute_gaps, generate_schedule,
-    rebuild_member_stats, replacement_candidates,
+    REASON_COURSE,
+    REASON_DAY,
+    REASON_LEAVE,
+    REASON_SLOT,
+    REASON_WEEK,
+    ScheduleConfig,
+    ScheduleContext,
+    build_busy_map,
+    compute_gaps,
+    generate_schedule,
+    rebuild_member_stats,
+    replacement_candidates,
 )
 
 
@@ -192,3 +202,73 @@ def test_reason_precedence_is_stable() -> None:
     assert ctx.reason(m5.id, 1, 1, 1) == REASON_SLOT, "重复安排同一时段应被拒"
     allowed = {None, REASON_COURSE, REASON_DAY, REASON_LEAVE, REASON_SLOT, REASON_WEEK}
     assert {ctx.reason(m.id, 1, 1, 1) for m in members} <= allowed, "出现未定义的原因"
+
+
+def test_whole_week_courses_block_every_slot_of_those_weeks() -> None:
+    """整周集中安排（军训/思政实践）必须让该周每天都不可值班
+
+    这类记录 weekday == WHOLE_WEEK_WEEKDAY（没有具体星期），若按普通课程处理，
+    busy 里会写进 (周, 0, 节次) 这种周三以下的无效键，等于没挡住任何人——
+    真实后果就是把正在军训的人排进值班表。
+    """
+    members = make_members(4)
+    courses = [
+        CourseRecord(id=1, member_id=1, course_name="大学军事技能训练", teacher="",
+                     weekday=WHOLE_WEEK_WEEKDAY, week_list=[11, 12, 13],
+                     session_list=[], location="", weeks_text="11-13", sessions_text=""),
+    ]
+    busy = build_busy_map(members, courses)
+    for week in (11, 12, 13):
+        for day in range(1, 8):
+            for session in range(1, 12):
+                assert (week, day, session) in busy[1], f"第{week}周 星期{day} {session}节未被挡住"
+    assert (10, 3, 1) not in busy[1], "占用周之外的周不该被挡住"
+    # 其它成员不受影响
+    for other in (2, 3, 4):
+        assert not busy[other]
+
+
+def test_whole_week_course_keeps_member_out_of_roster() -> None:
+    """被军训占用的周，排班不能把该成员排进去；其它周照常参与"""
+    members = make_members(3)
+    courses = [
+        CourseRecord(id=1, member_id=1, course_name="大学军事技能训练", teacher="",
+                     weekday=WHOLE_WEEK_WEEKDAY, week_list=[2], session_list=[],
+                     location="", weeks_text="2", sessions_text=""),
+    ]
+    config = ScheduleConfig(weeks=range(1, 5), per_slot=1, max_per_week=3, max_per_day=2,
+                            seed=3)
+    result = generate_schedule(members, courses, config)
+    week1 = [a for a in result.assignments if a.week == 2 and a.member_id == 1]
+    assert week1 == [], f"军训周（第2周）不应给该成员排班：{[(a.week, a.weekday, a.block) for a in week1]}"
+    other_weeks = [a for a in result.assignments if a.week != 2 and a.member_id == 1]
+    assert other_weeks, "其它周该成员应正常参与值班"
+
+
+def test_gantt_shows_reason_for_whole_week_courses() -> None:
+    """甘特图里被整周安排占用的格子必须显示课程名
+
+    整周记录没有 session_list，若沿用「按节次索引课程名」的写法会被静默跳过，
+    结果是一整片「忙但没有原因」的格子——用户看不出为什么这个人整周排不了班。
+    """
+    members = make_members(2)
+    courses = [
+        CourseRecord(id=1, member_id=1, course_name="大学军事技能训练", teacher="",
+                     weekday=WHOLE_WEEK_WEEKDAY, week_list=[11],
+                     session_list=[], location="", weeks_text="11", sessions_text=""),
+    ]
+    busy = build_busy_map(members, courses)
+    matrix = build_availability(members, courses, 11, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5],
+                                assignments=[], busy=busy)
+    assert not any(matrix.free[0]), "军训周该成员不应有任何空闲格"
+    assert matrix.free_counts == [1] * len(matrix.slots), "另一名成员应保持空闲"
+    for weekday in range(1, 6):
+        for block in range(1, 6):
+            names = matrix.busy_courses.get((0, weekday, block))
+            assert names == ["大学军事技能训练"], \
+                f"星期{weekday} 时段{block} 缺少占用原因：{names}"
+
+    # 非占用周：不显示任何占用
+    other = build_availability(members, courses, 12, [1, 2, 3, 4, 5], [1], assignments=[])
+    assert all(other.free[0]), "非军训周不应被占用"
+    assert not other.busy_courses

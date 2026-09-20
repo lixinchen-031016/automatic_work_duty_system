@@ -64,9 +64,15 @@ def test_manifest_entry_matches_sample(entry: dict) -> None:
     assert s.class_name == entry["class_name"]
     assert s.major == entry["major"]
     assert s.department == entry["department"]
-    assert len(s.courses) == entry["course_count"], \
-        f"课程数 {len(s.courses)} != manifest {entry['course_count']}"
-    assert not s.warnings
+    assert len(s.courses) == entry["course_count"], (
+        f"课程数 {len(s.courses)} != manifest {entry['course_count']}")
+    assert len(s.whole_week_courses) == entry["whole_week_count"], (
+        f"整周集中安排 {len(s.whole_week_courses)} "
+        f"!= manifest {entry['whole_week_count']}")
+    # 警告只允许是「备注行里还有网格未覆盖的上课时间」这一类，
+    # 姓名/表头识别失败之类的警告说明解析有问题
+    for w in s.warnings:
+        assert "来自备注行" in w, f"出现非预期警告：{w}"
 
 
 @pytest.mark.parametrize("path", sorted(DESENSITIZED.glob("*.xls")),
@@ -95,8 +101,12 @@ def test_samples_keep_real_course_data() -> None:
         assert len(s.courses) >= 30, f"{path.name} 课程数异常少：{len(s.courses)}"
         # 真实课表的关键特征：有地点、有单双周式周次、有跨节次课程
         assert any(c.location for c in s.courses), f"{path.name} 没有解析出任何地点"
-        assert any(len(c.session_list) >= 4 for c in s.courses), \
-            f"{path.name} 没有跨节次（实验/实习类）课程"
+        # 块状占用：要么有跨节次连堂（实验/实习），要么有整周集中安排（军训/思政实践）。
+        # 大一课表本来就没有 4 节连堂，但会带整周军训，两者都算「大片被占用」。
+        assert s.whole_week_courses or any(
+            len(c.session_list) >= 3 or c.whole_week for c in s.courses), (
+            f"{path.name} 既没有跨节次课程，也没有整周集中安排"
+        )
         for c in s.courses:
             assert c.weekday in range(1, 8)
             assert c.week_list, f"{c.course_name} 周次为空"

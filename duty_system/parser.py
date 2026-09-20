@@ -7,7 +7,7 @@
     行1: "学年学期：2026-2027-1 班级：xx 专业：xx ..." -> 元信息
     行2: 星期一 ~ 星期日                            -> 表头
     行3-7: 节次行（1-2节/3-4节/5-6节/7-8节/9-11节） -> 每列单元格内含课程
-    末行: 备注说明
+    末行: 备注说明（：课程 教师 周次周;…）
 
 单元格内多门课程以空行分隔，每门课程为多行文本：
     课程名（可能跨行，含 (板块x) 副标题）
@@ -15,7 +15,7 @@
     周次([周])[节次节]  <- 如 18([周])[01-02-03-04节]
     地点                <- 可能缺失（如无地点或网课编号）
 
-解析健壮性（均由 samples/ 下五份真实课表与变体用例覆盖）：
+解析健壮性（均由 samples/ 下九份真实课表与变体用例覆盖）：
   - 表头识别兼容 星期一 / 周一 / 周1 / 礼拜一 / 星期7；
   - 周次兼容 单双周（1-16单周 / 1-16双周 / 1-16(单) / 奇偶周），
     以及 "1-16周"、"第1-16周" 等带字写法；
@@ -31,8 +31,12 @@
   - 合并单元格会把值填充到整个合并区域，避免「表头只出现在第一列」
     等导出差异导致整份课表读不出来。
 
-`samples/` 下五份真实课表（国际商务 37 门 / 电信 57 门 / 材科 49 门 / 机器人 39 门 /
-物流管理 40 门）是
+备注行里还会出现课表网格中没有的课程（军训、思政实践、认识实习这类集中实践），
+它们不占具体节次、但整周占用，因此单独放在 `ParsedSchedule.whole_week_courses`，
+weekday 记为 `WHOLE_WEEK_WEEKDAY`，供排班时整天避开。
+
+`samples/` 下九份真实课表（国际商务 37 门 / 材控 57 门 / 电信 57 门 / 机器人 39 门 /
+材科 49 门 / 计科 45 门 / 物流管理 40 门 / 机械电子 30 门 / 电信 36 门）是
 回归基线：每份都要求课程数、姓名、学号、班级不变，且解析结果能覆盖文件
 末尾备注行列出的全部课程名/教师/周次。
 """
@@ -65,6 +69,12 @@ BLOCK_LABELS = {
     4: "7-8节 15:50-17:25",
     5: "9-11节 18:50-21:15",
 }
+
+# 整周占用的星期取值：备注行里的集中实践（军训 / 思政实践 / 认识实习）不排
+# 具体节次，只占满整周，网格里没有它对应的星期列。
+WHOLE_WEEK_WEEKDAY = 0
+# 整周占用要覆盖的节次（各时段块的并集，即 1-11 节）
+WHOLE_WEEK_SESSIONS = tuple(sorted({s for block in BLOCK_SESSIONS.values() for s in block}))
 
 # 周次行，如 "18([周])[01-02-03-04节]"、"1,3,5([周])[03-04节]"
 # 周次部分允许 单双周/奇偶周、周字后缀、第字前缀；节次分隔允许 - , 、 ~
@@ -150,6 +160,9 @@ class Course:
     location: str = ""
     # 单双周标记：normal=每周 / odd=单周 / even=双周（供界面展示，不改变周次列表）
     week_mode: str = "normal"
+    # 是否来自备注行的整周集中安排（军训/思政实践/认识实习）：
+    # 这类记录没有星期与节次，weekday == WHOLE_WEEK_WEEKDAY
+    whole_week: bool = False
 
     def key(self) -> tuple:
         return (self.course_name, self.teacher, self.weekday,
@@ -167,6 +180,10 @@ class ParsedSchedule:
     department: str = ""
     file_name: str = ""
     courses: list[Course] = field(default_factory=list)
+    # 备注行里有、课表网格里没有的整周集中安排（军训/思政实践/认识实习）。
+    # 单独成表而不是塞进 courses：它们没有星期/节次，混进去会让「按星期展示
+    # 课程」和「课程数统计」都失真。
+    whole_week_courses: list[Course] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -484,6 +501,147 @@ def _grid_from_xlsx(file_bytes: bytes) -> list[list[str]]:
         wb.close()
 
 
+# 备注行条目：`课程名[ 教师] 周次周`，如
+#   "大学军事技能训练  11-12周"（无教师，课程名与周次之间是两个空格）
+#   "物流前沿讲座Ⅰ 景乔松,罗霞,王宁 18周"
+#   "思想政治理论课实践教学 王丽茹 21周"
+_NOTE_WEEKS_RE = re.compile(r"^[\d,，、~～\-\s]+周$")
+_NOTE_TEACHER_RE = re.compile(r"^[\u4e00-\u9fa5·]{2,8}(?:[,，、][\u4e00-\u9fa5·]{2,8})*$")
+
+
+def _grid_course_matching(key: str, grid_names) -> str | None:
+    """key 是否指向网格里已有的课程（同名，或互为前缀）
+
+    互为前缀是为了兼容副标题差异：备注行写「体育Ⅰ」，网格里是
+    「体育Ⅰ (板块1A1乒乓球)」——这类条目属于网格里已有的课，不该当成
+    新增的整周安排。
+    """
+    if not key:
+        return None
+    if key in grid_names:
+        return key
+    for name in grid_names:
+        if name.startswith(key) or key.startswith(name):
+            return name
+    return None
+
+
+def find_note_text(grid: list[list[str]]) -> str:
+    """找出教务系统写在末尾的「备注」单元格文本
+
+    备注单元格以全角/半角冒号开头，内容是 `课程名 教师 周次周;` 清单。
+    课表正文里也有以冒号开头的内容（节次列是时间，不会），因此额外要求
+    至少有一条「以周次结尾」的条目才认定为备注。
+    """
+    best = ""
+    for row in grid:
+        for cell in row:
+            text = normalize_cell(cell).strip()
+            if not text or text[0] not in "：:":
+                continue
+            body = text.lstrip("：:").strip()
+            if len(body) <= len(best):
+                continue
+            items = [x.strip() for x in body.split(";") if x.strip()]
+            if not any(_NOTE_WEEKS_RE.match(x.split()[-1]) for x in items if x.split()):
+                continue
+            best = body
+    return best
+
+
+def _compress_weeks(weeks: list[int]) -> str:
+    """周次列表 -> 紧凑文本： [1,2,3,5] -> '1-3,5'（与 parse_weeks 互逆）"""
+    parts: list[str] = []
+    run_start = prev = None
+    for w in sorted(set(weeks)):
+        if run_start is None:
+            run_start = prev = w
+            continue
+        if w == prev + 1:
+            prev = w
+            continue
+        parts.append(str(run_start) if run_start == prev else f"{run_start}-{prev}")
+        run_start = prev = w
+    if run_start is not None:
+        parts.append(str(run_start) if run_start == prev else f"{run_start}-{prev}")
+    return ",".join(parts)
+
+
+def parse_note_courses(note_text: str, grid_courses) -> tuple[list[Course], list[str]]:
+    """解析备注行，返回 (整周集中安排, 警告信息)
+
+    备注行是教务系统自己生成的课程清单，比课表网格更全：网格只画得出「有星期
+    有节次」的课，军训、思政实践这类集中实践没有具体节次，只会出现在备注里；
+    也有课程的某几周只在备注里出现（网格漏画）。
+
+    因此规则统一成一条：**备注行提到、而课表网格没有覆盖的周，按「整周避让」
+    处理**，并给出警告说明具体星期未知。这些记录单独放进
+    `ParsedSchedule.whole_week_courses`，weekday 记为 WHOLE_WEEK_WEEKDAY。
+
+    备注行里大部分条目其实是网格已有课程的变更记录（教师换人、周次调整），
+    这类直接跳过——网格更权威，它带星期/节次/地点。
+    """
+    if not note_text:
+        return [], []
+
+    # 网格覆盖情况：课程名 -> 已覆盖周次
+    coverage: dict[str, set[int]] = {}
+    for c in grid_courses:
+        coverage.setdefault(c.course_name, set()).update(c.week_list)
+
+    # key -> (未覆盖周次, 依据说明)；同一门课会分多条写在备注里，合并后再提示一次
+    merged: dict[tuple[str, str], tuple[set[int], str]] = {}
+    for item in (x.strip() for x in note_text.split(";")):
+        if not item:
+            continue
+        tokens = item.split()
+        if len(tokens) < 2:
+            continue
+        weeks_token = tokens[-1]
+        if not _NOTE_WEEKS_RE.match(weeks_token):
+            continue
+        head = tokens[:-1]
+        # 教师是排在周次前的一段姓名清单；没有教师时（"军训  11-12周"）整段都是课程名
+        teacher = head[-1] if len(head) >= 2 and _NOTE_TEACHER_RE.match(head[-1]) else ""
+        name = " ".join(head[:-1]) if teacher else " ".join(head)
+        weeks = parse_weeks(weeks_token[:-1])
+        if not name or not weeks:
+            continue
+
+        matched = _grid_course_matching(name, coverage)
+        if matched is None:
+            uncovered = set(weeks)
+            reason = "课表中没有该课程的网格安排"
+        else:
+            # 用网格里的课程名（备注行常省略副标题，如「体育Ⅰ」对「体育Ⅰ (板块1A1乒乓球)」）
+            name = matched
+            uncovered = set(weeks) - coverage[matched]
+            reason = f"课表网格只画了第 {_compress_weeks(sorted(coverage[matched]))} 周"
+        if not uncovered:
+            continue
+
+        prev = merged.get((name, teacher))
+        merged[(name, teacher)] = (
+            (prev[0] | uncovered) if prev else set(uncovered), reason)
+
+    warnings = [
+        f"{name} 第 {_compress_weeks(sorted(weeks))} 周"
+        + (f"（{teacher}）" if teacher else "")
+        + f"来自备注行，{reason}，具体上课时间未知；排班时按整周避让。"
+        for (name, teacher), (weeks, reason) in merged.items()
+    ]
+    courses = [
+        Course(
+            course_name=name, teacher=teacher, weekday=WHOLE_WEEK_WEEKDAY,
+            weeks_text=_weeks_label(_compress_weeks(sorted(weeks)), "normal"),
+            week_list=sorted(weeks), sessions_text="", session_list=[],
+            location="", whole_week=True,
+        )
+        for (name, teacher), (weeks, _) in merged.items()
+    ]
+    return courses, warnings
+
+
 def _extract_person_name(grid: list[list[str]]) -> str:
     """从标题行 '成都工业学院 赵明明 学生个人课表' 提取姓名"""
     for row in grid:
@@ -584,6 +742,10 @@ def parse_grid(grid: list[list[str]], file_name: str = "") -> ParsedSchedule:
 
     if not result.name:
         result.warnings.append("未能从标题行提取姓名")
+
+    note_text = find_note_text(grid)
+    result.whole_week_courses, note_warnings = parse_note_courses(note_text, result.courses)
+    result.warnings.extend(note_warnings)
     return result
 
 

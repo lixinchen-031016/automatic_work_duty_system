@@ -16,7 +16,13 @@ import io
 from dataclasses import dataclass, field
 
 from .database import Assignment, CourseRecord, Leave, Member
-from .parser import BLOCK_LABELS, BLOCK_SESSIONS, WEEKDAY_LABELS
+from .parser import (
+    BLOCK_LABELS,
+    BLOCK_SESSIONS,
+    WEEKDAY_LABELS,
+    WHOLE_WEEK_SESSIONS,
+    WHOLE_WEEK_WEEKDAY,
+)
 from .scheduler import build_busy_map
 
 
@@ -82,6 +88,15 @@ def build_availability(
             continue
         member_busy = busy.get(c.member_id)
         if not member_busy:
+            continue
+        if c.weekday == WHOLE_WEEK_WEEKDAY:
+            # 整周集中安排（军训/思政实践）没有星期与节次：该周每一天每一节都算被
+            # 占用，课程名也要挂上去——否则甘特图上是一整片「忙但没有原因」的格子，
+            # 用户看不出为什么这个人整周都排不了班。
+            if week in c.week_list:
+                for day in range(1, 8):
+                    for sec in WHOLE_WEEK_SESSIONS:
+                        course_index.setdefault((c.member_id, day, sec), set()).add(c.course_name)
             continue
         weekday = c.weekday
         active = [sec for sec in c.session_list if (week, weekday, sec) in member_busy]

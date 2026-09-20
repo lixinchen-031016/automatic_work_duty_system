@@ -211,7 +211,7 @@ class Database:
                     (member_id, c.course_name, c.teacher, c.weekday, c.weeks_text,
                      json.dumps(c.week_list), c.sessions_text,
                      json.dumps(c.session_list), c.location)
-                    for c in schedule.courses
+                    for c in [*schedule.courses, *schedule.whole_week_courses]
                 ],
             )
             return member_id

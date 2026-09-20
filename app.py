@@ -1244,12 +1244,15 @@ class MainWindow(QMainWindow):
         self.member_info.setText(
             f"学号 {m.student_id or '—'} | {m.term or '—'} | {m.major or '—'} | "
             f"{m.department or '—'} | 来源：{m.file_name or '—'}")
+        # 整周集中安排（军训/思政实践）没有星期与节次，排序键与展示都要单独处理
         courses = sorted(self.db.get_courses(member_id),
-                         key=lambda c: (c.weekday, min(c.session_list), c.course_name))
+                         key=lambda c: (c.weekday or 99, min(c.session_list or [0]),
+                                        c.course_name))
         df = pd.DataFrame([{
-            "星期": WEEKDAY_LABELS[c.weekday], "课程": c.course_name,
+            "星期": WEEKDAY_LABELS.get(c.weekday, "整周"), "课程": c.course_name,
             "教师": c.teacher or "—", "周次": c.weeks_text,
-            "节次": f"{c.sessions_text}节", "地点": c.location or "—",
+            "节次": f"{c.sessions_text}节" if c.sessions_text else "整周",
+            "地点": c.location or "—",
         } for c in courses])
         fill_table(self.course_table, df if not df.empty else
                    pd.DataFrame(columns=["星期", "课程", "教师", "周次", "节次", "地点"]))
@@ -1710,7 +1713,7 @@ class MainWindow(QMainWindow):
         if not files:
             return
         known = {(m.student_id, m.name) for m in self.members()}
-        added, updated, errors = 0, 0, []
+        added, updated, errors, parse_warnings = 0, 0, [], []
         for f in files:
             try:
                 schedule = parse_schedule_file(Path(f).read_bytes(), Path(f).name)
@@ -1720,6 +1723,8 @@ class MainWindow(QMainWindow):
             if not schedule.courses and not schedule.name:
                 errors.append(f"{Path(f).name}：未解析到课程信息，请确认是教务系统导出的个人课表")
                 continue
+            parse_warnings.extend(
+                f"{Path(f).name}：{warning}" for warning in schedule.warnings)
             is_update = (schedule.student_id, schedule.name) in known
             self.db.upsert_member(schedule)
             known.add((schedule.student_id, schedule.name))
@@ -1729,6 +1734,12 @@ class MainWindow(QMainWindow):
         self.refresh_members()
         if errors:
             QMessageBox.warning(self, "部分文件导入失败", "\n".join(errors))
+        if parse_warnings:
+            QMessageBox.warning(
+                self, "课表存在未定位的集中安排",
+                "以下备注行课程没有具体星期/节次，已按整周避让：\n"
+                + "\n".join(parse_warnings),
+            )
         parts = []
         if added:
             parts.append(f"新增 {added} 名成员")

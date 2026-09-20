@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from .database import Assignment, CourseRecord, Leave, Member
-from .parser import BLOCK_SESSIONS
+from .parser import BLOCK_SESSIONS, WHOLE_WEEK_SESSIONS, WHOLE_WEEK_WEEKDAY
 
 # 不可用原因：算法与界面共用同一组文案，避免两处漂移
 REASON_COURSE = "该时段有课"
@@ -161,9 +161,16 @@ def build_busy_map(members: list[Member], courses: list[CourseRecord]) -> dict[i
         target = busy[c.member_id]
         weekday = c.weekday
         sessions = c.session_list
+        if weekday == WHOLE_WEEK_WEEKDAY:
+            # 整周集中安排（军训/思政实践）：没有星期与节次，整周都不可值班
+            days = range(1, 8)
+            sessions = WHOLE_WEEK_SESSIONS
+        else:
+            days = (weekday,)
         for week in c.week_list:
-            for session in sessions:
-                target.add((week, weekday, session))
+            for day in days:
+                for session in sessions:
+                    target.add((week, day, session))
     return busy
 
 

@@ -18,7 +18,8 @@
   - 课程名 / 周次 / 节次 / 地点 / 课程数原样保留，解析器仍需按真实逻辑工作。
 
 替换表**按文件独立生成**（每个文件从假名池起始位置重新分配），这样新增或删除
-某份样例不会让其它样例的假名漂移，测试基线保持稳定。
+某份样例不会让其它样例的假名漂移，测试基线保持稳定。假名与真名、假名与假名
+之间都不允许互为子串（假名「赵明明」包含真名「赵明」会让残留检测误报）。
 脚本会另外写出 `manifest.json`（脱敏样例文件名 + 假姓名 + 假学号 + 课程数），
 供测试数据驱动读取；清单里**不含任何真实信息**。脚本不会输出
 「真名 -> 假名」对照表——那份对照表本身就是需要消除的隐私数据。
@@ -93,6 +94,17 @@ def _real_names(path: Path) -> list[str]:
     return sorted(names, key=lambda n: (len(n), n))
 
 
+def _swallows_real_name(fake: str, real_names) -> bool:
+    """假名里是否**包含**某个真实姓名
+
+    这个方向才是隐私问题：假名「赵明明」把真名「赵明」整段包了进去，脱敏后的
+    文件里依然能搜到真实姓名，「真实姓名零残留」的保证就不成立。
+    反方向（假名「王明」是真实姓名「王明阳」的前缀）不会把任何真名写进文件，
+    不必禁止——若一并禁止会引发连锁改名，让已有样例的假名整体漂移。
+    """
+    return any(real in fake for real in real_names)
+
+
 def build_mapping(path: Path) -> dict:
     """为单个文件建立替换表（独立于其它文件，保证基线稳定）"""
     parsed = parse_schedule_path(path)
@@ -107,7 +119,8 @@ def build_mapping(path: Path) -> dict:
         for i, real in enumerate(group):
             fake = _fake_name(i, length)
             guard = 0
-            while (fake in real_names or fake in name_map.values()) and guard < 500:
+            while (fake in name_map.values() or _swallows_real_name(fake, real_names)) \
+                    and guard < 500:
                 guard += 1
                 fake = _fake_name(i + guard * 97, length)
             name_map[real] = fake
@@ -147,6 +160,9 @@ def _manifest_entries(plan: list[dict]) -> list[dict]:
             "major": fake.major,
             "department": fake.department,
             "course_count": len(fake.courses),
+            # 备注行里的整周集中安排（军训/思政实践）单独计数，
+            # 便于测试确认这份样例该有多少条整周占用
+            "whole_week_count": len(fake.whole_week_courses),
         })
     return entries
 
@@ -197,6 +213,11 @@ def desensitize_all(check_only: bool = False) -> int:
 
     # ---- 自检 2：真实个人信息已彻底清除（字节级）----
     for item in plan:
+        for real, fake in item["names"].items():
+            if real != fake and real in fake:
+                problems.append(f"{item['src'].name}: 假名 {fake!r} 包含真名 {real!r}，"
+                                f"脱敏后仍能搜到真实姓名")
+
         leaked = [n for n in item["names"] if n.encode("utf-16-le") in item["bytes"]]
         if leaked:
             problems.append(f"{item['src'].name}: 仍残留真实姓名 {leaked}")
@@ -207,7 +228,15 @@ def desensitize_all(check_only: bool = False) -> int:
         for item in plan:
             (OUT_DIR / item["out_name"]).write_bytes(item["bytes"])
 
-    # ---- 自检 3：脱敏样例仍可解析，且课程数据与真实文件逐条一致 ----
+    # ---- 自检 3：脱敏目录里不能有清单之外的陈旧样例 ----
+    # 不做自动删除：本地可能只放了一部分原始课表，自动清理会误删其它样例。
+    orphans = sorted({p.name for p in OUT_DIR.glob("*.xls")}
+                     - {item["out_name"] for item in plan})
+    if orphans:
+        problems.append(
+            f"脱敏目录存在清单之外的样例（请手动删除）：{orphans}")
+
+    # ---- 自检 4：脱敏样例仍可解析，且课程数据与真实文件逐条一致 ----
     for item in plan:
         fake_path = OUT_DIR / item["out_name"]
         if not fake_path.exists():
@@ -227,8 +256,19 @@ def desensitize_all(check_only: bool = False) -> int:
                (b.course_name, b.weekday, b.weeks_text, b.sessions_text, b.location):
                 problems.append(f"{item['out_name']}: 课程 {a.course_name} 的字段被改动")
                 break
+        # 整周集中安排同样要逐字段保真（它们没有教师姓名，只换学生姓名/学号）
+        if len(fake.whole_week_courses) != len(real.whole_week_courses):
+            problems.append(
+                f"{item['out_name']}: 整周集中安排 {len(fake.whole_week_courses)} "
+                f"!= {len(real.whole_week_courses)}")
+        for a, b in zip(real.whole_week_courses, fake.whole_week_courses):
+            if (a.course_name, a.week_list, a.weeks_text, a.location) != \
+               (b.course_name, b.week_list, b.weeks_text, b.location):
+                problems.append(
+                    f"{item['out_name']}: 整周安排 {a.course_name} 的字段被改动")
+                break
 
-    # ---- 自检 4：清单与脱敏样例一致 ----
+    # ---- 自检 5：清单与脱敏样例一致 ----
     entries = _manifest_entries(plan)
     if check_only:
         if not MANIFEST.exists():
