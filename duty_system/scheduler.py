@@ -4,6 +4,7 @@
   - 值班时刻内（时段块的每一节）不能有任何课程；
   - 每人每天最多值一次（max_per_day，默认 1）；
   - 每人每周值班不超过 max_per_week 次；
+  - 长期特殊安排占用的 (成员, 周, 星期, 节次) 不安排值班；
   - 请假/临时占用的 (成员, 周, 星期) 不安排值班。
 软目标：按 累计总次数 -> 本周次数 -> 当天次数 三级均衡贪心分配，
         随机种子固定可复现，平手时随机打散。
@@ -20,11 +21,12 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-from .database import Assignment, CourseRecord, Leave, Member
+from .database import Assignment, CourseRecord, Leave, Member, SpecialArrangement
 from .parser import BLOCK_SESSIONS, WHOLE_WEEK_SESSIONS, WHOLE_WEEK_WEEKDAY
 
 # 不可用原因：算法与界面共用同一组文案，避免两处漂移
 REASON_COURSE = "该时段有课"
+REASON_SPECIAL = "其他安排"
 REASON_LEAVE = "请假"
 REASON_DAY = "当天已值班"
 REASON_WEEK = "本周已达上限"
@@ -74,10 +76,12 @@ class ScheduleContext:
         busy: dict[int, set],
         leave_set: set[tuple[int, int, int]] | None,
         config: ScheduleConfig,
+        special_set: set[tuple[int, int, int, int]] | None = None,
     ) -> None:
         self.members = members
         self.busy = busy
         self.leave_set = leave_set or set()
+        self.special_set = special_set or set()
         self.config = config
         self.assigned: set[tuple[int, int, int, int]] = set()  # (mid, week, day, block)
         self.total: Counter = Counter()
@@ -132,6 +136,9 @@ class ScheduleContext:
         if any((week, weekday, s) in self.busy.get(member_id, ())
                for s in BLOCK_SESSIONS[block]):
             return REASON_COURSE
+        if any((member_id, week, weekday, s) in self.special_set
+               for s in BLOCK_SESSIONS[block]):
+            return REASON_SPECIAL
         if (member_id, week, weekday) in self.leave_set:
             return REASON_LEAVE
         if (member_id, week, weekday, block) in self.assigned:
@@ -171,6 +178,23 @@ def build_busy_map(members: list[Member], courses: list[CourseRecord]) -> dict[i
             for day in days:
                 for session in sessions:
                     target.add((week, day, session))
+    return busy
+
+
+def build_special_busy_map(
+    members: list[Member],
+    arrangements: list[SpecialArrangement] | None,
+) -> dict[int, set]:
+    """长期特殊安排 -> member_id: {(周, 星期, 节次)} 忙时集合。"""
+    member_ids = {m.id for m in members}
+    busy: dict[int, set] = defaultdict(set)
+    for a in arrangements or []:
+        if a.member_id not in member_ids:
+            continue
+        target = busy[a.member_id]
+        for week in a.week_list:
+            for session in a.session_list:
+                target.add((week, a.weekday, session))
     return busy
 
 
@@ -289,9 +313,9 @@ def repair_gaps(
     return fixed
 
 
-# 缺口原因：让界面能区分「排不了」（课程/请假冲突）与「排不下」（上限不足），
+# 缺口原因：让界面能区分「排不了」（课程/特殊安排/请假冲突）与「排不下」（上限不足），
 # 后者可以通过提高每周/每天上限或增加成员解决。
-GAP_NO_FREE = "成员均有课或请假"
+GAP_NO_FREE = "成员均有课、其他安排或请假"
 GAP_DAY_CAP = "受每天上限限制"
 GAP_WEEK_CAP = "受每周上限限制"
 GAP_MIXED_CAP = "受每天/每周上限限制"
@@ -306,8 +330,9 @@ class GapDiagnosis:
     weekday: int
     block: int
     cause: str
-    free_members: int = 0          # 该时段无课且未请假的成员数
+    free_members: int = 0          # 该时段无课、无特殊安排且未请假的成员数
     blocked_by_course: int = 0
+    blocked_by_special: int = 0
     blocked_by_leave: int = 0
     blocked_by_day_cap: int = 0
     blocked_by_week_cap: int = 0
@@ -324,14 +349,21 @@ def diagnose_gaps(
     leaves: list[Leave] | None,
     assignments: list[Assignment],
     config: ScheduleConfig,
+    special_arrangements: list[SpecialArrangement] | None = None,
 ) -> list[GapDiagnosis]:
-    """逐条分析缺口成因：谁被课程/请假挡住、谁只是被上限挡住。
+    """逐条分析缺口成因：谁被课程/特殊安排/请假挡住、谁只是被上限挡住。
 
     与排班共用 ScheduleContext.reason()，因此「诊断说可排」与「算法认为可排」
     永远一致，不会出现界面解释与算法行为不符。
     """
     leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
-    ctx = ScheduleContext(members, busy, leave_set, config)
+    special_busy = build_special_busy_map(members, special_arrangements)
+    special_set = {
+        (mid, week, weekday, session)
+        for mid, sessions in special_busy.items()
+        for week, weekday, session in sessions
+    }
+    ctx = ScheduleContext(members, busy, leave_set, config, special_set)
     ctx.load(assignments)
 
     out: list[GapDiagnosis] = []
@@ -341,6 +373,10 @@ def diagnose_gaps(
             if any((week, weekday, s) in busy.get(m.id, ())
                    for s in BLOCK_SESSIONS[block]):
                 d.blocked_by_course += 1
+                continue
+            if any((m.id, week, weekday, s) in special_set
+                   for s in BLOCK_SESSIONS[block]):
+                d.blocked_by_special += 1
                 continue
             if (m.id, week, weekday) in leave_set:
                 d.blocked_by_leave += 1
@@ -383,7 +419,7 @@ def capacity_advice(summary: dict[str, int], per_slot: int) -> str:
     missed = summary.get(GAP_ELIGIBLE, 0)
     parts: list[str] = []
     if hard:
-        parts.append(f"{hard} 个时段成员普遍有课或请假（只能靠增加成员解决）")
+        parts.append(f"{hard} 个时段成员普遍有课、其他安排或请假（只能靠增加成员解决）")
     if capped:
         parts.append(f"{capped} 个时段还有无课成员、只是达到每天/每周上限"
                      f"（提高上限或增加成员即可排满）")
@@ -414,7 +450,7 @@ def _availability_counts(
     weekdays: list[int],
     blocks: list[int],
 ) -> dict[tuple[int, int], int]:
-    """第 week 周各 (星期, 时段) 的静态可用人数（只算课程/请假，不算动态上限）。
+    """第 week 周各 (星期, 时段) 的静态可用人数（传入的忙时含课程/特殊安排）。
 
     作为贪心的次级排序键：同样的覆盖度下优先处理「可选人少」的时段，
     把抢手的时段先占住，实测显著减少单遍贪心留下的缺口。每个时段只算一次。
@@ -441,14 +477,27 @@ def generate_schedule(
     leaves: list[Leave] | None = None,
     base_assignments: list[Assignment] | None = None,
     repair: bool = True,
+    special_arrangements: list[SpecialArrangement] | None = None,
 ) -> ScheduleResult:
     """base_assignments：排班范围外的已有安排（按周增量模式），
     作为总次数均衡基数计入，且与新排班合并进返回结果。
     repair=False 可关闭缺口修复（用于对比/测试）。"""
     busy = build_busy_map(members, courses)
+    special_busy = build_special_busy_map(members, special_arrangements)
+    special_set = {
+        (mid, week, weekday, session)
+        for mid, sessions in special_busy.items()
+        for week, weekday, session in sessions
+    }
+    scarcity_busy = busy
+    if special_busy:
+        scarcity_busy = {
+            m.id: busy.get(m.id, set()) | special_busy.get(m.id, set())
+            for m in members
+        }
     leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
     rng = random.Random(config.seed)
-    ctx = ScheduleContext(members, busy, leave_set, config)
+    ctx = ScheduleContext(members, busy, leave_set, config, special_set)
 
     result = ScheduleResult()
     result.assignments.extend(base_assignments or [])
@@ -462,7 +511,7 @@ def generate_schedule(
             for weekday in config.weekdays
             for block in config.blocks
         ]
-        scarcity = _availability_counts(members, busy, leave_set, week,
+        scarcity = _availability_counts(members, scarcity_busy, leave_set, week,
                                         list(config.weekdays), list(config.blocks))
         # 每条任务只抽一次随机数作为平手排序键，主排序仍是「覆盖均衡」
         keys = {i: rng.random() for i in range(len(pending))}
@@ -541,6 +590,7 @@ def replacement_candidates(
     block: int,
     max_per_week: int,
     max_per_day: int,
+    special_set: set[tuple[int, int, int, int]] | None = None,
 ) -> list[tuple[Member, str]]:
     """手动微调候选：返回 (成员, 不可用原因)，原因为空串表示可值班。
     排除该时段已在岗的成员；与自动排班共用 ScheduleContext.reason() 判定。"""
@@ -548,7 +598,7 @@ def replacement_candidates(
         weeks=range(week, week + 1), weekdays=[weekday], blocks=[block],
         max_per_week=max_per_week, max_per_day=max_per_day,
     )
-    ctx = ScheduleContext(members, busy, leave_set, config)
+    ctx = ScheduleContext(members, busy, leave_set, config, special_set)
     ctx.load(assignments)
     current = {a.member_id for a in assignments
                if (a.week, a.weekday, a.block) == (week, weekday, block)}

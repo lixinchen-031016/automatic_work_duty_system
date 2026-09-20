@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from duty_system.database import CourseRecord, Member
+from duty_system.database import CourseRecord, Member, SpecialArrangement
 from duty_system.exporter import build_gap_df
 from duty_system.scheduler import (
     GAP_DAY_CAP, GAP_ELIGIBLE, GAP_MIXED_CAP, GAP_NO_FREE, GAP_WEEK_CAP,
@@ -41,6 +41,25 @@ def test_all_busy_slot_is_reported_as_no_free_member() -> None:
     assert d.blocked_by_course == 3 and d.free_members == 0 and d.eligible == 0
     assert "增加成员" in capacity_advice(summarize_gap_causes(diags), 1), \
         "全员冲突类缺口只能靠增加成员，建议里应说明"
+
+
+def test_special_arrangement_is_reported_as_hard_conflict() -> None:
+    """长期特殊安排应计入硬冲突，而不是误报为成员空闲。"""
+    members = [member(1)]
+    arrangement = SpecialArrangement(
+        id=1, member_id=1, week_start=1, week_end=3, weekday=1,
+        session_list=[1, 2], reason="固定实习")
+    config = ScheduleConfig(weeks=range(1, 2), weekdays=[1], blocks=[1], per_slot=1)
+    result = generate_schedule(
+        members, [], config, special_arrangements=[arrangement])
+    assert result.gaps == [(1, 1, 1)]
+
+    diags = diagnose_gaps(
+        members, {}, None, result.assignments, config,
+        special_arrangements=[arrangement])
+    assert len(diags) == 1
+    assert diags[0].blocked_by_special == 1
+    assert diags[0].blocked_by_course == 0 and diags[0].free_members == 0
 
 
 def test_capacity_limited_gap_and_advice_is_actionable() -> None:

@@ -1,7 +1,7 @@
 """成员空闲时段甘特图
 
 数据层：计算第 W 周内各成员在每个 (星期, 时段块) 的忙闲状态，
-空闲判定与排班算法完全一致（时段块内每一节均无课才算空闲）。
+空闲判定与排班算法完全一致（时段块内每一节均无课、无长期特殊安排才算空闲）。
 展示：app.py 用 QTableWidget 染色绘制甘特图；本模块提供导出
 带填充色的 Excel 甘特图（行=成员，列=星期x时段，绿=空闲）。
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, field
 
-from .database import Assignment, CourseRecord, Leave, Member
+from .database import Assignment, CourseRecord, Leave, Member, SpecialArrangement
 from .parser import (
     BLOCK_LABELS,
     BLOCK_SESSIONS,
@@ -23,7 +23,7 @@ from .parser import (
     WHOLE_WEEK_SESSIONS,
     WHOLE_WEEK_WEEKDAY,
 )
-from .scheduler import build_busy_map
+from .scheduler import build_busy_map, build_special_busy_map
 
 
 @dataclass
@@ -37,6 +37,7 @@ class AvailabilityMatrix:
     free_counts: list[int]                                 # 各时段空闲人数
     leave_info: dict[tuple[int, int], str] = field(default_factory=dict)  # (行号, 星期) -> 请假原因
     duty_cells: set[tuple[int, int, int]] = field(default_factory=set)  # (行号, 星期, 时段) -> 已排值班
+    special_info: dict[tuple[int, int, int], list[str]] = field(default_factory=dict)  # (行号, 星期, 时段) -> 特殊安排原因
 
     @property
     def member_count(self) -> int:
@@ -66,6 +67,7 @@ def build_availability(
     leaves: list[Leave] | None = None,
     assignments: list[Assignment] | None = None,
     busy: dict[int, set] | None = None,
+    special_arrangements: list[SpecialArrangement] | None = None,
 ) -> AvailabilityMatrix:
     """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）
 
@@ -74,6 +76,7 @@ def build_availability(
     """
     if busy is None:
         busy = build_busy_map(members, courses)
+    special_busy = build_special_busy_map(members, special_arrangements)
     leave_map = {(l.member_id, l.weekday): l.reason
                  for l in (leaves or []) if l.week == week}
     duty_set = {(a.member_id, a.weekday, a.block)
@@ -82,6 +85,14 @@ def build_availability(
     # 用忙时表判断「这门课本周是否上课」：忙时表里存在 (周, 星期, 节次) 就等价于
     # 本周有这门课，比在 week_list 里做线性查找快得多（课程多时差异明显）
     course_index: dict[tuple[int, int, int], set[str]] = {}
+    special_index: dict[tuple[int, int, int], set[str]] = {}
+    for a in special_arrangements or []:
+        if week not in a.week_list:
+            continue
+        label = a.reason.strip() or "其他安排"
+        for session in a.session_list:
+            special_index.setdefault(
+                (a.member_id, a.weekday, session), set()).add(label)
     member_ids = {m.id for m in members}
     for c in courses:
         if c.member_id not in member_ids:
@@ -110,9 +121,11 @@ def build_availability(
     busy_courses: dict[tuple[int, int, int], list[str]] = {}
     leave_info: dict[tuple[int, int], str] = {}
     duty_cells: set[tuple[int, int, int]] = set()
+    special_info: dict[tuple[int, int, int], list[str]] = {}
     for m in members:
         row = len(free)  # 当前行号
         member_busy = busy.get(m.id, ())
+        member_special = special_busy.get(m.id, ())
         row_free: list[bool] = []
         for d, b in slots:
             if (m.id, d) in leave_map:
@@ -124,14 +137,20 @@ def build_availability(
                 duty_cells.add((row, d, b))
                 continue
             names: set[str] = set()
+            special_names: set[str] = set()
             is_free = True
             for s in BLOCK_SESSIONS[b]:
                 if (week, d, s) in member_busy:
                     is_free = False
                     names |= course_index.get((m.id, d, s), set())
+                if (week, d, s) in member_special:
+                    is_free = False
+                    special_names |= special_index.get((m.id, d, s), set())
             row_free.append(is_free)
             if names:
                 busy_courses[(row, d, b)] = sorted(names)
+            if special_names:
+                special_info[(row, d, b)] = sorted(special_names)
         free.append(row_free)
 
     free_counts = [sum(1 for row in free if row[i]) for i in range(len(slots))]
@@ -144,6 +163,7 @@ def build_availability(
         free_counts=free_counts,
         leave_info=leave_info,
         duty_cells=duty_cells,
+        special_info=special_info,
     )
 
 
@@ -157,6 +177,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
     BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
     ALL_FREE_FILL = PatternFill("solid", fgColor="FFD9A8")
     LEAVE_FILL = PatternFill("solid", fgColor="FFD6D2")
+    SPECIAL_FILL = PatternFill("solid", fgColor="E5D8FF")
     DUTY_FILL = PatternFill("solid", fgColor="B8D9FF")
     HEADER_FILL = PatternFill("solid", fgColor="007AFF")
     THIN = Side(style="thin", color="FFFFFF")
@@ -188,7 +209,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 成员行：空闲绿色、有课灰色、请假红色、值班蓝色
+    # 成员行：空闲绿色、有课灰色、特殊安排紫色、请假红色、值班蓝色
     border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
     for r, name in enumerate(matrix.member_names):
         row = 3 + r
@@ -199,6 +220,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
             leave_reason = matrix.leave_info.get((r, d))
             is_free = matrix.free[r][i]
             names = matrix.busy_courses.get((r, d, b), [])
+            special_names = matrix.special_info.get((r, d, b), [])
             if leave_reason is not None:
                 cell = ws.cell(row=row, column=2 + i,
                                value=f"请假：{leave_reason}" if leave_reason else "请假")
@@ -208,6 +230,11 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
                 cell = ws.cell(row=row, column=2 + i, value="值班")
                 cell.fill = DUTY_FILL
                 cell.font = Font(bold=True, color="0A5AA8")
+            elif special_names:
+                cell = ws.cell(row=row, column=2 + i,
+                               value="其他安排：" + "、".join(special_names))
+                cell.fill = SPECIAL_FILL
+                cell.font = Font(color="6E3DC2")
             else:
                 cell = ws.cell(row=row, column=2 + i, value="" if is_free else "、".join(names))
                 cell.fill = FREE_FILL if is_free else BUSY_FILL

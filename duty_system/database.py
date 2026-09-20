@@ -1,4 +1,4 @@
-"""SQLite 存储层：成员、课程、值班安排的持久化"""
+"""SQLite 存储层：成员、课程、特殊安排、请假与值班安排的持久化"""
 
 from __future__ import annotations
 
@@ -57,10 +57,25 @@ CREATE TABLE IF NOT EXISTS leaves (
     UNIQUE(member_id, week, weekday)
 );
 
+CREATE TABLE IF NOT EXISTS special_arrangements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    week_start INTEGER NOT NULL,
+    week_end INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    session_list TEXT NOT NULL DEFAULT '[]',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(member_id, week_start, week_end, weekday, session_list)
+);
+
 CREATE INDEX IF NOT EXISTS idx_courses_member ON courses(member_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week);
 CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id);
 CREATE INDEX IF NOT EXISTS idx_leaves_week ON leaves(week);
+CREATE INDEX IF NOT EXISTS idx_special_arrangements_member ON special_arrangements(member_id);
+CREATE INDEX IF NOT EXISTS idx_special_arrangements_weeks ON special_arrangements(week_start, week_end);
 """
 
 # 结构迁移：只对已有数据库执行增量 DDL。
@@ -72,6 +87,24 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week)",
         "CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id)",
         "CREATE INDEX IF NOT EXISTS idx_leaves_week ON leaves(week)",
+    ]),
+    (2, [
+        """CREATE TABLE IF NOT EXISTS special_arrangements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+            week_start INTEGER NOT NULL,
+            week_end INTEGER NOT NULL,
+            weekday INTEGER NOT NULL,
+            session_list TEXT NOT NULL DEFAULT '[]',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            UNIQUE(member_id, week_start, week_end, weekday, session_list)
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_special_arrangements_member
+            ON special_arrangements(member_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_special_arrangements_weeks
+            ON special_arrangements(week_start, week_end)""",
     ]),
 ]
 
@@ -121,6 +154,22 @@ class Leave:
     week: int
     weekday: int
     reason: str = ""
+
+
+@dataclass
+class SpecialArrangement:
+    """课表外的长期固定占用：连续周范围内每周同一天、同一时段不可值班。"""
+    id: int
+    member_id: int
+    week_start: int
+    week_end: int
+    weekday: int
+    session_list: list[int]
+    reason: str = ""
+
+    @property
+    def week_list(self) -> range:
+        return range(self.week_start, self.week_end + 1)
 
 
 class Database:
@@ -386,4 +435,118 @@ class Database:
             return [Leave(
                 id=r["id"], member_id=r["member_id"], week=r["week"],
                 weekday=r["weekday"], reason=r["reason"],
+            ) for r in rows]
+
+    # ---------- 长期特殊安排（课表修改） ----------
+
+    @staticmethod
+    def _normalize_special(
+        week_start: int,
+        week_end: int,
+        weekday: int,
+        session_list: list[int],
+    ) -> tuple[int, int, int, list[int], str]:
+        if not 1 <= week_start <= week_end <= 25:
+            raise ValueError("周次范围应为 1–25，且起始周不能大于结束周")
+        if not 1 <= weekday <= 7:
+            raise ValueError("星期应为 1–7")
+        sessions = sorted({int(s) for s in session_list})
+        if not sessions or any(s < 1 or s > 11 for s in sessions):
+            raise ValueError("请至少选择一个有效节次")
+        return week_start, week_end, weekday, sessions, json.dumps(
+            sessions, ensure_ascii=False, separators=(",", ":"))
+
+    def add_special_arrangement(
+        self,
+        member_id: int,
+        week_start: int,
+        week_end: int,
+        weekday: int,
+        session_list: list[int],
+        reason: str = "",
+    ) -> int:
+        """新增长期特殊安排；相同范围/星期/节次重复登记时覆盖原因。"""
+        week_start, week_end, weekday, _sessions, sessions_json = self._normalize_special(
+            week_start, week_end, weekday, session_list)
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO special_arrangements
+                       (member_id, week_start, week_end, weekday, session_list, reason)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(member_id, week_start, week_end, weekday, session_list)
+                   DO UPDATE SET reason = excluded.reason,
+                                 updated_at = datetime('now', 'localtime')""",
+                (member_id, week_start, week_end, weekday, sessions_json, reason.strip()),
+            )
+            row = conn.execute(
+                """SELECT id FROM special_arrangements
+                   WHERE member_id = ? AND week_start = ? AND week_end = ?
+                     AND weekday = ? AND session_list = ?""",
+                (member_id, week_start, week_end, weekday, sessions_json),
+            ).fetchone()
+            return int(row["id"])
+
+    def update_special_arrangement(
+        self,
+        arrangement_id: int,
+        member_id: int,
+        week_start: int,
+        week_end: int,
+        weekday: int,
+        session_list: list[int],
+        reason: str = "",
+    ) -> None:
+        """修改一条长期特殊安排。"""
+        week_start, week_end, weekday, _sessions, sessions_json = self._normalize_special(
+            week_start, week_end, weekday, session_list)
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """UPDATE special_arrangements
+                       SET member_id = ?, week_start = ?, week_end = ?, weekday = ?,
+                           session_list = ?, reason = ?,
+                           updated_at = datetime('now', 'localtime')
+                       WHERE id = ?""",
+                    (member_id, week_start, week_end, weekday, sessions_json,
+                     reason.strip(), arrangement_id),
+                )
+            except sqlite3.IntegrityError:
+                # 修改后与另一条安排完全重合时合并：保留当前记录，删除重复项。
+                conn.execute(
+                    """DELETE FROM special_arrangements
+                       WHERE member_id = ? AND week_start = ? AND week_end = ?
+                         AND weekday = ? AND session_list = ? AND id != ?""",
+                    (member_id, week_start, week_end, weekday, sessions_json,
+                     arrangement_id),
+                )
+                conn.execute(
+                    """UPDATE special_arrangements
+                       SET member_id = ?, week_start = ?, week_end = ?, weekday = ?,
+                           session_list = ?, reason = ?,
+                           updated_at = datetime('now', 'localtime')
+                       WHERE id = ?""",
+                    (member_id, week_start, week_end, weekday, sessions_json,
+                     reason.strip(), arrangement_id),
+                )
+
+    def remove_special_arrangement(self, arrangement_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM special_arrangements WHERE id = ?", (arrangement_id,))
+
+    def list_special_arrangements(
+        self,
+        member_id: int | None = None,
+    ) -> list[SpecialArrangement]:
+        sql = "SELECT * FROM special_arrangements"
+        params: tuple = ()
+        if member_id is not None:
+            sql += " WHERE member_id = ?"
+            params = (member_id,)
+        sql += " ORDER BY member_id, week_start, week_end, weekday, session_list"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [SpecialArrangement(
+                id=r["id"], member_id=r["member_id"], week_start=r["week_start"],
+                week_end=r["week_end"], weekday=r["weekday"],
+                session_list=json.loads(r["session_list"]), reason=r["reason"],
             ) for r in rows]

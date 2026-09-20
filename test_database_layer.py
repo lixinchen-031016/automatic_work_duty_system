@@ -98,7 +98,9 @@ def test_indexes_wal_and_migration(tmp_path: Path) -> None:
     conn.close()
 
     expected = {"idx_courses_member", "idx_assignments_week",
-                "idx_assignments_member", "idx_leaves_week"}
+                "idx_assignments_member", "idx_leaves_week",
+                "idx_special_arrangements_member",
+                "idx_special_arrangements_weeks"}
     assert expected <= indexes, f"缺少索引: {expected - indexes}"
     assert version == MIGRATIONS[-1][0], "user_version 未推进到最新"
     assert journal.lower() == "wal", "应启用 WAL 以提升并发写入稳定性"
@@ -141,10 +143,35 @@ def test_upsert_replaces_courses_and_cascades(tmp_path: Path) -> None:
 
     db.save_assignments([Assignment(1, 1, 1, mid, "甲")])
     db.add_leave(mid, 1, 1, "事假")
+    db.add_special_arrangement(mid, 1, 8, 2, [3, 4], "固定实习")
     db.delete_member(mid)
     assert db.list_members() == []
     assert db.load_assignments() == [], "删除成员应级联清理排班"
     assert db.list_leaves() == [], "删除成员应级联清理请假"
+    assert db.list_special_arrangements() == [], "删除成员应级联清理特殊安排"
+
+
+def test_special_arrangement_crud_is_normalized_and_idempotent(tmp_path: Path) -> None:
+    """长期特殊安排支持新增、覆盖、编辑、查询和删除，节次会规范化排序。"""
+    db = new_db(tmp_path)
+    mid, other = add_members(db, ["甲", "乙"])
+
+    arrangement_id = db.add_special_arrangement(
+        mid, 2, 10, 3, [4, 3, 3], "训练")
+    again = db.add_special_arrangement(mid, 2, 10, 3, [3, 4], "训练（调整）")
+    assert again == arrangement_id, "相同范围/星期/节次重复登记应覆盖而非新增"
+    rows = db.list_special_arrangements(mid)
+    assert len(rows) == 1 and rows[0].session_list == [3, 4]
+    assert rows[0].reason == "训练（调整）" and list(rows[0].week_list) == list(range(2, 11))
+
+    db.update_special_arrangement(arrangement_id, other, 5, 5, 6, [7, 8], "比赛")
+    updated = db.list_special_arrangements(other)[0]
+    assert updated.id == arrangement_id and updated.member_id == other
+    assert (updated.week_start, updated.week_end, updated.weekday) == (5, 5, 6)
+    assert updated.session_list == [7, 8] and updated.reason == "比赛"
+
+    db.remove_special_arrangement(arrangement_id)
+    assert db.list_special_arrangements() == []
 
 def test_backup_to_is_wal_safe(tmp_path: Path) -> None:
     """WAL 模式下备份必须用 SQLite 在线备份 API

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 import app as appmod  # noqa: E402
 from duty_system.database import Member  # noqa: E402
-from duty_system.parser import Course, ParsedSchedule  # noqa: E402
+from duty_system.parser import BLOCK_SESSIONS, Course, ParsedSchedule  # noqa: E402
 from duty_system.scheduler import (  # noqa: E402
     compute_gaps, replacement_candidates, build_busy_map,
 )
@@ -183,7 +183,7 @@ def test_last_config_is_per_database(qt_app, settings, tmp_path) -> None:
 def test_cache_avoids_repeated_full_queries(window, monkeypatch) -> None:
     """成员/课程/请假只查一次，写操作后失效"""
     seed_members(window, 5)
-    calls = {"members": 0, "courses": 0, "leaves": 0}
+    calls = {"members": 0, "courses": 0, "leaves": 0, "specials": 0}
 
     def counting(name, original):
         def wrapper(*args, **kwargs):
@@ -194,13 +194,16 @@ def test_cache_avoids_repeated_full_queries(window, monkeypatch) -> None:
     monkeypatch.setattr(window.db, "list_members", counting("members", window.db.list_members))
     monkeypatch.setattr(window.db, "get_courses", counting("courses", window.db.get_courses))
     monkeypatch.setattr(window.db, "list_leaves", counting("leaves", window.db.list_leaves))
+    monkeypatch.setattr(window.db, "list_special_arrangements",
+                        counting("specials", window.db.list_special_arrangements))
     window.invalidate_cache()
 
     for _ in range(3):
         window.members()
         window.courses()
         window.leaves()
-    assert calls == {"members": 1, "courses": 1, "leaves": 1}, \
+        window.specials()
+    assert calls == {"members": 1, "courses": 1, "leaves": 1, "specials": 1}, \
         f"缓存未生效，实际查询次数 {calls}"
 
     window.invalidate_cache()
@@ -515,3 +518,24 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
     for i, (d, _b) in enumerate(m2.slots):
         if d == 2:
             assert t.item(r0, i).text() == "假" and "生病" in t.item(r0, i).toolTip()
+
+
+def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
+    """长期特殊安排应在甘特图中显示为紫色「其他安排」并计入忙时。"""
+    seed_members(window, 3)
+    member_id = window.members()[0].id
+    window.db.add_special_arrangement(
+        member_id, 1, 3, 1, list(BLOCK_SESSIONS[1]), "固定实习")
+    window.invalidate_cache()
+    window.gantt_week.setValue(2)
+    window.refresh_gantt()
+
+    matrix = window.gantt_matrix
+    assert matrix is not None
+    row = next(r for r, m in enumerate(window.members()) if m.id == member_id)
+    col = matrix.slots.index((1, 1))
+    assert matrix.free[row][col] is False
+    assert matrix.special_info[(row, 1, 1)] == ["固定实习"]
+    item = window.gantt_table.item(row, col)
+    assert item.text() == "特" and "其他安排" in item.toolTip()
+    assert item.background().color().name() == "#e5d8ff"

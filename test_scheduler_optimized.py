@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 
-from duty_system.database import CourseRecord, Member
+from duty_system.database import CourseRecord, Member, SpecialArrangement
 from duty_system.gantt import build_availability
 from duty_system.parser import BLOCK_SESSIONS, WHOLE_WEEK_WEEKDAY
 from duty_system.scheduler import (
@@ -13,6 +13,7 @@ from duty_system.scheduler import (
     REASON_DAY,
     REASON_LEAVE,
     REASON_SLOT,
+    REASON_SPECIAL,
     REASON_WEEK,
     ScheduleConfig,
     ScheduleContext,
@@ -82,6 +83,34 @@ def test_reason_single_source_of_truth() -> None:
     assert ctx.total[a.member_id] == before[0].get(a.member_id, 0) - 1
     ctx.assign(a.member_id, a.week, a.weekday, a.block)
     assert ctx.total[a.member_id] == before[0].get(a.member_id, 0), "assign/unassign 不对称"
+
+
+def test_long_term_special_arrangement_blocks_specified_weeks() -> None:
+    """特殊安排应连续阻断指定周次，并在甘特图和微调候选中显示同一原因。"""
+    members = make_members(2)
+    arrangement = SpecialArrangement(
+        id=1, member_id=members[0].id, week_start=1, week_end=3,
+        weekday=1, session_list=[1, 2], reason="固定实习")
+    config = ScheduleConfig(
+        weeks=range(1, 5), weekdays=[1], blocks=[1],
+        per_slot=1, max_per_week=1, max_per_day=1)
+
+    result = generate_schedule(
+        members, [], config, special_arrangements=[arrangement])
+    assigned = {(a.week, a.member_id) for a in result.assignments}
+    assert all((week, members[0].id) not in assigned for week in (1, 2, 3))
+    assert all((week, members[1].id) in assigned for week in (1, 2, 3))
+    assert (4, members[0].id) in assigned, "安排结束后应恢复可排"
+
+    cands = {m.id: reason for m, reason in replacement_candidates(
+        members, {}, set(), result.assignments, 2, 1, 1, 1, 1,
+        special_set={(members[0].id, 2, 1, 1), (members[0].id, 2, 1, 2)})}
+    assert cands[members[0].id] == REASON_SPECIAL
+
+    matrix = build_availability(
+        members, [], 2, [1], [1], special_arrangements=[arrangement])
+    assert matrix.free[0][0] is False
+    assert matrix.special_info[(0, 1, 1)] == ["固定实习"]
 
 
 def test_gap_repair_reduces_gaps() -> None:
