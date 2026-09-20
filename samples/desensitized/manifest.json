@@ -38,5 +38,15 @@
     "major": "材料科学与工程",
     "department": "材料与环境工程学院",
     "course_count": 49
+  },
+  {
+    "file": "学生个人课表_9999713269.xls",
+    "name": "周明明",
+    "student_id": "9999713269",
+    "term": "2026-2027-1",
+    "class_name": "25物流管理1班",
+    "major": "物流管理",
+    "department": "管理工程学院",
+    "course_count": 40
   }
 ]

@@ -1,11 +1,11 @@
 """课表解析健壮性测试
 
-基准数据是 `samples/desensitized/` 下的四份样例（真实教务系统导出后脱敏）：
+基准数据是 `samples/desensitized/` 下的五份样例（真实教务系统导出后脱敏）：
 它们是**真实文件的等长字节替换版本**——课程名/周次/节次/地点/课程数与原始
 文件逐字段一致，只把姓名与学号换成了虚构值，因此既能放进仓库供 CI 使用，
 又保留了真实布局（合并单元格、SST 共享、换行方式）带来的解析难度。
 
-修复解析器时必须保证这四份课表的基线不变，再用变体用例覆盖各校常见写法
+修复解析器时必须保证这五份课表的基线不变，再用变体用例覆盖各校常见写法
 （单双周、表头写法、全角字符、空行异常、合并单元格）。
 
 原始文件与脱敏样例的对应关系由 `tools/desensitize_samples.py` 维护；
@@ -419,12 +419,14 @@ def test_merged_cells_do_not_break_sample(tmp_path: Path) -> None:
 SAMPLE_2403 = SAMPLES_DIR / "学生个人课表_9999832478.xls"      # 原始 57 门，电信
 SAMPLE_2502 = SAMPLES_DIR / "学生个人课表_9999453245(1).xls"   # 原始 49 门，材科（文件名带后缀）
 SAMPLE_2501 = SAMPLES_DIR / "学生个人课表_9999125207.xls"      # 原始 39 门，机器人
+SAMPLE_2507 = SAMPLES_DIR / "学生个人课表_9999713269.xls"      # 原始 40 门，物流管理
 
 REAL_SAMPLES = [
     pytest.param(SAMPLE, "赵明明", "9999800598", "24国际商务双语4班", 37, id="国际商务"),
     pytest.param(SAMPLE_2403, "钱明明", "9999832478", "24电信3班", 57, id="电信"),
     pytest.param(SAMPLE_2502, "郑明明", "9999453245", "25材科4班", 49, id="材科"),
     pytest.param(SAMPLE_2501, "郑明明", "9999125207", "25机器人1班", 39, id="机器人"),
+    pytest.param(SAMPLE_2507, "周明明", "9999713269", "25物流管理1班", 40, id="物流管理"),
 ]
 
 
@@ -436,7 +438,7 @@ def _require(path: Path) -> Path:
 
 @pytest.mark.parametrize("path,name,student_id,class_name,count", REAL_SAMPLES)
 def test_real_samples_meta_and_count(path, name, student_id, class_name, count) -> None:
-    """四份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
+    """五份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
     s = parse_schedule_path(_require(path))
     assert s.name == name
     assert s.student_id == student_id, f"学号提取失败：{s.student_id!r}"
@@ -446,8 +448,8 @@ def test_real_samples_meta_and_count(path, name, student_id, class_name, count) 
     assert not s.warnings
 
 
-@pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502, SAMPLE_2501],
-                         ids=["国际商务", "电信", "材科", "机器人"])
+@pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502, SAMPLE_2501, SAMPLE_2507],
+                         ids=["国际商务", "电信", "材科", "机器人", "物流管理"])
 def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
     """用教务系统自己生成的末尾「备注行」反查解析结果
 
@@ -644,6 +646,150 @@ def test_theory_schedule_note_row_is_partial() -> None:
             continue
         name = " ".join(item.split()[:-2])
         assert any(c.course_name == name for c in parsed.courses), f"备注行的 {name!r} 未解析出来"
+
+
+def test_unknown_teacher_title_is_still_extracted() -> None:
+    """白名单外的职称（其他中级）也要能拆出教师，不能被并进课程名
+
+    真实课表里出现过「刘建泉(其他中级)」——教务系统的职称字典会扩充，
+    修复前 11 个单元格受影响：教师字段为空、课程名被污染成
+    「企业运营管理综合模拟实验 刘建泉(其他中级)」。
+    """
+    courses = parse_cell(cell([
+        "企业运营管理综合模拟实验", "赵明明(其他中级)",
+        "19([周])[01-02-03-04节]", "德五楼3312",
+    ]), 1)
+    assert len(courses) == 1
+    c = courses[0]
+    assert c.course_name == "企业运营管理综合模拟实验", f"课程名被污染：{c.course_name!r}"
+    assert c.teacher == "赵明明", f"教师解析错误：{c.teacher!r}"
+
+    # 样例课表里该课程必须全部带教师
+    s = parse_schedule_path(_require(SAMPLE_2507))
+    sy = [c for c in s.courses if c.course_name == "企业运营管理综合模拟实验"]
+    assert len(sy) == 6, f"应有 6 条，实际 {len(sy)}"
+    assert all(c.teacher == "赵明明" for c in sy), \
+        f"教师缺失：{[(c.course_name, c.teacher) for c in sy]}"
+    assert not any("(" in c.course_name or "（" in c.course_name for c in sy), \
+        f"课程名仍被职称污染：{[c.course_name for c in sy]}"
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("其他中级", "赵明明"), ("其他初级", "赵明明"), ("其他副高", "赵明明"),
+    ("教授", "赵明明"), ("副教授", "赵明明"), ("讲师", "赵明明"),
+    ("助教", "赵明明"), ("未评级", "赵明明"), ("实验师", "赵明明"),
+    ("高级实验师", "赵明明"), ("研究员", "赵明明"), ("外教", "赵明明"),
+])
+def test_teacher_title_variants(title: str, expected: str) -> None:
+    """各职称写法都要能识别（含白名单外的「其他X」家族）"""
+    courses = parse_cell(cell(["物流前沿讲座Ⅰ", f"赵明明({title})",
+                               "18([周])[01-02-03节]", "允明楼1124"]), 4)
+    assert len(courses) == 1
+    assert courses[0].course_name == "物流前沿讲座Ⅰ", f"{title} 时课程名错误：{courses[0].course_name!r}"
+    assert courses[0].teacher == expected, f"{title} 时教师错误：{courses[0].teacher!r}"
+
+
+@pytest.mark.parametrize("subtitle", [
+    "PD03-3", "PD1-1", "25PJ04", "PD8-1", "25PT07-跨文化交际", "板块1羽毛球",
+    "板块3乒乓球", "智慧树网课", "通识课", "五", "三", "跨", "Ⅰ",
+])
+def test_course_subtitle_is_not_treated_as_teacher_title(subtitle: str) -> None:
+    """课程副标题不能被误当成职称（兜底规则不能过度匹配）
+
+    职称兜底要求以 级/师/授/员/研/教 收尾，而课程副标题都不满足，
+    这条用例锁住该边界。
+    """
+    name = f"测试课程 ({subtitle})"
+    courses = parse_cell(cell([name, "赵明明(讲师)",
+                               "1-8([周])[01-02节]", "教室A"]), 1)
+    assert len(courses) == 1
+    c = courses[0]
+    assert c.teacher == "赵明明", f"副标题 {subtitle!r} 干扰教师识别：{c.teacher!r}"
+    assert subtitle in c.course_name, f"副标题 {subtitle!r} 丢失：{c.course_name!r}"
+
+
+def test_short_session_course_with_three_periods() -> None:
+    """3 个连续节次的短课（18([周])[01-02-03节]）节次要完整解析"""
+    s = parse_schedule_path(_require(SAMPLE_2507))
+    lec = [c for c in s.courses if c.course_name == "物流前沿讲座Ⅰ" and c.weekday == 4]
+    assert lec, "缺少第 4 周的物流前沿讲座Ⅰ"
+    three = [c for c in lec if c.sessions_text == "01-02-03"]
+    assert three, f"缺 3 节次记录：{[(c.sessions_text, c.weekday) for c in lec]}"
+    assert three[0].session_list == [1, 2, 3]
+    assert three[0].week_list == [18]
+
+
+def test_theory_schedule_note_row_multi_teacher() -> None:
+    """备注行里的多人授课（景乔松,罗霞,王宁）在单元格中是分条出现的
+
+    这门课由 3 位教师分周次上，每个人都必须在解析结果里出现。
+    """
+    import xlrd
+
+    from duty_system.parser import normalize_cell
+
+    path = _require(SAMPLE_2507)
+    sheet = xlrd.open_workbook(str(path), formatting_info=True).sheet_by_index(0)
+    note = normalize_cell(sheet.cell_value(sheet.nrows - 1, 1))
+
+    # 在备注行里找到那条带多个教师的记录（形如「课程名 甲,乙,丙 18周」）
+    multi = [it.strip() for it in note.lstrip("：:").split(";")
+             if it.strip() and "," in it.strip().split()[-2]]
+    assert multi, f"该样例备注行应有一条多人授课记录：{note!r}"
+
+    parsed = parse_schedule_path(path)
+    for item in multi:
+        parts = item.split()
+        course, teachers, weeks_text = " ".join(parts[:-2]), parts[-2], parts[-1]
+        want = {t for t in re.split(r"[,，、]", teachers) if t}
+        assert len(want) >= 2, f"该条应含多位教师：{item!r}"
+
+        hit = [c for c in parsed.courses if c.course_name == course]
+        assert hit, f"备注行的 {course!r} 未解析出来"
+        # 分周授课：每位教师都要在单元格里各自成条
+        assert want <= {c.teacher for c in hit}, \
+            f"{course} 教师缺失：备注 {sorted(want)} vs 解析 {sorted({c.teacher for c in hit})}"
+        expected_weeks = int(re.search(r"(\d+)", weeks_text).group(1))
+        assert {tuple(c.week_list) for c in hit} == {(expected_weeks,)}, \
+            f"{course} 周次错误：备注 {weeks_text!r} vs 解析 {[c.week_list for c in hit]}"
+
+        # 单元格里这门课必须拆成多条（一位教师一条），而不是把多人写进一个字段
+        assert len(hit) == len(want), \
+            f"{course} 应拆成 {len(want)} 条（每位教师一条），实际 {len(hit)} 条"
+        assert all("," not in c.teacher for c in hit), \
+            f"{course} 的教师字段不应含分隔符：{[c.teacher for c in hit]}"
+
+
+def test_logistics_sample_course_count_and_fields() -> None:
+    """物流管理样例：40 条记录 / 14 门课程，关键字段抽样核对"""
+    s = parse_schedule_path(_require(SAMPLE_2507))
+    assert len(s.courses) == 40, f"课程数 {len(s.courses)} != 40"
+    assert len({c.course_name for c in s.courses}) == 14
+    for c in s.courses:
+        assert c.course_name and c.teacher, f"{c.course_name!r}/{c.teacher!r}"
+        assert c.weekday in range(1, 8) and c.week_list and c.session_list
+
+    # 键含 星期+周次+节次，唯一确定一条记录（同名课程常有多条）
+    sample = {
+        ("运输管理", 1, "1-8", "01-02"): ("郑明明", "零号教室022"),
+        ("大学英语III (25PJ04)", 4, "1-16", "01-02"): ("吴明", "允明楼1230"),
+        ("体育Ⅲ (板块1羽毛球)", 2, "1,3,7,9,11,13,15", "03-04"): ("李明明", "乒羽中心"),
+        ("商品流通学", 3, "9-16", "03-04"): ("郑明", "允明楼1104"),
+        ("运筹学", 4, "13-16", "05-06"): ("王明", "德五楼3420"),
+        ("文献检索与说理写作", 2, "6-7", "09-10-11"): ("李明", "允明楼1226"),
+        ("商业数据分析", 5, "9-12", "01-02-03-04"): ("孙明明", "允明楼1204"),
+        ("物流前沿讲座Ⅰ", 4, "18", "01-02-03"): ("周明", "允明楼1124"),
+        ("仓储与配送管理", 5, "9-12", "05-06"): ("周明", "德五楼3512"),
+        ("仓储与配送管理", 5, "1-8", "03-04"): ("周明", "允明楼1330"),
+        ("企业运营管理综合模拟实验", 3, "19", "09-10"): ("赵明明", "德五楼3312"),
+        ("企业运营管理综合模拟实验", 1, "19", "01-02-03-04"): ("赵明明", "德五楼3312"),
+    }
+    for (name, weekday, weeks, sessions), (teacher, loc) in sample.items():
+        hit = [c for c in s.courses if c.course_name == name and c.weekday == weekday
+               and c.weeks_text == weeks and c.sessions_text == sessions]
+        assert len(hit) == 1, f"{name!r}（周{weekday}/{weeks}周/{sessions}节）应唯一，实际 {len(hit)} 条"
+        assert (hit[0].teacher, hit[0].location) == (teacher, loc), \
+            f"{name}（{weeks} 周）字段错误：{(hit[0].teacher, hit[0].location)}"
 
 
 # --------------------------------------------------------------------------- #
