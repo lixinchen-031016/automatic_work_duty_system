@@ -1,11 +1,11 @@
 """课表解析健壮性测试
 
-基准数据是 `samples/desensitized/` 下的三份样例（真实教务系统导出后脱敏）：
+基准数据是 `samples/desensitized/` 下的四份样例（真实教务系统导出后脱敏）：
 它们是**真实文件的等长字节替换版本**——课程名/周次/节次/地点/课程数与原始
 文件逐字段一致，只把姓名与学号换成了虚构值，因此既能放进仓库供 CI 使用，
 又保留了真实布局（合并单元格、SST 共享、换行方式）带来的解析难度。
 
-修复解析器时必须保证这三份课表的基线不变，再用变体用例覆盖各校常见写法
+修复解析器时必须保证这四份课表的基线不变，再用变体用例覆盖各校常见写法
 （单双周、表头写法、全角字符、空行异常、合并单元格）。
 
 原始文件与脱敏样例的对应关系由 `tools/desensitize_samples.py` 维护；
@@ -411,16 +411,20 @@ def test_merged_cells_do_not_break_sample(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 真实样例二三：25材科 / 24电信（新格式：多教师、文件名带后缀）
+# 其余真实样例：国际商务 / 电信 / 材科 / 机器人
+#   覆盖到的真实写法：多人授课、文件名带后缀、备注行只列部分课程、
+#   单元格内某门课没有地点行、跨节次课程重复出现、全角括号课程名。
 # --------------------------------------------------------------------------- #
 
 SAMPLE_2403 = SAMPLES_DIR / "学生个人课表_9999832478.xls"      # 原始 57 门，电信
 SAMPLE_2502 = SAMPLES_DIR / "学生个人课表_9999453245(1).xls"   # 原始 49 门，材科（文件名带后缀）
+SAMPLE_2501 = SAMPLES_DIR / "学生个人课表_9999125207.xls"      # 原始 39 门，机器人
 
 REAL_SAMPLES = [
     pytest.param(SAMPLE, "赵明明", "9999800598", "24国际商务双语4班", 37, id="国际商务"),
     pytest.param(SAMPLE_2403, "钱明明", "9999832478", "24电信3班", 57, id="电信"),
     pytest.param(SAMPLE_2502, "郑明明", "9999453245", "25材科4班", 49, id="材科"),
+    pytest.param(SAMPLE_2501, "郑明明", "9999125207", "25机器人1班", 39, id="机器人"),
 ]
 
 
@@ -432,7 +436,7 @@ def _require(path: Path) -> Path:
 
 @pytest.mark.parametrize("path,name,student_id,class_name,count", REAL_SAMPLES)
 def test_real_samples_meta_and_count(path, name, student_id, class_name, count) -> None:
-    """三份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
+    """四份样例课表的元信息与课程数都必须稳定（学生姓名/学号/班级不得错位）"""
     s = parse_schedule_path(_require(path))
     assert s.name == name
     assert s.student_id == student_id, f"学号提取失败：{s.student_id!r}"
@@ -442,8 +446,8 @@ def test_real_samples_meta_and_count(path, name, student_id, class_name, count) 
     assert not s.warnings
 
 
-@pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502],
-                         ids=["国际商务", "电信", "材科"])
+@pytest.mark.parametrize("path", [SAMPLE, SAMPLE_2403, SAMPLE_2502, SAMPLE_2501],
+                         ids=["国际商务", "电信", "材科", "机器人"])
 def test_real_samples_note_row_agrees_with_parsed_courses(path: Path) -> None:
     """用教务系统自己生成的末尾「备注行」反查解析结果
 
@@ -509,6 +513,137 @@ def test_real_sample_shared_room_multiple_experiments() -> None:
     assert len({c.location for c in exps}) >= 4, f"实验地点被合并：{weeks_to_room}"
     for c in exps:
         assert len(c.week_list) == 1, f"单周实验被合并：{c.week_list}"
+
+
+def test_theory_schedule_course_count_and_fields() -> None:
+    """学期理论课表：课程数、各字段完整率与抽样字段必须准确
+
+    这份样例（机器人工程 25 级）共 39 条记录，覆盖 14 门课程，
+    原始单元格里有 43 个周次行——其中 4 个是「大学物理实验-2」跨 01-04 节，
+    同时出现在 1-2 节行与 3-4 节行，去重后应为 39 条。
+    """
+    s = parse_schedule_path(_require(SAMPLE_2501))
+    assert len(s.courses) == 39, f"课程数 {len(s.courses)} != 39"
+
+    # 每条记录的关键字段都必须非空（地点允许为空，原始文件里确实缺）
+    for c in s.courses:
+        assert c.course_name, "课程名为空"
+        assert c.teacher, f"{c.course_name} 教师为空"
+        assert c.weekday in range(1, 8), f"{c.course_name} 星期非法：{c.weekday}"
+        assert c.weeks_text and c.week_list, f"{c.course_name} 周次为空"
+        assert c.sessions_text and c.session_list, f"{c.course_name} 节次为空"
+
+    # 抽样逐字段核对（教师/星期/周次/节次/地点）
+    sample = {
+        ("线性代数 (PD03-3)", 1): ("孙明", "1-8", "01-02", "允明楼1230"),
+        ("理论力学D", 2): ("李明", "1-4,6-11", "01-02", "允明楼1224"),
+        ("大学英语III (25PT07-跨文化交际)", 3): ("卫明明", "1-16", "03-04", "允明楼1506"),
+        ("中国近现代史纲要 (PD3-1)", 1): ("赵明", "1-10", "05-06", "允明楼1232"),
+        ("体育Ⅲ (板块3乒乓球)", 2): ("钱明", "1,3,7,9,11,13,15", "07-08", "乒羽中心"),
+        ("形势与政策(三)", 3): ("王明明", "8-9", "09-10", "允明楼1203"),
+        ("外国建筑赏析 (智慧树网课)", 7): ("蒋明明", "1,3-8", "09-10", "智慧树ZHSWK01"),
+    }
+    for (name, weekday), (teacher, weeks, sessions, location) in sample.items():
+        hit = [c for c in s.courses if c.course_name == name and c.weekday == weekday]
+        assert hit, f"缺少课程 {name!r}（周{weekday}）"
+        c = hit[0]
+        assert c.teacher == teacher, f"{name} 教师 {c.teacher!r} != {teacher!r}"
+        assert c.weeks_text == weeks, f"{name} 周次 {c.weeks_text!r} != {weeks!r}"
+        assert c.sessions_text == sessions, f"{name} 节次 {c.sessions_text!r} != {sessions!r}"
+        assert c.location == location, f"{name} 地点 {c.location!r} != {location!r}"
+
+    # 14 门不同课程
+    assert len({c.course_name for c in s.courses}) == 14
+
+
+def test_theory_schedule_cross_period_course_is_deduplicated() -> None:
+    """跨节次课程（01-04 节）在 1-2 节行与 3-4 节行重复出现，必须去重成 4 条
+
+    原始单元格里「大学物理实验-2」在第 10/12/14/16 周各上一次，
+    每次占 01-04 节，因此它在两行里各出现一次。若去重失效会变成 8 条。
+    """
+    s = parse_schedule_path(_require(SAMPLE_2501))
+    labs = [c for c in s.courses if c.course_name == "大学物理实验-2"]
+    assert len(labs) == 4, f"跨节次实验课去重失败，得到 {len(labs)} 条：{[c.weeks_text for c in labs]}"
+
+    by_week = {c.week_list[0]: c for c in labs}
+    assert sorted(by_week) == [10, 12, 14, 16], f"实验周次错误：{sorted(by_week)}"
+    # 每次实验地点都不同，不能被合并
+    assert {c.location for c in labs} == {
+        "甲工楼A座6404", "甲工楼A座6401", "甲工楼A座6409", "甲工楼A座6402"}
+    for c in labs:
+        assert c.session_list == [1, 2, 3, 4], f"{c.weeks_text} 周节次错误：{c.session_list}"
+        assert c.teacher == "冯明明"
+
+
+def test_theory_schedule_course_without_location_line() -> None:
+    """单元格里某门课没有地点行时，不能把下一门课的课程名当成它的地点
+
+    真实数据：「创新创业教育」第 8 周那一条没有地点，紧跟其后的是
+    「单片机原理及应用」（也是课程名，没有楼/室等地点特征词）。
+    """
+    s = parse_schedule_path(_require(SAMPLE_2501))
+    pe = [c for c in s.courses if c.course_name == "创新创业教育" and c.week_list == [8]]
+    assert pe, "缺少第 8 周的创新创业教育"
+    assert pe[0].location == "", f"无地点课程的地点应为空，实际 {pe[0].location!r}"
+    assert pe[0].teacher == "李明"
+
+    # 紧随其后的课程必须保持完整（课程名/教师/地点都没被牵连）
+    mcu = [c for c in s.courses if c.course_name == "单片机原理及应用" and c.week_list == [9, 10, 11, 12]]
+    assert mcu, "缺少 9-12 周的单片机原理及应用"
+    assert mcu[0].location == "允明楼1306"
+    assert mcu[0].teacher == "李明明"
+
+
+def test_theory_schedule_same_course_different_weeks_and_rooms() -> None:
+    """同一门课在不同周次换教室（单片机/电工电子技术B）必须各自成条，不能合并"""
+    s = parse_schedule_path(_require(SAMPLE_2501))
+
+    mcu = [c for c in s.courses if c.course_name == "单片机原理及应用"]
+    assert len(mcu) == 4, f"单片机原理及应用应有 4 条，实际 {len(mcu)}"
+    rooms = {tuple(c.week_list): c.location for c in mcu}
+    assert rooms[(9, 10, 11, 12)] == "允明楼1306"
+    assert rooms[(13, 14, 15, 16)] == "文澄楼2207"
+
+    # 同一门课由不同教师分周上（1 周刘娟秀 / 2-16 周马瑞峰）
+    eee = [c for c in s.courses if c.course_name == "电工电子技术B" and c.weekday == 1]
+    by_teacher = {c.teacher: c for c in eee}
+    assert by_teacher["赵明明"].week_list == [1]
+    assert by_teacher["褚明明"].week_list == list(range(2, 17))
+
+
+def test_theory_schedule_fullwidth_parens_and_subtitle() -> None:
+    """课程名的全角括号与带连字符的副标题必须原样保留"""
+    s = parse_schedule_path(_require(SAMPLE_2501))
+    names = {c.course_name for c in s.courses}
+    assert "人工智能导论（通识课）" in names, f"全角括号课程名丢失：{sorted(names)}"
+    assert "大学英语III (25PT07-跨文化交际)" in names, f"带连字符副标题丢失：{sorted(names)}"
+    assert "线性代数 (PD03-3)" in names, f"课程副标题丢失：{sorted(names)}"
+    # 副标题不能被误当成教师
+    for c in s.courses:
+        if c.course_name.startswith("大学英语III"):
+            assert c.teacher == "卫明明"
+
+
+def test_theory_schedule_note_row_is_partial() -> None:
+    """这份课表的备注行只列了 8 条（不是全部课程），核对时不能反推成「只该有 8 门」"""
+    import xlrd
+
+    from duty_system.parser import normalize_cell
+
+    path = _require(SAMPLE_2501)
+    sheet = xlrd.open_workbook(str(path), formatting_info=True).sheet_by_index(0)
+    note = normalize_cell(sheet.cell_value(sheet.nrows - 1, 1))
+    assert note.count(";") == 8, f"该样例备注行应有 8 条，实际 {note.count(';')}"
+    parsed = parse_schedule_path(path)
+    assert len(parsed.courses) == 39, "备注行条目数少于课程数，不能据此裁剪课程"
+    # 备注行提到的课程必须都在解析结果里
+    for item in note.lstrip("：:").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        name = " ".join(item.split()[:-2])
+        assert any(c.course_name == name for c in parsed.courses), f"备注行的 {name!r} 未解析出来"
 
 
 # --------------------------------------------------------------------------- #
