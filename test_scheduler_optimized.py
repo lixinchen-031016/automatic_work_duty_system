@@ -301,3 +301,23 @@ def test_gantt_shows_reason_for_whole_week_courses() -> None:
     other = build_availability(members, courses, 12, [1, 2, 3, 4, 5], [1], assignments=[])
     assert all(other.free[0]), "非军训周不应被占用"
     assert not other.busy_courses
+
+
+def test_gantt_only_shows_courses_for_selected_week() -> None:
+    """同一时段跨周课程不能串周显示，课程详情必须与所选周匹配"""
+    members = make_members(1)
+    courses = [
+        CourseRecord(id=1, member_id=1, course_name="第1周课程", teacher="",
+                     weekday=1, week_list=[1], session_list=[1],
+                     location="", weeks_text="1", sessions_text="01"),
+        CourseRecord(id=2, member_id=1, course_name="第2周课程", teacher="",
+                     weekday=1, week_list=[2], session_list=[1],
+                     location="", weeks_text="2", sessions_text="01"),
+    ]
+    busy = build_busy_map(members, courses)
+
+    week1 = build_availability(members, courses, 1, [1], [1], assignments=[], busy=busy)
+    week2 = build_availability(members, courses, 2, [1], [1], assignments=[], busy=busy)
+
+    assert week1.busy_courses[(0, 1, 1)] == ["第1周课程"]
+    assert week2.busy_courses[(0, 1, 1)] == ["第2周课程"]

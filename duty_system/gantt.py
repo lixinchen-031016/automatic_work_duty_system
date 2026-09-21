@@ -81,9 +81,9 @@ def build_availability(
                  for l in (leaves or []) if l.week == week}
     duty_set = {(a.member_id, a.weekday, a.block)
                 for a in (assignments or []) if a.week == week}
-    # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）
-    # 用忙时表判断「这门课本周是否上课」：忙时表里存在 (周, 星期, 节次) 就等价于
-    # 本周有这门课，比在 week_list 里做线性查找快得多（课程多时差异明显）
+    # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）。
+    # 先按 week_list 过滤课程，再用忙时表定位本门课的具体节次；不能只看忙时表，
+    # 因为不同课程可能占用同一星期节次，但只在其他周上课。
     course_index: dict[tuple[int, int, int], set[str]] = {}
     special_index: dict[tuple[int, int, int], set[str]] = {}
     for a in special_arrangements or []:
@@ -97,6 +97,8 @@ def build_availability(
     for c in courses:
         if c.member_id not in member_ids:
             continue
+        if week not in c.week_list:
+            continue
         member_busy = busy.get(c.member_id)
         if not member_busy:
             continue
@@ -104,10 +106,9 @@ def build_availability(
             # 整周集中安排（军训/思政实践）没有星期与节次：该周每一天每一节都算被
             # 占用，课程名也要挂上去——否则甘特图上是一整片「忙但没有原因」的格子，
             # 用户看不出为什么这个人整周都排不了班。
-            if week in c.week_list:
-                for day in range(1, 8):
-                    for sec in WHOLE_WEEK_SESSIONS:
-                        course_index.setdefault((c.member_id, day, sec), set()).add(c.course_name)
+            for day in range(1, 8):
+                for sec in WHOLE_WEEK_SESSIONS:
+                    course_index.setdefault((c.member_id, day, sec), set()).add(c.course_name)
             continue
         weekday = c.weekday
         active = [sec for sec in c.session_list if (week, weekday, sec) in member_busy]
