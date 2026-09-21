@@ -418,8 +418,9 @@ automatic_work_duty_system/
 每份课表末尾还有一行教务系统自带的备注（`课程名 教师 周次周;` 清单；集中实践也可能是
 `课程名 周次周;`），
 `test_real_samples_note_row_agrees_with_parsed_courses` 会用它反查解析结果，
-所以「少读一门课」「教师读错」这类问题会自动被测试抓住。备注行中网格未覆盖的周次
-会进入 `whole_week_courses`，排班按整周避让并在 `warnings` 中说明具体时间未知。
+所以「少读一门课」「教师读错」这类问题会自动被测试抓住。备注行中网格未覆盖的周次，
+若同一门课在网格中有唯一的星期/节次，会自动继承该时间并补全周次；只有完全无法定位、
+或同名课程存在多套时间时，才进入 `whole_week_courses` 并按整周避让。
 
 **关于样例的隐私处理**：原始课表含姓名与学号，只留在本地
 （`.gitignore` 忽略 `samples/*.xls`）。提交进仓库的是 `samples/desensitized/`

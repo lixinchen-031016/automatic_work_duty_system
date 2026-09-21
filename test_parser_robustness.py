@@ -924,18 +924,17 @@ def test_note_row_whole_week_courses_are_extracted() -> None:
         assert c.location == ""
 
 
-def test_note_row_partial_weeks_are_flagged() -> None:
-    """备注行里比网格多出来的周（体育Ⅰ 2,4,6,8）要按整周避让并给出警告"""
+def test_note_row_partial_weeks_inherit_grid_schedule() -> None:
+    """同一门课只缺周次时，应继承网格星期/节次而不是整周避让。"""
     s = parse_schedule_path(_require(SAMPLE_2601))
-    pe = [c for c in s.whole_week_courses if c.course_name.startswith("体育Ⅰ")]
-    assert pe, "备注行的体育Ⅰ 2,4,6,8 周未被解析出来"
-    assert pe[0].week_list == [2, 4, 6, 8]
-    assert pe[0].teacher == "赵明"
-    # 网格里的体育Ⅰ 仍然是它自己的星期与节次，没有被改写
+    assert not any(c.course_name.startswith("体育Ⅰ") for c in s.whole_week_courses), \
+        "体育Ⅰ 已有网格星期/节次，不应按整周避让"
     grid_pe = [c for c in s.courses if c.course_name.startswith("体育Ⅰ")]
-    assert len(grid_pe) == 1 and grid_pe[0].week_list == [3, 5, 7, 9, 11, 15, 17, 19]
+    assert len(grid_pe) == 1
+    assert grid_pe[0].week_list == [2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 17, 19]
+    assert grid_pe[0].weekday == 3 and grid_pe[0].session_list == [3, 4]
     warn = " ".join(s.warnings)
-    assert "体育Ⅰ" in warn and "2,4,6,8" in warn, f"缺少体育Ⅰ 的整周避让提示：{s.warnings}"
+    assert "体育Ⅰ" not in warn, f"体育Ⅰ 已定位时间，不应再警告整周避让：{s.warnings}"
 
 
 def test_samples_without_note_only_courses_are_unaffected() -> None:

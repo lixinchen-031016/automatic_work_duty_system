@@ -526,6 +526,31 @@ def _grid_course_matching(key: str, grid_names) -> str | None:
     return None
 
 
+def _unique_grid_schedule(
+    matched_name: str,
+    teacher: str,
+    grid_courses: list[Course],
+) -> Course | None:
+    """找备注课程唯一可继承的网格星期/节次；多套安排时返回 None。"""
+    candidates = [c for c in grid_courses if c.course_name == matched_name]
+    if teacher:
+        teacher_matches = [
+            c for c in candidates
+            if c.teacher and teacher == c.teacher.strip()
+        ]
+        if teacher_matches:
+            candidates = teacher_matches
+    schedules: dict[tuple[int, tuple[int, ...]], Course] = {}
+    for course in candidates:
+        if course.weekday == WHOLE_WEEK_WEEKDAY or not course.session_list:
+            continue
+        schedules.setdefault(
+            (course.weekday, tuple(course.session_list)), course)
+    if len(schedules) != 1:
+        return None
+    return next(iter(schedules.values()))
+
+
 def find_note_text(grid: list[list[str]]) -> str:
     """找出教务系统写在末尾的「备注」单元格文本
 
@@ -574,9 +599,13 @@ def parse_note_courses(note_text: str, grid_courses) -> tuple[list[Course], list
     有节次」的课，军训、思政实践这类集中实践没有具体节次，只会出现在备注里；
     也有课程的某几周只在备注里出现（网格漏画）。
 
-    因此规则统一成一条：**备注行提到、而课表网格没有覆盖的周，按「整周避让」
-    处理**，并给出警告说明具体星期未知。这些记录单独放进
-    `ParsedSchedule.whole_week_courses`，weekday 记为 WHOLE_WEEK_WEEKDAY。
+    处理规则：
+    * 若课程名能在网格中匹配到唯一的星期/节次，则用网格时间补全备注缺失周次；
+    * 若网格里完全没有该课程，或同名课程存在多套时间而无法判断，才按
+      「整周避让」处理，并给出警告说明具体星期未知。
+
+    无法定位的整周记录单独放进 `ParsedSchedule.whole_week_courses`，
+    weekday 记为 WHOLE_WEEK_WEEKDAY。
 
     备注行里大部分条目其实是网格已有课程的变更记录（教师换人、周次调整），
     这类直接跳过——网格更权威，它带星期/节次/地点。
@@ -590,7 +619,10 @@ def parse_note_courses(note_text: str, grid_courses) -> tuple[list[Course], list
         coverage.setdefault(c.course_name, set()).update(c.week_list)
 
     # key -> (未覆盖周次, 依据说明)；同一门课会分多条写在备注里，合并后再提示一次
-    merged: dict[tuple[str, str], tuple[set[int], str]] = {}
+    whole_merged: dict[tuple[str, str], tuple[set[int], str]] = {}
+    supplemental: dict[
+        tuple[str, str, int, str, tuple[int, ...], str], set[int]
+    ] = {}
     for item in (x.strip() for x in note_text.split(";")):
         if not item:
             continue
@@ -620,15 +652,36 @@ def parse_note_courses(note_text: str, grid_courses) -> tuple[list[Course], list
         if not uncovered:
             continue
 
-        prev = merged.get((name, teacher))
-        merged[(name, teacher)] = (
+        # 同课程且网格时间唯一时，直接继承星期/节次并补全周次；只有确实
+        # 无法定位时间的条目才降级为整周避让。
+        if matched is not None:
+            schedule = _unique_grid_schedule(matched, teacher, grid_courses)
+            if schedule is not None:
+                if not teacher or teacher == schedule.teacher.strip():
+                    merged_weeks = sorted(set(schedule.week_list) | uncovered)
+                    schedule.week_list = merged_weeks
+                    schedule.weeks_text = _weeks_label(
+                        _compress_weeks(merged_weeks), "normal")
+                    schedule.week_mode = "normal"
+                    coverage[matched].update(uncovered)
+                else:
+                    key = (
+                        matched, teacher, schedule.weekday,
+                        schedule.sessions_text, tuple(schedule.session_list),
+                        schedule.location,
+                    )
+                    supplemental.setdefault(key, set()).update(uncovered)
+                continue
+
+        prev = whole_merged.get((name, teacher))
+        whole_merged[(name, teacher)] = (
             (prev[0] | uncovered) if prev else set(uncovered), reason)
 
     warnings = [
         f"{name} 第 {_compress_weeks(sorted(weeks))} 周"
         + (f"（{teacher}）" if teacher else "")
         + f"来自备注行，{reason}，具体上课时间未知；排班时按整周避让。"
-        for (name, teacher), (weeks, reason) in merged.items()
+        for (name, teacher), (weeks, reason) in whole_merged.items()
     ]
     courses = [
         Course(
@@ -637,8 +690,15 @@ def parse_note_courses(note_text: str, grid_courses) -> tuple[list[Course], list
             week_list=sorted(weeks), sessions_text="", session_list=[],
             location="", whole_week=True,
         )
-        for (name, teacher), (weeks, _) in merged.items()
+        for (name, teacher), (weeks, _) in whole_merged.items()
     ]
+    for (name, teacher, weekday, sessions_text, sessions, location), weeks in supplemental.items():
+        grid_courses.append(Course(
+            course_name=name, teacher=teacher, weekday=weekday,
+            weeks_text=_weeks_label(_compress_weeks(sorted(weeks)), "normal"),
+            week_list=sorted(weeks), sessions_text=sessions_text,
+            session_list=list(sessions), location=location,
+        ))
     return courses, warnings
 
 
