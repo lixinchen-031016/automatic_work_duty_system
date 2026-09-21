@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 
-from duty_system.database import CourseRecord, Member, SpecialArrangement
+from duty_system.database import Assignment, CourseRecord, Member, SpecialArrangement
 from duty_system.gantt import build_availability
 from duty_system.parser import BLOCK_SESSIONS, WHOLE_WEEK_WEEKDAY
 from duty_system.scheduler import (
@@ -154,7 +154,7 @@ def test_gaps_are_consistent_with_assignments() -> None:
 
     # 成员/课程/参数完全相同的两次生成结果一致（同种子可复现）
     again = generate_schedule(members, courses, config)
-    key = lambda a: (a.week, a.weekday, a.block, a.member_id)  # noqa: E731
+    key = lambda a: (a.week, a.weekday, a.block, a.member_id)
     assert sorted(key(a) for a in again.assignments) == sorted(key(a) for a in result.assignments), \
         "固定种子应可复现同一份排班"
 
@@ -321,3 +321,47 @@ def test_gantt_only_shows_courses_for_selected_week() -> None:
 
     assert week1.busy_courses[(0, 1, 1)] == ["第1周课程"]
     assert week2.busy_courses[(0, 1, 1)] == ["第2周课程"]
+
+
+def test_off_days_leave_grid_and_base_balancing() -> None:
+    """纯假日应提前退出任务网格与 base 均衡，而不是排完后被动删除。"""
+    members = make_members(12)
+    courses = make_courses(members, per_member=30, weeks=6, seed=11)
+    config = ScheduleConfig(
+        weeks=range(1, 5), weekdays=[1, 2, 3, 4, 5], blocks=[1, 2],
+        per_slot=1, max_per_week=3, max_per_day=1, seed=19)
+    off_days = {(2, 1), (3, 3), (4, 5)}
+    is_off = lambda week, weekday: (week, weekday) in off_days
+
+    baseline = generate_schedule(members, courses, config)
+    covered = generate_schedule(members, courses, config, is_off=is_off)
+    available_slots = (
+        len(config.weeks) * len(config.weekdays) * len(config.blocks)
+        - len(off_days) * len(config.blocks)
+    )
+    assert len(covered.assignments) + len(covered.gaps) == available_slots
+    assert not any(is_off(a.week, a.weekday) for a in covered.assignments)
+    assert not any(is_off(w, d) for w, d, _ in covered.gaps)
+    assert covered.gaps == compute_gaps(
+        covered.assignments, config, is_off=is_off)
+
+    base_counts = [s["total"] for s in baseline.member_stats.values()]
+    off_counts = [s["total"] for s in covered.member_stats.values()]
+    assert max(off_counts) - min(off_counts) <= (
+        max(base_counts) - min(base_counts) + 1), "放假后公平性不应明显恶化"
+
+    off_base = [
+        Assignment(1, 1, 1, members[0].id, members[0].name),
+        Assignment(1, 2, 1, members[0].id, members[0].name),
+    ]
+    ranged = ScheduleConfig(
+        weeks=range(2, 3), weekdays=[1, 2], blocks=[1],
+        per_slot=1, max_per_week=2, max_per_day=1, seed=3)
+    merged = generate_schedule(
+        members, [], ranged, base_assignments=off_base,
+        is_off=lambda week, weekday: (week, weekday) == (1, 1))
+    assert (1, 1, 1, members[0].id) not in {
+        (a.week, a.weekday, a.block, a.member_id) for a in merged.assignments
+    }
+    assert merged.member_stats[members[0].id]["total"] == sum(
+        a.member_id == members[0].id for a in merged.assignments)

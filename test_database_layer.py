@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
+from duty_system.calendar import CalendarEntry
 from duty_system.database import MIGRATIONS, SCHEMA, Assignment, Database
 from duty_system.parser import ParsedSchedule
 
@@ -109,6 +111,7 @@ def test_indexes_wal_and_migration(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy.db"
     conn = sqlite3.connect(legacy)
     conn.executescript(SCHEMA.replace("CREATE INDEX IF NOT EXISTS", "-- CREATE INDEX IF NOT EXISTS"))
+    conn.execute("DROP TABLE IF EXISTS term_calendar")
     conn.execute("PRAGMA user_version = 0")
     conn.commit()
     conn.close()
@@ -118,9 +121,50 @@ def test_indexes_wal_and_migration(tmp_path: Path) -> None:
     migrated = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")}
     version = conn.execute("PRAGMA user_version").fetchone()[0]
+    calendar_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='term_calendar'"
+    ).fetchone()
     conn.close()
     assert expected <= migrated, "老库迁移后应补齐索引"
     assert version == MIGRATIONS[-1][0], "老库迁移后应记录版本号"
+    assert calendar_table is not None, "老库迁移后应创建学期日历表"
+
+
+def test_term_calendar_crud_and_validation(tmp_path: Path) -> None:
+    """日历覆盖可增改查删，严格校验缺对/错对，纯假日可显式放行。"""
+    db = new_db(tmp_path)
+    term_start = date(2026, 9, 14)
+    off = CalendarEntry(date(2026, 10, 15), "off", note="调休")
+    makeup = CalendarEntry(date(2026, 10, 17), "class", 5, 4, "补第5周周四")
+
+    db.upsert_calendar([off, makeup])
+    assert db.list_calendar() == [off, makeup]
+    db.upsert_calendar([CalendarEntry(date(2026, 10, 15), "off", note="更新")])
+    assert db.list_calendar()[0].note == "更新"
+    db.validate_calendar()
+    db.validate_calendar(term_start)
+
+    db.clear_calendar()
+    db.upsert_calendar([off])
+    try:
+        db.validate_calendar(term_start)
+    except ValueError as exc:
+        assert "缺少对应的 class" in str(exc)
+    else:
+        raise AssertionError("严格模式应拦截缺失补课对的 off 项")
+    db.validate_calendar(term_start, allow_unpaired_off=True)
+
+    db.clear_calendar()
+    db.upsert_calendar([
+        CalendarEntry(date(2026, 10, 16), "off"),
+        CalendarEntry(date(2026, 10, 17), "class", 5, 4),
+    ])
+    try:
+        db.validate_calendar(term_start)
+    except ValueError as exc:
+        assert "未设为 off" in str(exc)
+    else:
+        raise AssertionError("补课项指向的自然工作日不是 off 时应报错")
 
 
 def test_upsert_replaces_courses_and_cascades(tmp_path: Path) -> None:

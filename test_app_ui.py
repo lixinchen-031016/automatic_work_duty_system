@@ -9,19 +9,32 @@ from __future__ import annotations
 import random
 import sqlite3
 import time
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QMessageBox  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QInputDialog,
+    QLineEdit,
+    QMessageBox,
+    QSpinBox,
+    QTableWidget,
+)
 
 import app as appmod  # noqa: E402
+from duty_system.calendar import CalendarEntry  # noqa: E402
 from duty_system.database import Member  # noqa: E402
 from duty_system.parser import BLOCK_SESSIONS, Course, ParsedSchedule  # noqa: E402
 from duty_system.scheduler import (  # noqa: E402
-    compute_gaps, replacement_candidates, build_busy_map,
+    build_busy_map,
+    compute_gaps,
+    replacement_candidates,
 )
 
 
@@ -124,6 +137,131 @@ def test_settings_roundtrip(window, settings) -> None:
     # 新增参数只需在 _param_specs 登记，键名自动生成
     keys = {key for _kind, _w, key, _d in window._param_specs()}
     assert {"week_from", "term_start", "weekday_6", "block_5"} <= keys
+
+
+def test_calendar_editor_uses_widgets_and_roundtrips(window, qt_app) -> None:
+    """学期日历必须通过日期/类型控件编辑，不再依赖文本解析。"""
+    table = QTableWidget(0, 6)
+    off = CalendarEntry(date(2026, 10, 15), "off", note="调休")
+    makeup = CalendarEntry(date(2026, 10, 17), "class", 5, 4, "补第5周周四")
+    window._add_calendar_row(table, off)
+    window._add_calendar_row(table, makeup)
+
+    assert isinstance(table.cellWidget(0, 0), QDateEdit)
+    assert isinstance(table.cellWidget(0, 1), QComboBox)
+    assert isinstance(table.cellWidget(0, 2), QSpinBox)
+    assert isinstance(table.cellWidget(0, 4), QLineEdit)
+    assert not table.cellWidget(0, 2).isEnabled(), "off 行不应编辑代表周"
+    assert table.cellWidget(1, 2).isEnabled(), "class 行应允许编辑代表周"
+    assert window._calendar_entries_from_table(table) == [off, makeup]
+
+    first_calendar = window.term_calendar()
+    assert window.term_calendar() is first_calendar, "TermCalendar 应随缓存复用"
+    window.invalidate_cache()
+    assert window.term_calendar() is not first_calendar, "缓存失效后应重建 TermCalendar"
+
+    generated = window._makeup_entries(
+        date(2026, 9, 14), 5, 4, date(2026, 10, 17))
+    window.db.validate_calendar(
+        date(2026, 9, 14), entries=generated)
+    assert [(e.override_type, e.maps_to_week, e.maps_to_weekday) for e in generated] == [
+        ("off", None, None), ("class", 5, 4)]
+
+    table.cellWidget(1, 5).click()
+    qt_app.processEvents()
+    assert table.rowCount() == 1
+
+
+def test_member_search_filters_view_without_changing_data(window, qt_app) -> None:
+    """成员搜索仅控制列表可见性，清空后恢复全部并保持双击跳转。"""
+    people = [
+        ("张三", "1001", "一班"),
+        ("张小明", "1002", "二班"),
+        ("李四", "1003", "一班"),
+    ]
+    for name, student_id, class_name in people:
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, class_name=class_name, courses=[]))
+    window.invalidate_cache()
+    window.refresh_members()
+
+    window.member_search.setText("张")
+    qt_app.processEvents()
+    visible = [
+        window.member_list.item(i)
+        for i in range(window.member_list.count())
+        if not window.member_list.item(i).isHidden()
+    ]
+    assert [item.text().split("（", 1)[0] for item in visible] == ["张三", "张小明"]
+    assert len(window.members()) == 3, "搜索不应修改底层成员数据"
+
+    first_visible = visible[0]
+    window.open_member_courses(first_visible)
+    assert window.member_combo.currentData() == first_visible.data(Qt.UserRole)
+
+    window.member_search.clear()
+    qt_app.processEvents()
+    assert all(
+        not window.member_list.item(i).isHidden()
+        for i in range(window.member_list.count())
+    )
+
+
+def test_national_holiday_import_dialog_previews_builtin_data(
+    window, qt_app, monkeypatch,
+) -> None:
+    """国家调休入口应加载内置数据并生成可编辑预览行。"""
+    window.term_start.setDate(
+        window.term_start.date().fromString("2026-09-14", "yyyy-MM-dd"))
+    seen: dict[str, int] = {}
+
+    def fake_exec(dialog) -> int:
+        tables = dialog.findChildren(QTableWidget)
+        assert tables
+        seen["rows"] = tables[0].rowCount()
+        return QDialog.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    window._open_national_holiday_import_dialog(QTableWidget(0, 6))
+    assert seen["rows"] == 12
+
+
+def test_stale_out_of_range_calendar_is_disabled_without_crash(window) -> None:
+    """学期起始日变化导致历史日历越界时，运行态应降级而非崩溃。"""
+    window.term_start.setDate(
+        window.term_start.date().fromString("2026-09-21", "yyyy-MM-dd"))
+    window.db.upsert_calendar([
+        CalendarEntry(date(2026, 10, 6), "off"),
+        CalendarEntry(date(2026, 9, 20), "class", 3, 2),
+    ])
+    window.invalidate_cache()
+
+    calendar = window.term_calendar()
+    assert calendar.entries == (), "越界的历史日历覆盖应暂停应用"
+    assert window._calendar_error is not None
+    assert "超出学期" in window._calendar_error
+
+
+def test_startup_after_loading_term_start_refreshes_calendar_status(
+    qt_app, settings, tmp_path,
+) -> None:
+    """启动时真实学期起始日晚于默认值，也不能残留“配置异常”提示。"""
+    db_path = tmp_path / "startup-calendar.db"
+    db = appmod.Database(db_path)
+    db.upsert_calendar([
+        CalendarEntry(date(2026, 10, 6), "off"),
+        CalendarEntry(date(2026, 9, 20), "class", 4, 2),
+    ])
+    settings.setValue("term_start", "2026-09-14")
+
+    win = appmod.MainWindow(db_path=db_path)
+    try:
+        assert win.calendar_label.text() != "配置异常，已暂停应用"
+        assert win.term_calendar().entries
+    finally:
+        win.close()
+        win.deleteLater()
+        qt_app.processEvents()
 
 
 def test_last_config_persisted_and_reused_on_restart(qt_app, settings, tmp_path, monkeypatch) -> None:
@@ -314,6 +452,83 @@ def test_manual_tweak_writes_only_target_slot(window, qt_app) -> None:
     assert all(a.member_id != target.member_id for a in window.db.load_assignments()
                if (a.week, a.weekday, a.block) == (target.week, target.weekday, target.block))
     assert window.result.gaps == compute_gaps(window.result.assignments, window._last_config)
+
+
+def test_manual_tweak_undo_redo_and_generate_clears_history(window, qt_app) -> None:
+    """微调可撤销/重做，重新生成后清空历史并禁用菜单操作。"""
+    seed_members(window, 10)
+    run_generate(window, qt_app, week_from=1, week_to=3, per_slot=1)
+
+    members = window.members()
+    busy = build_busy_map(members, window.courses())
+    target = None
+    for assignment in sorted(
+            window.result.assignments, key=lambda x: (x.week, x.weekday, x.block)):
+        candidates = replacement_candidates(
+            members, busy, set(), window.result.assignments,
+            assignment.week, assignment.weekday, assignment.block, 3, 1)
+        if any(not reason for _member, reason in candidates):
+            target = assignment
+            break
+    assert target is not None
+    new_member = next(m for m, reason in replacement_candidates(
+        members, busy, set(), window.result.assignments,
+        target.week, target.weekday, target.block, 3, 1) if not reason)
+    old_ids = window._slot_member_ids(
+        target.week, target.weekday, target.block)
+    new_ids = (new_member.id,)
+
+    window._apply_tweak(
+        target.week, target.weekday, target.block, target.member_id, new_member.id)
+    assert window._slot_member_ids(
+        target.week, target.weekday, target.block) == new_ids
+    assert window.undo_action.isEnabled() and not window.redo_action.isEnabled()
+
+    window.undo_tweak()
+    assert window._slot_member_ids(
+        target.week, target.weekday, target.block) == old_ids
+    assert window._slot_member_ids(
+        target.week, target.weekday, target.block) == tuple(sorted(
+            a.member_id for a in window.db.load_assignments()
+            if (a.week, a.weekday, a.block) ==
+            (target.week, target.weekday, target.block)))
+    assert window.redo_action.isEnabled()
+
+    window.redo_tweak()
+    assert window._slot_member_ids(
+        target.week, target.weekday, target.block) == new_ids
+    assert window._slot_member_ids(
+        target.week, target.weekday, target.block) == tuple(sorted(
+            a.member_id for a in window.db.load_assignments()
+            if (a.week, a.weekday, a.block) ==
+            (target.week, target.weekday, target.block)))
+
+    run_generate(window, qt_app, week_from=1, week_to=3, per_slot=1)
+    assert not window._undo_stack and not window._redo_stack
+    assert not window.undo_action.isEnabled() and not window.redo_action.isEnabled()
+
+
+def test_clear_schedule_button_removes_duties(
+    window, qt_app, monkeypatch,
+) -> None:
+    """界面清空排班后，数据库、结果表和甘特图都不应保留值班标记。"""
+    seed_members(window, 8)
+    run_generate(window, qt_app, week_from=1, week_to=3, per_slot=1)
+    assert window.db.load_assignments()
+    monkeypatch.setattr(
+        QInputDialog, "getItem",
+        staticmethod(lambda *_a, **_k: ("清空全部排班", True)))
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *_a, **_k: QMessageBox.Yes))
+
+    window.clear_schedule()
+    qt_app.processEvents()
+    assert window.db.load_assignments() == []
+    assert window.result is None
+    assert window.gantt_matrix is not None
+    assert not window.gantt_matrix.duty_cells
+    assert not window.btn_clear_schedule.isEnabled()
 
 
 def test_stale_marking_and_empty_state(window) -> None:

@@ -14,7 +14,7 @@ import copy
 import random
 import tempfile
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 STATE: dict = {}
@@ -33,15 +33,24 @@ def reset_env() -> None:
     """清空测试状态（供需要干净环境的用例调用）"""
     STATE.clear()
 
-from duty_system.database import Assignment, Database
+from duty_system.calendar import CalendarEntry, TermCalendar
+from duty_system.database import Assignment, CourseRecord, Database, Member
 from duty_system.exporter import (
-    build_detail_df, build_leaves_df, build_pivot_df, export_csv, export_excel,
-    export_leaves_excel, week_date,
+    build_detail_df,
+    build_leaves_df,
+    build_pivot_df,
+    export_csv,
+    export_excel,
+    export_leaves_excel,
+    week_date,
 )
-from duty_system.gantt import build_availability, export_gantt_excel
+from duty_system.gantt import build_availability, display_columns, export_gantt_excel
 from duty_system.parser import BLOCK_SESSIONS, WEEKDAY_LABELS, parse_schedule_path
 from duty_system.scheduler import (
-    ScheduleConfig, build_busy_map, generate_schedule, rebuild_member_stats,
+    ScheduleConfig,
+    build_busy_map,
+    generate_schedule,
+    rebuild_member_stats,
     replacement_candidates,
 )
 
@@ -467,6 +476,126 @@ def test_gantt_duty() -> None:
     print(f"[13] 甘特图值班标记: 通过（{len(assignments)} 个值班格标蓝且不占空闲统计，Excel 同步）")
 
 
+def test_calendar_makeup_mapping() -> None:
+    """调休映射：逻辑周四移到周六，排班避开周四课程并按周六展示日期。"""
+    start = date(2026, 9, 14)
+    members = [
+        Member(1, "甲", "1", "", "", "", "", ""),
+        Member(2, "乙", "2", "", "", "", "", ""),
+    ]
+    courses = [CourseRecord(
+        id=1, member_id=1, course_name="周四课程", teacher="", weekday=4,
+        week_list=[5], session_list=[1, 2], location="",
+        weeks_text="5", sessions_text="01-02")]
+    calendar = TermCalendar(start, [
+        CalendarEntry(date(2026, 10, 15), "off", note="第5周周四放假"),
+        CalendarEntry(date(2026, 10, 17), "class", 5, 4, "补第5周周四"),
+    ])
+    result = generate_schedule(
+        members, courses,
+        ScheduleConfig(weeks=range(5, 6), weekdays=[4], blocks=[1],
+                       per_slot=1, max_per_week=1, max_per_day=1, seed=1))
+
+    assert [(a.member_id, a.week, a.weekday) for a in result.assignments] == [(2, 5, 4)], \
+        "应避开甲第5周周四的课程，由乙补到对应的周六"
+    detail = build_detail_df(result.assignments, start_date=start, calendar=calendar)
+    assert detail.iloc[0]["星期"] == "周六" and detail.iloc[0]["日期"] == "10月17日"
+    assert "10月15日" not in set(detail["日期"]), "被放假的周四自然日不应出现在排班表"
+    pivot = build_pivot_df(result.assignments, start_date=start, calendar=calendar)
+    assert ("第5周", "周六") in pivot.index
+    assert pivot.loc[("第5周", "周六"), "日期"] == "10月17日"
+
+    matrix = build_availability(
+        members, courses, 5, [4], [1], assignments=result.assignments,
+        calendar=calendar)
+    assert matrix.calendar_dates[4] == date(2026, 10, 17)
+    assert matrix.busy_courses[(0, 4, 1)] == ["周四课程"], \
+        "补课周六应按所代表的第5周周四判定课程忙闲"
+    assert any(c.is_off and c.date == date(2026, 10, 15)
+               for c in display_columns(matrix)), \
+        "原始放假周四应作为红色放假日列保留在甘特图"
+
+
+def test_pure_holiday_is_skipped_and_marked_off() -> None:
+    """纯法定假日无补课：排班日期跳过，甘特图对应逻辑日整列标为放假。"""
+    start = date(2026, 9, 14)
+    member = Member(1, "甲", "1", "", "", "", "", "")
+    calendar = TermCalendar(start, [
+        CalendarEntry(date(2026, 10, 15), "off", note="国庆法定假日"),
+    ])
+    assignments = [Assignment(5, 4, 1, 1, "甲")]
+
+    detail = build_detail_df(assignments, start_date=start, calendar=calendar)
+    assert detail.empty, "纯法定假日没有真实排班日期，应从明细中跳过"
+
+    matrix = build_availability(
+        [member], [], 5, [4], [1], assignments=assignments, calendar=calendar)
+    assert matrix.off_weekdays == {4}
+    assert matrix.free == [[False]] and matrix.busy_courses == {}
+
+
+def test_calendar_logical_date_roundtrip() -> None:
+    """逻辑日与真实日期双向映射往返一致，off 日期不参与排班。"""
+    start = date(2026, 9, 14)
+    calendar = TermCalendar(start, [
+        CalendarEntry(date(2026, 10, 15), "off"),
+        CalendarEntry(date(2026, 10, 17), "class", 5, 4),
+    ])
+    assert calendar.logical_to_date(5, 4) == date(2026, 10, 17)
+    assert calendar.date_to_logical(date(2026, 10, 17)) == (5, 4)
+    assert calendar.date_to_logical(date(2026, 10, 15)) is None
+
+    for week in range(1, 7):
+        for weekday in range(1, 6):
+            if (week, weekday) == (5, 4):
+                continue
+            actual = calendar.logical_to_date(week, weekday)
+            assert actual is not None
+            assert calendar.date_to_logical(actual) == (week, weekday)
+
+    for invalid in (
+            start - timedelta(days=1),
+            start + timedelta(days=25 * 7)):
+        try:
+            calendar.date_to_logical(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"越界日期 {invalid} 应被拒绝")
+
+
+def test_clear_assignments_all_and_selected_weeks() -> None:
+    """清空排班支持按周与全量模式，对应甘特图不再出现值班标记。"""
+    db, members = get_env()
+    assignments = db.load_assignments()
+    if not assignments:
+        generated = generate_schedule(
+            members, db.get_courses(),
+            ScheduleConfig(weeks=range(1, 4), per_slot=1,
+                           max_per_week=3, max_per_day=1))
+        db.save_assignments(generated.assignments)
+        assignments = db.load_assignments()
+    assert assignments
+    weeks = sorted({a.week for a in assignments})
+    target_week = weeks[0]
+
+    db.delete_assignments_for_weeks([target_week])
+    remaining = db.load_assignments()
+    assert all(a.week != target_week for a in remaining)
+    assert {a.week for a in remaining} == set(weeks[1:]), "按周清空不应影响其他周"
+    matrix = build_availability(
+        members, db.get_courses(), target_week, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5],
+        assignments=remaining)
+    assert not matrix.duty_cells, "被清空的周不应残留蓝色值班标记"
+
+    db.clear_assignments()
+    assert db.load_assignments() == []
+    all_empty = build_availability(
+        members, db.get_courses(), weeks[-1], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5],
+        assignments=[])
+    assert not all_empty.duty_cells, "全部清空后甘特图不应残留值班标记"
+
+
 def main() -> None:
     """直接执行（不依赖 pytest）时按真实使用顺序跑完整链路"""
     test_parser()
@@ -481,6 +610,10 @@ def main() -> None:
     test_persistence()
     test_week_export()
     test_gantt_duty()
+    test_calendar_makeup_mapping()
+    test_pure_holiday_is_skipped_and_marked_off()
+    test_calendar_logical_date_roundtrip()
+    test_clear_assignments_all_and_selected_weeks()
     print()
     print("全部测试通过 ✓")
 

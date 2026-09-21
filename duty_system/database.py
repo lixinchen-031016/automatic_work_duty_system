@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
+from .calendar import CalendarEntry, validate_calendar_entries
 from .parser import ParsedSchedule
 
 SCHEMA = """
@@ -70,6 +73,19 @@ CREATE TABLE IF NOT EXISTS special_arrangements (
     UNIQUE(member_id, week_start, week_end, weekday, session_list)
 );
 
+CREATE TABLE IF NOT EXISTS term_calendar (
+    date TEXT PRIMARY KEY,
+    override_type TEXT NOT NULL CHECK(override_type IN ('off', 'class')),
+    maps_to_week INTEGER,
+    maps_to_weekday INTEGER,
+    note TEXT NOT NULL DEFAULT '',
+    CHECK(
+        (override_type = 'off' AND maps_to_week IS NULL AND maps_to_weekday IS NULL)
+        OR
+        (override_type = 'class' AND maps_to_week IS NOT NULL AND maps_to_weekday IS NOT NULL)
+    )
+);
+
 CREATE INDEX IF NOT EXISTS idx_courses_member ON courses(member_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week);
 CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id);
@@ -105,6 +121,20 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             ON special_arrangements(member_id)""",
         """CREATE INDEX IF NOT EXISTS idx_special_arrangements_weeks
             ON special_arrangements(week_start, week_end)""",
+    ]),
+    (3, [
+        """CREATE TABLE IF NOT EXISTS term_calendar (
+            date TEXT PRIMARY KEY,
+            override_type TEXT NOT NULL CHECK(override_type IN ('off', 'class')),
+            maps_to_week INTEGER,
+            maps_to_weekday INTEGER,
+            note TEXT NOT NULL DEFAULT '',
+            CHECK(
+                (override_type = 'off' AND maps_to_week IS NULL AND maps_to_weekday IS NULL)
+                OR
+                (override_type = 'class' AND maps_to_week IS NOT NULL AND maps_to_weekday IS NOT NULL)
+            )
+        )""",
     ]),
 ]
 
@@ -311,6 +341,83 @@ class Database:
                 location=r["location"], weeks_text=r["weeks_text"],
                 sessions_text=r["sessions_text"],
             ) for r in rows]
+
+    # ---------- 学期日历覆盖（调休 / 法定假日） ----------
+
+    @staticmethod
+    def _coerce_calendar_entry(entry: CalendarEntry | dict | tuple | list) -> CalendarEntry:
+        if isinstance(entry, CalendarEntry):
+            return entry
+        if isinstance(entry, dict):
+            return CalendarEntry(
+                date=entry["date"],
+                override_type=entry["override_type"],
+                maps_to_week=entry.get("maps_to_week"),
+                maps_to_weekday=entry.get("maps_to_weekday"),
+                note=entry.get("note", ""),
+            )
+        if isinstance(entry, (tuple, list)):
+            if len(entry) < 2:
+                raise ValueError("日历条目至少需要日期和类型")
+            values = list(entry) + [None, None, ""]
+            return CalendarEntry(
+                date=values[0], override_type=values[1],
+                maps_to_week=values[2], maps_to_weekday=values[3],
+                note=values[4] or "",
+            )
+        raise TypeError("日历条目必须是 CalendarEntry、dict 或 tuple/list")
+
+    def upsert_calendar(
+        self,
+        entries: Iterable[CalendarEntry | dict | tuple | list],
+    ) -> None:
+        """按日期新增或覆盖学期日历项。"""
+        rows = [self._coerce_calendar_entry(entry) for entry in entries]
+        with self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO term_calendar
+                       (date, override_type, maps_to_week, maps_to_weekday, note)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(date) DO UPDATE SET
+                       override_type = excluded.override_type,
+                       maps_to_week = excluded.maps_to_week,
+                       maps_to_weekday = excluded.maps_to_weekday,
+                       note = excluded.note""",
+                [(e.date.isoformat(), e.override_type, e.maps_to_week,
+                  e.maps_to_weekday, e.note) for e in rows],
+            )
+
+    def list_calendar(self) -> list[CalendarEntry]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM term_calendar ORDER BY date, override_type"
+            ).fetchall()
+            return [CalendarEntry(
+                date=date.fromisoformat(r["date"]),
+                override_type=r["override_type"],
+                maps_to_week=r["maps_to_week"],
+                maps_to_weekday=r["maps_to_weekday"],
+                note=r["note"],
+            ) for r in rows]
+
+    def clear_calendar(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM term_calendar")
+
+    def validate_calendar(
+        self,
+        term_start: date | None = None,
+        *,
+        entries: Iterable[CalendarEntry | dict | tuple | list] | None = None,
+        allow_unpaired_off: bool = False,
+    ) -> None:
+        """校验日历覆盖；非法项抛 ``ValueError``，不会修改数据库。"""
+        rows = (self.list_calendar() if entries is None else
+                [self._coerce_calendar_entry(entry) for entry in entries])
+        validate_calendar_entries(
+            rows, term_start,
+            allow_unpaired_off=allow_unpaired_off,
+        )
 
     # ---------- 值班安排 ----------
 

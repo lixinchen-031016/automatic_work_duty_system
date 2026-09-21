@@ -8,24 +8,46 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+from .calendar import TermCalendar
 from .database import Assignment, Leave, Member
 from .parser import BLOCK_LABELS, WEEKDAY_LABELS
 
 
-def week_date(start_date: date, week: int, weekday: int) -> date:
-    """学期第 week 周 weekday（1=周一..7=周日）对应的日期"""
+def week_date(
+    start_date: date,
+    week: int,
+    weekday: int,
+    calendar: TermCalendar | None = None,
+) -> date | None:
+    """学期第 week 周 weekday（1=周一..7=周日）对应的真实日期。"""
+    if calendar is not None:
+        return calendar.logical_to_date(week, weekday)
     return start_date + timedelta(days=(week - 1) * 7 + (weekday - 1))
 
 
-def _date_label(start_date: date, week: int, weekday: int) -> str:
-    d = week_date(start_date, week, weekday)
+def _date_label(
+    start_date: date,
+    week: int,
+    weekday: int,
+    calendar: TermCalendar | None = None,
+) -> str:
+    d = week_date(start_date, week, weekday, calendar)
+    if d is None:
+        return "—"
     return f"{d.month}月{d.day}日"
+
+
+def _weekday_label(weekday: int, actual_date: date | None) -> str:
+    if actual_date is None:
+        return WEEKDAY_LABELS[weekday]
+    return WEEKDAY_LABELS[actual_date.isoweekday()]
 
 
 def build_detail_df(
     assignments: list[Assignment],
     per_slot: int = 1,
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> pd.DataFrame:
     """明细表：每行一个值班任务（周次 x 星期 x 时段），多人在岗合并显示"""
     grouped: dict[tuple[int, int, int], list[str]] = defaultdict(list)
@@ -34,10 +56,14 @@ def build_detail_df(
 
     rows = []
     for (week, weekday, block), names in sorted(grouped.items()):
+        actual_date = calendar.logical_to_date(week, weekday) if calendar else None
+        if calendar is not None and actual_date is None:
+            continue
         rows.append({
             "周次": f"第{week}周",
-            "星期": WEEKDAY_LABELS[weekday],
-            "日期": _date_label(start_date, week, weekday) if start_date else "",
+            "星期": _weekday_label(weekday, actual_date),
+            "日期": (_date_label(start_date, week, weekday, calendar)
+                     if start_date else ""),
             "值班时段": BLOCK_LABELS[block],
             "值班人": "、".join(sorted(names)),
             "人数": len(names),
@@ -49,6 +75,7 @@ def build_detail_df(
 def build_pivot_df(
     assignments: list[Assignment],
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> pd.DataFrame:
     """透视表：行=周次x星期，列=值班时段（多人用顿号连接），适合界面展示与打印"""
     grouped: dict[tuple[int, int, int], list[str]] = defaultdict(list)
@@ -59,7 +86,16 @@ def build_pivot_df(
     weeks = sorted({w for (w, _, _) in grouped})
     weekdays = sorted({d for (_, d, _) in grouped})
 
-    index = [(w, d) for w in weeks for d in weekdays]
+    index: list[tuple[int, int]] = []
+    actual_dates: dict[tuple[int, int], date] = {}
+    for w in weeks:
+        for d in weekdays:
+            actual = calendar.logical_to_date(w, d) if calendar else None
+            if calendar is not None and actual is None:
+                continue
+            index.append((w, d))
+            if actual is not None:
+                actual_dates[(w, d)] = actual
     data = {}
     for b in blocks:
         col = []
@@ -71,8 +107,9 @@ def build_pivot_df(
     df = pd.DataFrame(data, index=pd.MultiIndex.from_tuples(
         index, names=["周次", "星期"]))
     if start_date:
-        df.insert(0, "日期", [_date_label(start_date, w, d) for (w, d) in index])
-    df.index = df.index.map(lambda t: (f"第{t[0]}周", WEEKDAY_LABELS[t[1]]))
+        df.insert(0, "日期", [_date_label(start_date, w, d, calendar) for (w, d) in index])
+    df.index = df.index.map(
+        lambda t: (f"第{t[0]}周", _weekday_label(t[1], actual_dates.get(t))))
     return df
 
 
@@ -108,14 +145,15 @@ def export_excel(
     member_stats: dict[int, dict],
     gaps: list[tuple[int, int, int]],
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> bytes:
     """导出 Excel：排班总表(透视) + 值班明细 + 值班统计，返回文件字节"""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pivot = build_pivot_df(assignments, start_date=start_date)
+        pivot = build_pivot_df(assignments, start_date=start_date, calendar=calendar)
         pivot.to_excel(writer, sheet_name="排班总表", merge_cells=False)
 
-        detail = build_detail_df(assignments, start_date=start_date)
+        detail = build_detail_df(assignments, start_date=start_date, calendar=calendar)
         detail.to_excel(writer, sheet_name="值班明细", index=False)
 
         stats = build_stats_df(member_stats)
@@ -152,27 +190,35 @@ def _beautify(writer: pd.ExcelWriter) -> None:
 def export_csv(
     assignments: list[Assignment],
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> bytes:
     """导出 CSV（UTF-8 BOM，Excel 可直接打开）"""
-    return build_detail_df(assignments, start_date=start_date).to_csv(index=False).encode("utf-8-sig")
+    return build_detail_df(
+        assignments, start_date=start_date, calendar=calendar
+    ).to_csv(index=False).encode("utf-8-sig")
 
 
 def build_leaves_df(
     leaves: list[Leave],
     members: list[Member],
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> pd.DataFrame:
     """请假记录表：每行一条，含成员、周次/星期/日期与原因"""
     info_of = {m.id: m for m in members}
     rows = []
     for l in sorted(leaves, key=lambda x: (x.week, x.weekday)):
+        actual_date = calendar.logical_to_date(l.week, l.weekday) if calendar else None
+        if calendar is not None and actual_date is None:
+            continue
         m = info_of.get(l.member_id)
         rows.append({
             "成员": m.name if m else "已删除成员",
             "学号": m.student_id if m else "",
             "周次": f"第{l.week}周",
-            "星期": WEEKDAY_LABELS[l.weekday],
-            "日期": _date_label(start_date, l.week, l.weekday) if start_date else "",
+            "星期": _weekday_label(l.weekday, actual_date),
+            "日期": (_date_label(start_date, l.week, l.weekday, calendar)
+                     if start_date else ""),
             "原因": l.reason,
         })
     columns = ["成员", "学号", "周次", "星期"] + (["日期"] if start_date else []) + ["原因"]
@@ -183,11 +229,14 @@ def export_leaves_excel(
     leaves: list[Leave],
     members: list[Member],
     start_date: date | None = None,
+    calendar: TermCalendar | None = None,
 ) -> bytes:
     """导出请假记录 Excel（单表，供请假登记处一键导出）"""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        build_leaves_df(leaves, members, start_date=start_date).to_excel(
+        build_leaves_df(
+            leaves, members, start_date=start_date, calendar=calendar
+        ).to_excel(
             writer, sheet_name="请假记录", index=False)
         _beautify(writer)
     return buf.getvalue()

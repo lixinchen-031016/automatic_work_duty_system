@@ -10,11 +10,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -28,7 +29,17 @@ from PySide6.QtCore import (
     QThreadPool,
     Signal,
 )
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -60,6 +71,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from duty_system.calendar import (
+    MAX_WEEK,
+    CalendarEntry,
+    TermCalendar,
+    natural_date,
+)
 from duty_system.database import Assignment, Database, SpecialArrangement
 from duty_system.exporter import (
     build_detail_df,
@@ -69,13 +86,18 @@ from duty_system.exporter import (
     export_csv,
     export_excel,
     export_leaves_excel,
-    week_date,
 )
 from duty_system.gantt import (
     AvailabilityMatrix,
     build_availability,
+    display_columns,
     export_gantt_excel,
     slot_header,
+)
+from duty_system.holiday import (
+    build_holiday_import_plan,
+    fetch_holiday_data,
+    get_builtin_holiday_data,
 )
 from duty_system.parser import (
     BLOCK_LABELS,
@@ -111,9 +133,28 @@ if getattr(sys, "frozen", False):
             _BASE.mkdir(parents=True, exist_ok=True)
         DB_PATH = _BASE / "duty_system.db"
     else:
-        DB_PATH = Path(sys.executable).resolve().parent / "duty_system.db"
+        preferred = Path(sys.executable).resolve().parent
+        preferred_db = preferred / "duty_system.db"
+        writable = (
+            os.access(preferred_db, os.W_OK) if preferred_db.exists()
+            else os.access(preferred, os.W_OK)
+        )
+        if writable:
+            DB_PATH = preferred_db
+        else:
+            local_app_data = Path(
+                os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+            _BASE = local_app_data / "DutySystem"
+            try:
+                _BASE.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                _BASE = Path.home() / ".dutysystem"
+                _BASE.mkdir(parents=True, exist_ok=True)
+            DB_PATH = _BASE / "duty_system.db"
 else:
     DB_PATH = Path(__file__).parent / "duty_system.db"
+
+SHORTCUT_MODIFIER = "⌘" if sys.platform == "darwin" else "Ctrl+"
 
 # 类苹果设计语言（macOS 浅色模式）：
 #   背景 #f5f5f7 / 卡片白色圆角 / 系统蓝 #007aff / 文字 #1d1d1f·#86868b
@@ -585,12 +626,18 @@ class MainWindow(QMainWindow):
         self._courses_cache = None
         self._leaves_cache = None
         self._specials_cache = None
+        self._calendar_cache = None
+        self._term_calendar_cache: TermCalendar | None = None
+        self._calendar_error: str | None = None
         # 忙时表由「成员 + 课程」唯一决定，展开成本高（课程数 x 周次 x 节次），
         # 甘特图与微调对话框都会用到，因此与课表缓存同生命周期
         self._busy_cache = None
         self._special_busy_cache = None
         # 缺口诊断结果（按排班结果对象缓存，避免每次刷新重复诊断）
         self._gap_cache: tuple | None = None
+        self._undo_stack: list[tuple[int, int, int, tuple[int, ...]]] = []
+        self._redo_stack: list[tuple[int, int, int, tuple[int, ...]]] = []
+        self._undo_limit = 50
         # 甘特图单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
         self._gantt_cell_state: dict = {}
         self._pool = QThreadPool.globalInstance()
@@ -615,6 +662,9 @@ class MainWindow(QMainWindow):
         self._courses_cache = None
         self._leaves_cache = None
         self._specials_cache = None
+        self._calendar_cache = None
+        self._term_calendar_cache = None
+        self._calendar_error = None
         self._busy_cache = None
         self._special_busy_cache = None
         self._gap_cache = None
@@ -638,6 +688,32 @@ class MainWindow(QMainWindow):
         if self._specials_cache is None:
             self._specials_cache = self.db.list_special_arrangements()
         return self._specials_cache
+
+    def calendar_entries(self) -> list[CalendarEntry]:
+        if self._calendar_cache is None:
+            self._calendar_cache = self.db.list_calendar()
+        return self._calendar_cache
+
+    def term_calendar(self) -> TermCalendar:
+        """当前学期起始日 + 数据库日历覆盖的解析器。"""
+        term_start = self._term_start()
+        cached = self._term_calendar_cache
+        if cached is None or cached.term_start != term_start:
+            try:
+                cached = TermCalendar(term_start, self.calendar_entries())
+            except ValueError as exc:
+                # 学期起始日调整后，历史日历项可能暂时越界。运行态先停用全部
+                # 覆盖，避免甘特图和排班刷新崩溃；保存/校验时仍会明确报错。
+                self._calendar_error = str(exc)
+                cached = TermCalendar(term_start, [])
+            else:
+                self._calendar_error = None
+            self._term_calendar_cache = cached
+        return cached
+
+    def is_off_day(self, week: int, weekday: int) -> bool:
+        """逻辑教学日是否为无真实日期的纯假日。"""
+        return self.term_calendar().logical_to_date(week, weekday) is None
 
     def busy_map(self) -> dict[int, set]:
         """课程忙时表（按 成员 -> {(周, 星期, 节次)}）"""
@@ -704,6 +780,32 @@ class MainWindow(QMainWindow):
     # ---------- 界面构建 ----------
 
     def _build_ui(self) -> None:
+        edit_menu = self.menuBar().addMenu("编辑")
+        self.undo_action = QAction("撤销", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.undo_action.setToolTip(
+            f"撤销 {SHORTCUT_MODIFIER}Z" if SHORTCUT_MODIFIER == "⌘"
+            else f"撤销 {SHORTCUT_MODIFIER}Z")
+        self.undo_action.setEnabled(False)
+        self.undo_action.triggered.connect(self.undo_tweak)
+        edit_menu.addAction(self.undo_action)
+        self.redo_action = QAction("重做", self)
+        if sys.platform == "darwin":
+            self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        else:
+            self.redo_action.setShortcuts([
+                QKeySequence.StandardKey.Redo,
+                QKeySequence("Ctrl+Shift+Z"),
+            ])
+        self.redo_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.redo_action.setToolTip(
+            "重做 ⌘⇧Z" if SHORTCUT_MODIFIER == "⌘"
+            else "重做 Ctrl+Shift+Z")
+        self.redo_action.setEnabled(False)
+        self.redo_action.triggered.connect(self.redo_tweak)
+        edit_menu.addAction(self.redo_action)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
@@ -735,11 +837,20 @@ class MainWindow(QMainWindow):
         members_layout = QVBoxLayout(grp_members)
         members_layout.setContentsMargins(8, 4, 8, 8)
         members_layout.setSpacing(8)
+        self.member_search = QLineEdit()
+        self.member_search.setPlaceholderText("搜索姓名 / 学号 / 班级")
+        self.member_search.setClearButtonEnabled(True)
+        members_layout.addWidget(self.member_search)
+        self.member_class_filter = QComboBox()
+        self.member_class_filter.setToolTip("按班级筛选成员")
+        members_layout.addWidget(self.member_class_filter)
         self.member_list = QListWidget()
         self.member_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.member_list.setMinimumHeight(120)
         self.member_list.setToolTip("双击成员可在「成员课表」页查看其课表详情")
         self.member_list.itemDoubleClicked.connect(self.open_member_courses)
+        self.member_search.textChanged.connect(self._apply_member_filter)
+        self.member_class_filter.currentIndexChanged.connect(self._apply_member_filter)
         members_layout.addWidget(self.member_list)
         btn_remove = QPushButton("删除选中成员")
         btn_remove.setObjectName("danger")
@@ -829,6 +940,15 @@ class MainWindow(QMainWindow):
         self.term_start.setToolTip("第一周周一的日期；值班表按此把周次换算为具体日期")
         self.term_start.dateChanged.connect(self._on_term_start_changed)
         form.addRow("学期起始日", self.term_start)
+        calendar_row = QHBoxLayout()
+        self.calendar_label = QLabel("未设置")
+        self.calendar_label.setObjectName("secondary")
+        btn_calendar = QPushButton("管理日历…")
+        btn_calendar.setToolTip("批量设置法定假日与周末补课映射")
+        btn_calendar.clicked.connect(self.open_calendar_dialog)
+        calendar_row.addWidget(self.calendar_label, stretch=1)
+        calendar_row.addWidget(btn_calendar)
+        form.addRow("学期日历", calendar_row)
         layout.addWidget(grp_cfg)
 
         self.btn_generate = QPushButton("生成排班表")
@@ -836,6 +956,11 @@ class MainWindow(QMainWindow):
         self.btn_generate.setMinimumHeight(42)
         self.btn_generate.clicked.connect(self.generate)
         layout.addWidget(self.btn_generate)
+        self.btn_clear_schedule = QPushButton("清空排班…")
+        self.btn_clear_schedule.setObjectName("danger")
+        self.btn_clear_schedule.setEnabled(False)
+        self.btn_clear_schedule.clicked.connect(self.clear_schedule)
+        layout.addWidget(self.btn_clear_schedule)
 
         grp_data = QGroupBox("数据存储")
         dl = QHBoxLayout(grp_data)
@@ -852,6 +977,7 @@ class MainWindow(QMainWindow):
         dl.addWidget(btn_change_db)
         layout.addWidget(grp_data)
         self._update_db_path_label()
+        self._refresh_calendar_summary()
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -905,7 +1031,7 @@ class MainWindow(QMainWindow):
         sel_row.addWidget(QLabel("选择成员"))
         self.member_combo = QComboBox()
         self.member_combo.setMinimumWidth(220)
-        self.member_combo.currentIndexChanged.connect(self.show_member_courses)
+        self.member_combo.currentIndexChanged.connect(self._on_member_combo_changed)
         sel_row.addWidget(self.member_combo)
         sel_row.addStretch()
         v3.addLayout(sel_row)
@@ -1073,15 +1199,29 @@ class MainWindow(QMainWindow):
 
     def refresh_members(self) -> None:
         members = self.members()
+        selected_class = self.member_class_filter.currentData()
         self.member_list.clear()
+        self.member_class_filter.blockSignals(True)
+        self.member_class_filter.clear()
+        self.member_class_filter.addItem("全部", "")
+        for class_name in sorted({
+                m.class_name.strip() for m in members if m.class_name.strip()}):
+            self.member_class_filter.addItem(class_name, class_name)
+        class_index = self.member_class_filter.findData(selected_class)
+        self.member_class_filter.setCurrentIndex(max(class_index, 0))
+        self.member_class_filter.blockSignals(False)
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         for m in members:
             self.member_list.addItem(f"{m.name}（{m.course_count} 门课）")
             item = self.member_list.item(self.member_list.count() - 1)
             item.setData(Qt.UserRole, m.id)
+            item.setData(Qt.UserRole + 1, (
+                m.name, m.student_id, m.class_name))
             self.member_combo.addItem(f"{m.name}（{m.class_name or '未知班级'}）", m.id)
         self.member_combo.blockSignals(False)
+        self._apply_member_filter()
+        self._clear_undo_redo()
         if self.member_combo.count():
             self.show_member_courses(0)
         else:
@@ -1091,6 +1231,22 @@ class MainWindow(QMainWindow):
         self.refresh_gantt()
         self._update_empty_state()
         self._mark_stale()
+
+    def _apply_member_filter(self, *_args) -> None:
+        """按姓名/学号/班级即时过滤成员列表，不修改底层数据。"""
+        query = self.member_search.text().strip().casefold()
+        selected_class = self.member_class_filter.currentData() or ""
+        for row in range(self.member_list.count()):
+            item = self.member_list.item(row)
+            name, student_id, class_name = item.data(Qt.UserRole + 1)
+            matches_query = (
+                not query
+                or query in str(name).casefold()
+                or query in str(student_id).casefold()
+                or query in str(class_name).casefold()
+            )
+            matches_class = not selected_class or class_name == selected_class
+            item.setHidden(not (matches_query and matches_class))
 
     def _update_empty_state(self) -> None:
         """无排班结果时，给出下一步引导文案"""
@@ -1120,10 +1276,16 @@ class MainWindow(QMainWindow):
             return
         # 优先用「生成时保存的参数」判定缺口；没有记录（老版本数据）才退回当前界面参数
         config = self._last_config or self._load_last_config() or self._current_config()
+        assignments = [
+            a for a in assignments if not self.is_off_day(a.week, a.weekday)
+        ]
+        if not assignments:
+            return
         result = ScheduleResult()
         result.assignments = assignments
         result.member_stats = rebuild_member_stats(members, assignments)
-        result.gaps = compute_gaps(assignments, config)
+        result.gaps = compute_gaps(
+            assignments, config, is_off=self.is_off_day)
         self.result = result
         self._last_config = config
         self._stale = False
@@ -1168,6 +1330,7 @@ class MainWindow(QMainWindow):
         self.db = Database(new_path)
         self.invalidate_cache()
         self._update_db_path_label()
+        self._refresh_calendar_summary()
         self.result = None
         self._last_config = None
         self._stale = False
@@ -1227,6 +1390,7 @@ class MainWindow(QMainWindow):
                 parsed = QDate.fromString(str(s.value(key, "") or ""), "yyyy-MM-dd")
                 if parsed.isValid():
                     widget.setDate(parsed)
+        self._refresh_calendar_summary()
 
     def _save_settings(self) -> None:
         s = QSettings()
@@ -1281,8 +1445,430 @@ class MainWindow(QMainWindow):
 
     def _on_term_start_changed(self) -> None:
         """学期起始日只影响日期显示，改完立即刷新结果表"""
+        self._term_calendar_cache = None
+        self._calendar_error = None
         if self.result is not None:
             self.refresh_schedule_tabs()
+        self.refresh_gantt()
+        self._refresh_calendar_summary()
+
+    def _add_calendar_row(
+        self,
+        table: QTableWidget,
+        entry: CalendarEntry | None = None,
+    ) -> int:
+        """向学期日历编辑表追加一行可视化控件。"""
+        row = table.rowCount()
+        table.insertRow(row)
+
+        date_edit = QDateEdit()
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        term_start = self._term_start()
+        term_end = term_start + timedelta(days=MAX_WEEK * 7 - 1)
+        date_edit.setMinimumDate(QDate(term_start.year, term_start.month, term_start.day))
+        date_edit.setMaximumDate(QDate(term_end.year, term_end.month, term_end.day))
+        default_date = entry.date if entry else self._term_start()
+        date_edit.setDate(QDate(default_date.year, default_date.month, default_date.day))
+        table.setCellWidget(row, 0, date_edit)
+
+        kind_combo = QComboBox()
+        kind_combo.addItem("放假（off）", "off")
+        kind_combo.addItem("补课（class）", "class")
+        if entry is not None:
+            kind_combo.setCurrentIndex(kind_combo.findData(entry.override_type))
+        table.setCellWidget(row, 1, kind_combo)
+
+        week_spin = QSpinBox()
+        week_spin.setRange(1, 25)
+        week_spin.setValue(entry.maps_to_week if entry and entry.maps_to_week
+                           else self.week_from.value())
+        table.setCellWidget(row, 2, week_spin)
+
+        weekday_combo = QComboBox()
+        for weekday in range(1, 8):
+            weekday_combo.addItem(WEEKDAY_LABELS[weekday], weekday)
+        if entry is not None and entry.maps_to_weekday is not None:
+            weekday_combo.setCurrentIndex(
+                weekday_combo.findData(entry.maps_to_weekday))
+        table.setCellWidget(row, 3, weekday_combo)
+
+        note_edit = QLineEdit(entry.note if entry else "")
+        note_edit.setPlaceholderText("原因或备注（可空）")
+        table.setCellWidget(row, 4, note_edit)
+
+        delete_button = QPushButton("删除")
+        delete_button.setObjectName("danger")
+        delete_button.setFixedWidth(64)
+
+        def sync_class_fields() -> None:
+            is_class = kind_combo.currentData() == "class"
+            week_spin.setEnabled(is_class)
+            weekday_combo.setEnabled(is_class)
+
+        def remove_row() -> None:
+            for current in range(table.rowCount()):
+                if table.cellWidget(current, 5) is delete_button:
+                    table.removeRow(current)
+                    return
+
+        kind_combo.currentIndexChanged.connect(sync_class_fields)
+        delete_button.clicked.connect(remove_row)
+        table.setCellWidget(row, 5, delete_button)
+        sync_class_fields()
+        table.setRowHeight(row, 38)
+        return row
+
+    @staticmethod
+    def _calendar_entries_from_table(table: QTableWidget) -> list[CalendarEntry]:
+        """从可视化编辑表读取并构造日历覆盖项。"""
+        entries: list[CalendarEntry] = []
+        seen_dates: set[date] = set()
+        for row in range(table.rowCount()):
+            date_edit = table.cellWidget(row, 0)
+            kind_combo = table.cellWidget(row, 1)
+            week_spin = table.cellWidget(row, 2)
+            weekday_combo = table.cellWidget(row, 3)
+            note_edit = table.cellWidget(row, 4)
+            assert isinstance(date_edit, QDateEdit)
+            assert isinstance(kind_combo, QComboBox)
+            assert isinstance(week_spin, QSpinBox)
+            assert isinstance(weekday_combo, QComboBox)
+            assert isinstance(note_edit, QLineEdit)
+
+            entry_date = date_edit.date().toPython()
+            if entry_date in seen_dates:
+                raise ValueError(f"第 {row + 1} 行日期重复：{entry_date.isoformat()}")
+            seen_dates.add(entry_date)
+            kind = str(kind_combo.currentData())
+            if kind == "off":
+                entries.append(CalendarEntry(
+                    entry_date, "off", note=note_edit.text().strip()))
+            else:
+                entries.append(CalendarEntry(
+                    entry_date, "class", week_spin.value(),
+                    int(weekday_combo.currentData()), note_edit.text().strip()))
+        return sorted(entries, key=lambda item: item.date)
+
+    @staticmethod
+    def _makeup_entries(
+        term_start: date,
+        week: int,
+        weekday: int,
+        makeup_date: date,
+    ) -> list[CalendarEntry]:
+        """构造一组互补的放假/补课覆盖项。"""
+        return [
+            CalendarEntry(natural_date(term_start, week, weekday), "off", note="调休放假"),
+            CalendarEntry(makeup_date, "class", week, weekday, "周末补课"),
+        ]
+
+    def _open_add_makeup_dialog(self, table: QTableWidget) -> None:
+        """一键生成互补的 off/class，并在加入编辑表前校验 maps_to。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加调休")
+        form = QFormLayout(dlg)
+        form.setContentsMargins(16, 16, 16, 12)
+        form.setSpacing(10)
+
+        week_spin = QSpinBox()
+        week_spin.setRange(1, 25)
+        week_spin.setValue(self.week_from.value())
+        form.addRow("代表周次", week_spin)
+
+        weekday_combo = QComboBox()
+        for weekday in range(1, 8):
+            weekday_combo.addItem(WEEKDAY_LABELS[weekday], weekday)
+        weekday_combo.setCurrentIndex(weekday_combo.findData(4))
+        form.addRow("代表星期", weekday_combo)
+
+        off_date_edit = QDateEdit()
+        off_date_edit.setCalendarPopup(True)
+        off_date_edit.setDisplayFormat("yyyy-MM-dd")
+        off_date_edit.setEnabled(False)
+        form.addRow("放假日期", off_date_edit)
+
+        class_date_edit = QDateEdit()
+        class_date_edit.setCalendarPopup(True)
+        class_date_edit.setDisplayFormat("yyyy-MM-dd")
+        term_start = self._term_start()
+        term_end = term_start + timedelta(days=MAX_WEEK * 7 - 1)
+        class_date_edit.setMinimumDate(
+            QDate(term_start.year, term_start.month, term_start.day))
+        class_date_edit.setMaximumDate(
+            QDate(term_end.year, term_end.month, term_end.day))
+        form.addRow("补课日期", class_date_edit)
+
+        def sync_off_date(*_args) -> None:
+            off_date = natural_date(
+                self._term_start(), week_spin.value(),
+                int(weekday_combo.currentData()))
+            off_date_edit.setDate(QDate(off_date.year, off_date.month, off_date.day))
+            days_to_saturday = (5 - off_date.weekday()) % 7 or 7
+            makeup = off_date + timedelta(days=days_to_saturday)
+            class_date_edit.setDate(QDate(makeup.year, makeup.month, makeup.day))
+
+        week_spin.valueChanged.connect(sync_off_date)
+        weekday_combo.currentIndexChanged.connect(sync_off_date)
+        sync_off_date()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("添加")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        form.addRow(buttons)
+
+        def confirm() -> None:
+            week = week_spin.value()
+            weekday = int(weekday_combo.currentData())
+            off_date = natural_date(self._term_start(), week, weekday)
+            makeup_date = class_date_edit.date().toPython()
+            entries = self._makeup_entries(
+                self._term_start(), week, weekday, makeup_date)
+            try:
+                self.db.validate_calendar(
+                    self._term_start(), entries=entries)
+                existing = self._calendar_entries_from_table(table)
+                existing_dates = {entry.date for entry in existing}
+                duplicated = [entry for entry in entries if entry.date in existing_dates]
+                if duplicated:
+                    dates = "、".join(entry.date.isoformat() for entry in duplicated)
+                    raise ValueError(f"日期已存在：{dates}")
+            except ValueError as exc:
+                QMessageBox.warning(dlg, "无法添加调休", str(exc))
+                return
+            for entry in entries:
+                self._add_calendar_row(table, entry)
+            dlg.accept()
+
+        buttons.accepted.connect(confirm)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    def _open_national_holiday_import_dialog(self, table: QTableWidget) -> None:
+        """预览国家调休数据，确认后合并到当前学期日历编辑表。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("导入国家调休日历")
+        dlg.resize(960, 620)
+        layout = QVBoxLayout(dlg)
+
+        tip = QLabel(
+            "选择年份后加载国家法定节假日和调休上班日。补课日对应的逻辑周/星期"
+            "为自动推断结果，请逐行确认后再导入。")
+        tip.setObjectName("secondary")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("数据年份"))
+        year_spin = QSpinBox()
+        year_spin.setRange(2004, 2100)
+        year_spin.setValue(self._term_start().year)
+        controls.addWidget(year_spin)
+        load_button = QPushButton("加载内置数据")
+        online_button = QPushButton("在线更新")
+        controls.addWidget(load_button)
+        controls.addWidget(online_button)
+        controls.addStretch(1)
+        source_label = QLabel("尚未加载")
+        source_label.setObjectName("secondary")
+        controls.addWidget(source_label)
+        layout.addLayout(controls)
+
+        preview = QTableWidget(0, 6)
+        preview.setHorizontalHeaderLabels(
+            ["日期", "类型", "代表周", "代表星期", "备注", "操作"])
+        preview.verticalHeader().setVisible(False)
+        preview.setSelectionMode(QAbstractItemView.NoSelection)
+        preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        preview_header = preview.horizontalHeader()
+        preview_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        preview_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        preview_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        preview_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        preview_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        preview_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        layout.addWidget(preview, stretch=1)
+
+        warning_label = QLabel("")
+        warning_label.setObjectName("secondary")
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("导入到日历")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        layout.addWidget(buttons)
+
+        def populate(data) -> None:
+            preview.setRowCount(0)
+            plan = build_holiday_import_plan(self._term_start(), data)
+            for entry in plan.entries:
+                self._add_calendar_row(preview, entry)
+            source_label.setText(f"来源：{data.source}")
+            warning_label.setText(
+                "\n".join(plan.warnings) if plan.warnings else
+                f"共生成 {len(plan.entries)} 项，可在预览中修改或删除。")
+
+        def load_builtin(*_args) -> None:
+            data = get_builtin_holiday_data(year_spin.value())
+            if data is None:
+                source_label.setText(f"{year_spin.value()} 年暂无内置数据")
+                warning_label.setText("请点击「在线更新」获取该年度数据。")
+                return
+            populate(data)
+
+        def update_online() -> None:
+            year = year_spin.value()
+            self.run_async(
+                f"正在获取 {year} 年国家调休数据",
+                lambda: fetch_holiday_data(year),
+                populate,
+            )
+
+        def import_preview() -> None:
+            try:
+                incoming = self._calendar_entries_from_table(preview)
+                if not incoming:
+                    raise ValueError("预览中没有可导入的日历项")
+                existing = self._calendar_entries_from_table(table)
+                existing_by_date = {entry.date: entry for entry in existing}
+                conflicts = [
+                    entry for entry in incoming
+                    if entry.date in existing_by_date
+                    and existing_by_date[entry.date] != entry
+                ]
+                if conflicts:
+                    dates = "、".join(entry.date.isoformat() for entry in conflicts)
+                    raise ValueError(f"以下日期已存在，请先在预览中删除：{dates}")
+                incoming = [
+                    entry for entry in incoming if entry.date not in existing_by_date
+                ]
+                self.db.validate_calendar(
+                    self._term_start(), entries=[*existing, *incoming],
+                    allow_unpaired_off=True)
+            except ValueError as exc:
+                QMessageBox.warning(dlg, "无法导入", str(exc))
+                return
+            for entry in incoming:
+                self._add_calendar_row(table, entry)
+            dlg.accept()
+
+        load_button.clicked.connect(load_builtin)
+        online_button.clicked.connect(update_online)
+        year_spin.valueChanged.connect(load_builtin)
+        buttons.accepted.connect(import_preview)
+        buttons.rejected.connect(dlg.reject)
+        load_builtin()
+        dlg.exec()
+
+    def _refresh_calendar_summary(self) -> None:
+        self.term_calendar()
+        if self._calendar_error:
+            self.calendar_label.setText("配置异常，已暂停应用")
+            self.calendar_label.setToolTip(self._calendar_error)
+            return
+        entries = self.calendar_entries()
+        self.calendar_label.setToolTip("")
+        if not entries:
+            self.calendar_label.setText("未设置")
+            return
+        class_count = sum(e.override_type == "class" for e in entries)
+        off_count = len(entries) - class_count
+        self.calendar_label.setText(f"{len(entries)} 项（放假 {off_count} / 补课 {class_count}）")
+
+    def open_calendar_dialog(self) -> None:
+        """通过日期选择框编辑学期日历覆盖，保存前执行成对一致性校验。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("学期日历覆盖")
+        dlg.resize(900, 520)
+        layout = QVBoxLayout(dlg)
+        tip = QLabel(
+            "「放假 off」表示逻辑教学日放假；「补课 class」选择周末日期，"
+            "并指定它代表的逻辑教学周与星期。")
+        if self._calendar_error:
+            tip.setText(f"当前日历配置无效，已暂停应用：{self._calendar_error}")
+            tip.setStyleSheet("color: #b3261e;")
+        tip.setObjectName("secondary")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(
+            ["日期", "类型", "代表周", "代表星期", "备注", "操作"])
+        table.verticalHeader().setVisible(False)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        for entry in self.calendar_entries():
+            self._add_calendar_row(table, entry)
+        layout.addWidget(table, stretch=1)
+
+        add_button = QPushButton("添加覆盖项")
+        add_button.clicked.connect(lambda: self._add_calendar_row(table))
+        makeup_button = QPushButton("一键添加调休")
+        makeup_button.clicked.connect(
+            lambda: self._open_add_makeup_dialog(table))
+        holiday_button = QPushButton("从国家调休导入…")
+        holiday_button.clicked.connect(
+            lambda: self._open_national_holiday_import_dialog(table))
+        validate_button = QPushButton("校验")
+        allow_unpaired = QCheckBox("允许纯法定假日（off 无需补课配对）")
+        allow_unpaired.setChecked(True)
+        allow_unpaired.setToolTip(
+            "默认勾选：off 可表示无补课日的纯法定假日。"
+            "取消勾选后，每个 off 都必须有唯一 class 项与其成对。")
+
+        def validate_current() -> None:
+            try:
+                entries = self._calendar_entries_from_table(table)
+                self.db.validate_calendar(
+                    self._term_start(), entries=entries,
+                    allow_unpaired_off=allow_unpaired.isChecked())
+            except ValueError as exc:
+                QMessageBox.warning(dlg, "日历校验失败", str(exc))
+                return
+            QMessageBox.information(dlg, "日历校验", "日历覆盖项校验通过。")
+
+        validate_button.clicked.connect(validate_current)
+        options = QHBoxLayout()
+        options.addWidget(add_button)
+        options.addWidget(makeup_button)
+        options.addWidget(holiday_button)
+        options.addWidget(validate_button)
+        options.addStretch(1)
+        options.addWidget(allow_unpaired)
+        layout.addLayout(options)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            entries = self._calendar_entries_from_table(table)
+            self.db.validate_calendar(
+                self._term_start(), entries=entries,
+                allow_unpaired_off=allow_unpaired.isChecked())
+        except ValueError as exc:
+            QMessageBox.warning(self, "日历校验失败", str(exc))
+            return
+        self.db.clear_calendar()
+        self.db.upsert_calendar(entries)
+        self.invalidate_cache()
+        self._refresh_calendar_summary()
+        self.refresh_gantt()
+        if self.result is not None:
+            self.refresh_schedule_tabs()
+            self._mark_stale()
+        self.statusBar().showMessage(f"学期日历已更新（{len(entries)} 项）。")
 
     def closeEvent(self, event) -> None:
         # 关闭时可能有后台任务在跑：置位后回调直接返回，避免回写到已关闭的界面
@@ -1293,10 +1879,22 @@ class MainWindow(QMainWindow):
     def refresh_schedule_tabs(self) -> None:
         result = self.result
         if result is None:
+            for table in (self.pivot_table, self.detail_table,
+                          self.stats_table, self.gap_table):
+                fill_table(table, pd.DataFrame())
+            self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
+            self.gap_title.setText("无人可值时段")
+            self.btn_export_xlsx.setEnabled(False)
+            self.btn_export_csv.setEnabled(False)
+            self.btn_export_png.setEnabled(False)
+            self.btn_clear_schedule.setEnabled(bool(self.db.load_assignments()))
+            self.refresh_charts()
             return
         display = self._pivot_display()
         fill_table(self.pivot_table, display)
-        fill_table(self.detail_table, build_detail_df(result.assignments, start_date=self._term_start()))
+        fill_table(self.detail_table, build_detail_df(
+            result.assignments, start_date=self._term_start(),
+            calendar=self.term_calendar()))
         fill_table(self.stats_table, build_stats_df(result.member_stats))
 
         n = len(result.assignments)
@@ -1315,6 +1913,7 @@ class MainWindow(QMainWindow):
         self.btn_export_xlsx.setEnabled(has_data)
         self.btn_export_csv.setEnabled(has_data)
         self.btn_export_png.setEnabled(has_data)
+        self.btn_clear_schedule.setEnabled(has_data)
 
         if result.gaps:
             self.gap_title.setText(
@@ -1340,7 +1939,7 @@ class MainWindow(QMainWindow):
         cfg = self._last_config or self._load_last_config() or self._current_config()
         diagnoses = diagnose_gaps(
             self.members(), self.busy_map(), self.leaves(), result.assignments,
-            cfg, special_arrangements=self.specials())
+            cfg, special_arrangements=self.specials(), is_off=self.is_off_day)
         self._gap_cache = (result, diagnoses)
         return diagnoses
 
@@ -1349,7 +1948,8 @@ class MainWindow(QMainWindow):
 
     def _pivot_frame(self, assignments: list[Assignment]) -> pd.DataFrame:
         """扁平化透视表（周次/星期 + 日期 + 各时段），供表格展示与 PNG 导出"""
-        pivot = build_pivot_df(assignments, start_date=self._term_start())
+        pivot = build_pivot_df(
+            assignments, start_date=self._term_start(), calendar=self.term_calendar())
         return pd.concat(
             [pd.DataFrame(pivot.index.tolist(), columns=["周次", "星期"]),
              pivot.reset_index(drop=True)], axis=1)
@@ -1361,7 +1961,11 @@ class MainWindow(QMainWindow):
         # 这里按相同顺序用原始整数重建行映射，供微调对话框定位
         weeks = sorted({a.week for a in result.assignments})
         weekdays = sorted({a.weekday for a in result.assignments})
-        self._pivot_rows = [(w, d) for w in weeks for d in weekdays]
+        calendar = self.term_calendar()
+        self._pivot_rows = [
+            (w, d) for w in weeks for d in weekdays
+            if calendar.logical_to_date(w, d) is not None
+        ]
         self._pivot_blocks = sorted({a.block for a in result.assignments})
         self._pivot_date_offset = 1  # 展示列顺序：周次、星期、日期、各时段
         return self._pivot_frame(result.assignments)
@@ -1390,6 +1994,11 @@ class MainWindow(QMainWindow):
                    pd.DataFrame(columns=["星期", "课程", "教师", "周次", "节次", "地点"]))
         self._refresh_special_arrangements(member_id)
         self._refresh_leaves(member_id)
+
+    def _on_member_combo_changed(self, index: int) -> None:
+        """切换查看成员时清空微调历史，避免跨成员撤销。"""
+        self._clear_undo_redo()
+        self.show_member_courses(index)
 
     # ---------- 空闲甘特图 ----------
 
@@ -1427,7 +2036,8 @@ class MainWindow(QMainWindow):
             leaves=self.leaves(),
             assignments=self.result.assignments if self.result else None,
             busy=self.busy_map(),
-            special_arrangements=self.specials())
+            special_arrangements=self.specials(),
+            calendar=self.term_calendar())
         self.gantt_matrix = matrix
         self._fill_gantt_table(matrix)
 
@@ -1505,7 +2115,8 @@ class MainWindow(QMainWindow):
         DUTY_COLOR = QColor("#0a5aa8")
         ALL_FREE_COLOR = QColor("#b25e00")
 
-        rows, cols = m.member_count + 1, len(m.slots)
+        columns = display_columns(m)
+        rows, cols = m.member_count + 1, len(columns)
         if t.rowCount() != rows or t.columnCount() != cols:
             t.clearContents()
             t.setRowCount(rows)
@@ -1515,14 +2126,23 @@ class MainWindow(QMainWindow):
         else:
             cache = self._gantt_cell_state
         t.setVerticalHeaderLabels(m.member_names + ["空闲人数"])
-        t.setHorizontalHeaderLabels([slot_header(d, b) for d, b in m.slots])
+        t.setHorizontalHeaderLabels([
+            slot_header(c.weekday, c.block, c.date, is_off=c.is_off)
+            for c in columns])
 
         week = m.week
         for r in range(m.member_count):
             free_row = m.free[r]
-            for i, (d, b) in enumerate(m.slots):
+            for i, column in enumerate(columns):
+                d, b = column.weekday, column.block
                 leave_reason = m.leave_info.get((r, d))
-                if leave_reason is not None:
+                if column.is_off:
+                    actual = column.date
+                    date_text = (f"（{actual.month}月{actual.day}日）"
+                                 if actual is not None else "")
+                    state = ("假", LEAVE, LEAVE_COLOR,
+                             f"第{week}周 {WEEKDAY_LABELS[d]}{date_text}：法定假日放假", True)
+                elif leave_reason is not None:
                     reason = f"（{leave_reason}）" if leave_reason else ""
                     state = ("假", LEAVE, LEAVE_COLOR,
                              f"第{week}周 {WEEKDAY_LABELS[d]}：请假{reason}", True)
@@ -1534,26 +2154,40 @@ class MainWindow(QMainWindow):
                     state = ("特", SPECIAL, SPECIAL_COLOR,
                              f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：其他安排\n"
                              + "\n".join(reasons), True)
-                elif free_row[i]:
-                    state = ("", FREE, None,
-                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：空闲", False)
                 else:
-                    names = m.busy_courses.get((r, d, b), [])
-                    state = ("课", BUSY, BUSY_COLOR,
-                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：\n"
-                             + "\n".join(names), True)
+                    assert column.slot_index is not None
+                    if free_row[column.slot_index]:
+                        state = ("", FREE, None,
+                                 f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：空闲",
+                                 False)
+                    else:
+                        names = m.busy_courses.get((r, d, b), [])
+                        state = ("课", BUSY, BUSY_COLOR,
+                                 f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：\n"
+                                 + "\n".join(names), True)
                 self._fill_cell(t, r, i, state, cache)
 
         r = m.member_count
-        for i, (d, b) in enumerate(m.slots):
-            all_free = m.free_counts[i] == m.member_count
-            state = (f"{m.free_counts[i]}/{m.member_count}",
-                     ALL_FREE if all_free else QColor(0, 0, 0, 0),
-                     ALL_FREE_COLOR if all_free else NO_COLOR, "", True)
+        for i, column in enumerate(columns):
+            if column.is_off:
+                state = ("放假", LEAVE, LEAVE_COLOR,
+                         f"第{week}周 {WEEKDAY_LABELS[column.weekday]}：法定假日放假",
+                         True)
+            else:
+                assert column.slot_index is not None
+                count = m.free_counts[column.slot_index]
+                all_free = count == m.member_count
+                state = (f"{count}/{m.member_count}",
+                         ALL_FREE if all_free else QColor(0, 0, 0, 0),
+                         ALL_FREE_COLOR if all_free else NO_COLOR, "", True)
             self._fill_cell(t, r, i, state, cache)
             head = t.horizontalHeaderItem(i)
             if head is not None:
-                head.setForeground(QBrush(QColor("#ff9500" if all_free else "#86868b")))
+                highlighted = column.is_off or (
+                    not column.is_off
+                    and m.free_counts[column.slot_index] == m.member_count)
+                head.setForeground(QBrush(QColor(
+                    "#ff9500" if highlighted else "#86868b")))
 
     def export_gantt(self) -> None:
         m = self.gantt_matrix
@@ -1836,11 +2470,13 @@ class MainWindow(QMainWindow):
             return
         members = self.members()
         start = self._term_start()
+        calendar = self.term_calendar()
         target = Path(path)
         self.run_async(
             "正在导出请假记录",
             lambda: target.write_bytes(
-                export_leaves_excel(leaves, members, start_date=start)),
+                export_leaves_excel(
+                    leaves, members, start_date=start, calendar=calendar)),
             lambda _r: self.statusBar().showMessage(
                 f"已导出请假记录（{len(leaves)} 条）：{target}"))
 
@@ -1945,6 +2581,93 @@ class MainWindow(QMainWindow):
                 item.setToolTip("课程/特殊安排/请假/当天条件均满足，手动换入将超过每周上限，请知悉")
             lst.addItem(item)
 
+    def _slot_member_ids(self, week: int, weekday: int, block: int) -> tuple[int, ...]:
+        if self.result is None:
+            return ()
+        return tuple(sorted(
+            a.member_id for a in self.result.assignments
+            if a.week == week and a.weekday == weekday and a.block == block
+        ))
+
+    def _push_undo(self, snapshot: tuple[int, int, int, tuple[int, ...]]) -> None:
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._undo_limit:
+            del self._undo_stack[:len(self._undo_stack) - self._undo_limit]
+        self._update_undo_redo_actions()
+
+    def _push_redo(self, snapshot: tuple[int, int, int, tuple[int, ...]]) -> None:
+        self._redo_stack.append(snapshot)
+        if len(self._redo_stack) > self._undo_limit:
+            del self._redo_stack[:len(self._redo_stack) - self._undo_limit]
+        self._update_undo_redo_actions()
+
+    def _clear_undo_redo(self) -> None:
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._update_undo_redo_actions()
+
+    def _update_undo_redo_actions(self) -> None:
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(bool(self._undo_stack) and self.result is not None)
+        if hasattr(self, "redo_action"):
+            self.redo_action.setEnabled(bool(self._redo_stack) and self.result is not None)
+
+    def _restore_slot_snapshot(
+        self,
+        week: int,
+        weekday: int,
+        block: int,
+        member_ids: tuple[int, ...],
+    ) -> None:
+        """把一个微调快照恢复到结果对象和数据库。"""
+        if self.result is None or self._last_config is None:
+            return
+        members = {m.id: m for m in self.members()}
+        kept = [
+            a for a in self.result.assignments
+            if not (a.week == week and a.weekday == weekday and a.block == block)
+        ]
+        for member_id in member_ids:
+            member = members[member_id]
+            kept.append(Assignment(
+                week=week, weekday=weekday, block=block,
+                member_id=member_id, member_name=member.name))
+        self.db.replace_slot(week, weekday, block, list(member_ids))
+        self.result.assignments = kept
+        self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
+        self.result.gaps = compute_gaps(
+            kept, self._last_config, is_off=self.is_off_day)
+        self._gap_cache = None
+        self._stale = False
+        self.refresh_schedule_tabs()
+        self.refresh_gantt()
+
+    def undo_tweak(self, *_args) -> None:
+        """撤销一次手动微调。"""
+        if not self._undo_stack or self.result is None:
+            return
+        week, weekday, block, old_ids = self._undo_stack.pop()
+        current_ids = self._slot_member_ids(week, weekday, block)
+        self._push_redo((week, weekday, block, current_ids))
+        self._restore_slot_snapshot(week, weekday, block, old_ids)
+        self._update_undo_redo_actions()
+        self.statusBar().showMessage(
+            f"已撤销第{week}周{WEEKDAY_LABELS[weekday]}"
+            f"{BLOCK_LABELS[block].split(' ')[0]}的微调。")
+
+    def redo_tweak(self, *_args) -> None:
+        """重做一次手动微调。"""
+        if not self._redo_stack or self.result is None:
+            return
+        week, weekday, block, new_ids = self._redo_stack.pop()
+        current_ids = self._slot_member_ids(week, weekday, block)
+        self._push_undo((week, weekday, block, current_ids))
+        self._restore_slot_snapshot(week, weekday, block, new_ids)
+        self._update_undo_redo_actions()
+        self.statusBar().showMessage(
+            f"已重做第{week}周{WEEKDAY_LABELS[weekday]}"
+            f"{BLOCK_LABELS[block].split(' ')[0]}的微调。")
+
     def _apply_tweak(self, week: int, weekday: int, block: int, out_id: int | None, in_id: int | None) -> None:
         """执行微调：out_id 换出（None=纯新增），in_id 换入（None=纯移除）"""
         if self.result is None or self._last_config is None:
@@ -1963,6 +2686,7 @@ class MainWindow(QMainWindow):
             if in_id not in eligible:
                 QMessageBox.warning(self, "无法调整", "该成员在此时段不满足值班条件，请重新选择。")
                 return
+        old_ids = self._slot_member_ids(week, weekday, block)
         kept = []
         for a in self.result.assignments:
             if (a.week == week and a.weekday == weekday and a.block == block
@@ -1973,15 +2697,26 @@ class MainWindow(QMainWindow):
             kept.append(Assignment(
                 week=week, weekday=weekday, block=block,
                 member_id=in_id, member_name=members[in_id].name))
+        new_ids = tuple(sorted(
+            a.member_id for a in kept
+            if a.week == week and a.weekday == weekday and a.block == block
+        ))
+        if new_ids != old_ids:
+            self._push_undo((week, weekday, block, old_ids))
+            self._redo_stack.clear()
+            self._update_undo_redo_actions()
         self.result.assignments = kept
         self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
-        self.result.gaps = compute_gaps(kept, cfg)
+        self.result.gaps = compute_gaps(
+            kept, cfg, is_off=self.is_off_day)
+        self._gap_cache = None
         # 只重写被调整的那一个时段，避免全表清空 + 全量重写
         self.db.replace_slot(week, weekday, block,
                              [a.member_id for a in kept
                               if (a.week, a.weekday, a.block) == (week, weekday, block)])
         self._stale = False
         self.refresh_schedule_tabs()
+        self.refresh_gantt()
         out_name = members[out_id].name if out_id is not None else None
         in_name = members[in_id].name if in_id is not None else None
         slot = f"第{week}周{WEEKDAY_LABELS[weekday]}{BLOCK_LABELS[block].split(' ')[0]}"
@@ -2097,14 +2832,22 @@ class MainWindow(QMainWindow):
         config = self._current_config()
         # 按周增量：只重排所选周范围，范围外的历史排班保留并作为均衡基数
         existing = self.db.load_assignments()
-        base = [a for a in existing if a.week not in config.weeks]
+        base = [
+            a for a in existing
+            if a.week not in config.weeks and not self.is_off_day(a.week, a.weekday)
+        ]
         courses, leaves, specials = self.courses(), self.leaves(), self.specials()
+        calendar = self.term_calendar()
+
+        def is_off(week: int, weekday: int) -> bool:
+            return calendar.logical_to_date(week, weekday) is None
 
         def work() -> dict:
             # 后台线程内自行构建忙时表：避免跨线程读取主线程缓存
             result = generate_schedule(members, courses, config,
                                        leaves=leaves, base_assignments=base,
-                                       special_arrangements=specials)
+                                       special_arrangements=specials,
+                                       is_off=is_off)
             return {
                 "result": result,
                 "fresh": [a for a in result.assignments if a.week in config.weeks],
@@ -2126,6 +2869,7 @@ class MainWindow(QMainWindow):
         self.result = result
         self._last_config = config
         self._stale = False
+        self._clear_undo_redo()
         self._save_last_config(config)
         self.refresh_schedule_tabs()
         self.refresh_gantt()
@@ -2144,6 +2888,50 @@ class MainWindow(QMainWindow):
             + (f"已应用 {payload['specials_n']} 条课表特殊安排。"
                if payload["specials_n"] else "")
             + (advice if advice else ""))
+
+    def clear_schedule(self) -> None:
+        """清空全部排班或当前所选周范围的排班。"""
+        assignments = self.db.load_assignments()
+        if not assignments:
+            QMessageBox.information(self, "提示", "当前没有可清空的排班记录。")
+            return
+        weeks = list(self._current_config().weeks)
+        if len(weeks) > 1:
+            week_label = f"第{weeks[0]}–{weeks[-1]}周"
+        else:
+            week_label = f"第{weeks[0]}周"
+        scope_items = [f"清空所选周范围（{week_label}）", "清空全部排班"]
+        mode, ok = QInputDialog.getItem(
+            self, "清空排班", "请选择清空范围：", scope_items, 0, False)
+        if not ok:
+            return
+        if mode == scope_items[0]:
+            week_set = set(weeks)
+            count = sum(a.week in week_set for a in assignments)
+            prompt = f"确定清空{week_label}内的 {count} 条值班安排？"
+        else:
+            count = len(assignments)
+            prompt = f"确定清空全部 {count} 条值班安排？此操作不可恢复。"
+        if count == 0:
+            QMessageBox.information(self, "提示", "所选范围内没有排班记录。")
+            return
+        if QMessageBox.question(
+                self, "确认清空", prompt,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        if mode == scope_items[0]:
+            self.db.delete_assignments_for_weeks(weeks)
+        else:
+            self.db.clear_assignments()
+        self.invalidate_cache()
+        self.result = None
+        self._last_config = None
+        self._stale = False
+        self._clear_undo_redo()
+        self.refresh_schedule_tabs()
+        self.refresh_gantt()
+        self.statusBar().showMessage(f"已清空 {count} 条值班安排。")
 
     def _export_scope(self) -> tuple | None:
         """导出前选择周数：返回 (assignments, stats, gaps, 周次文本) 或 None（取消导出）"""
@@ -2199,10 +2987,12 @@ class MainWindow(QMainWindow):
         assignments, stats, gaps, weeks_txt = scope
         # 界面控件只能在主线程读：先生成函数参数，再交给后台线程
         start = self._term_start()
+        calendar = self.term_calendar()
         self._export_bytes(
             "导出 Excel", f"值班排班表_{weeks_txt}.xlsx", "Excel", "Excel 文件 (*.xlsx)",
             weeks_txt,
-            lambda: export_excel(assignments, stats, gaps, start_date=start))
+            lambda: export_excel(
+                assignments, stats, gaps, start_date=start, calendar=calendar))
 
     def export_csv(self) -> None:
         scope = self._export_scope()
@@ -2210,9 +3000,11 @@ class MainWindow(QMainWindow):
             return
         assignments, _, _, weeks_txt = scope
         start = self._term_start()
+        calendar = self.term_calendar()
         self._export_bytes(
             "导出 CSV", f"值班排班表_{weeks_txt}.csv", "CSV", "CSV 文件 (*.csv)", weeks_txt,
-            lambda: export_csv(assignments, start_date=start))
+            lambda: export_csv(
+                assignments, start_date=start, calendar=calendar))
 
     def export_png(self) -> None:
         if self.result is None:
@@ -2226,13 +3018,18 @@ class MainWindow(QMainWindow):
         if not path:
             return
         start = self._term_start()
+        calendar = self.term_calendar()
         frame = self._pivot_frame(assignments)
         if weeks_txt.startswith("第") and "–" not in weeks_txt:
             week = int(weeks_txt[1:-1])
             weekdays = sorted({a.weekday for a in assignments}) or [1]
-            fd = week_date(start, week, weekdays[0])
-            ld = week_date(start, week, weekdays[-1])
-            subtitle = f"{weeks_txt}（{fd.month}月{fd.day}日–{ld.month}月{ld.day}日）"
+            dates = [calendar.logical_to_date(week, d) for d in weekdays]
+            dates = [d for d in dates if d is not None]
+            if dates:
+                fd, ld = min(dates), max(dates)
+                subtitle = f"{weeks_txt}（{fd.month}月{fd.day}日–{ld.month}月{ld.day}日）"
+            else:
+                subtitle = f"{weeks_txt}（法定假日，无排班日期）"
         else:
             subtitle = (f"{weeks_txt} · {start.year}年{start.month}月{start.day}日起")
         target = Path(path)

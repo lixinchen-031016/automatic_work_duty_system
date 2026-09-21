@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .database import Assignment, CourseRecord, Leave, Member, SpecialArrangement
@@ -201,11 +202,18 @@ def build_special_busy_map(
 def compute_gaps(
     assignments: list[Assignment],
     config: ScheduleConfig,
+    is_off: Callable[[int, int], bool] | None = None,
 ) -> list[tuple[int, int, int]]:
     """按「排班范围内人数不足 per_slot 的时段」重算缺口。
-    自动排班、启动恢复、手动微调共用，保证三处口径一致。"""
+    is_off 为真表示该逻辑日没有真实日期，不进入缺口网格。"""
     cnt = Counter((a.week, a.weekday, a.block) for a in assignments)
-    grid = ((w, d, b) for w in config.weeks for d in config.weekdays for b in config.blocks)
+    grid = (
+        (w, d, b)
+        for w in config.weeks
+        for d in config.weekdays
+        for b in config.blocks
+        if is_off is None or not is_off(w, d)
+    )
     return sorted(s for s in grid if cnt[s] < max(config.per_slot, 1))
 
 
@@ -285,6 +293,7 @@ def repair_gaps(
     members: list[Member],
     config: ScheduleConfig,
     gap_slots: list[tuple[int, int, int]],
+    is_off: Callable[[int, int], bool] | None = None,
 ) -> int:
     """对缺口做链式挪动修复，返回修复成功的时段数。
 
@@ -302,7 +311,8 @@ def repair_gaps(
             break
         week = slot[0]
         if week not in has_spare:
-            has_spare[week] = _week_has_spare_capacity(ctx, members, week)
+            has_spare[week] = _week_has_spare_capacity(
+                ctx, members, week, is_off)
         if not has_spare[week]:
             continue
         if ctx.slot_cnt[slot] >= config.per_slot:
@@ -350,6 +360,7 @@ def diagnose_gaps(
     assignments: list[Assignment],
     config: ScheduleConfig,
     special_arrangements: list[SpecialArrangement] | None = None,
+    is_off: Callable[[int, int], bool] | None = None,
 ) -> list[GapDiagnosis]:
     """逐条分析缺口成因：谁被课程/特殊安排/请假挡住、谁只是被上限挡住。
 
@@ -357,6 +368,10 @@ def diagnose_gaps(
     永远一致，不会出现界面解释与算法行为不符。
     """
     leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
+    if is_off is not None:
+        assignments = [
+            a for a in assignments if not is_off(a.week, a.weekday)
+        ]
     special_busy = build_special_busy_map(members, special_arrangements)
     special_set = {
         (mid, week, weekday, session)
@@ -367,7 +382,7 @@ def diagnose_gaps(
     ctx.load(assignments)
 
     out: list[GapDiagnosis] = []
-    for week, weekday, block in compute_gaps(assignments, config):
+    for week, weekday, block in compute_gaps(assignments, config, is_off):
         d = GapDiagnosis(week=week, weekday=weekday, block=block, cause=GAP_NO_FREE)
         for m in members:
             if any((week, weekday, s) in busy.get(m.id, ())
@@ -428,13 +443,20 @@ def capacity_advice(summary: dict[str, int], per_slot: int) -> str:
     return "；".join(parts) + "。"
 
 
-def _week_has_spare_capacity(ctx: ScheduleContext, members: list[Member], week: int) -> bool:
+def _week_has_spare_capacity(
+    ctx: ScheduleContext,
+    members: list[Member],
+    week: int,
+    is_off: Callable[[int, int], bool] | None = None,
+) -> bool:
     """本周是否还有人「周上限未满 且 存在可用时段」——否则修无可修"""
     cfg = ctx.config
     for m in members:
         if ctx.week_cnt[(m.id, week)] >= cfg.max_per_week:
             continue
         for d in cfg.weekdays:
+            if is_off is not None and is_off(week, d):
+                continue
             if ctx.day_cnt[(m.id, week, d)] >= cfg.max_per_day:
                 continue
             if any(ctx.reason(m.id, week, d, b) is None for b in cfg.blocks):
@@ -478,9 +500,11 @@ def generate_schedule(
     base_assignments: list[Assignment] | None = None,
     repair: bool = True,
     special_arrangements: list[SpecialArrangement] | None = None,
+    is_off: Callable[[int, int], bool] | None = None,
 ) -> ScheduleResult:
     """base_assignments：排班范围外的已有安排（按周增量模式），
     作为总次数均衡基数计入，且与新排班合并进返回结果。
+    is_off：逻辑日放假谓词，命中的日期不进入任务网格或均衡基数。
     repair=False 可关闭缺口修复（用于对比/测试）。"""
     busy = build_busy_map(members, courses)
     special_busy = build_special_busy_map(members, special_arrangements)
@@ -500,19 +524,28 @@ def generate_schedule(
     ctx = ScheduleContext(members, busy, leave_set, config, special_set)
 
     result = ScheduleResult()
-    result.assignments.extend(base_assignments or [])
+    result.assignments.extend(
+        a for a in (base_assignments or [])
+        if is_off is None or not is_off(a.week, a.weekday)
+    )
     ctx.load(result.assignments)
 
     for week in config.weeks:
+        weekdays = [
+            weekday for weekday in config.weekdays
+            if is_off is None or not is_off(week, weekday)
+        ]
+        if not weekdays:
+            continue
         # 本周任务池（每时段 per_slot 人）
         pending = [
             (weekday, block)
             for _ in range(config.per_slot)
-            for weekday in config.weekdays
+            for weekday in weekdays
             for block in config.blocks
         ]
         scarcity = _availability_counts(members, scarcity_busy, leave_set, week,
-                                        list(config.weekdays), list(config.blocks))
+                                        weekdays, list(config.blocks))
         # 每条任务只抽一次随机数作为平手排序键，主排序仍是「覆盖均衡」
         keys = {i: rng.random() for i in range(len(pending))}
         keys_idx = list(range(len(pending)))
@@ -538,10 +571,10 @@ def generate_schedule(
                 member_id=chosen.id, member_name=chosen.name,
             ))
 
-    result.gaps = compute_gaps(result.assignments, config)
+    result.gaps = compute_gaps(result.assignments, config, is_off)
     repaired = 0
     if repair and result.gaps:
-        repaired = repair_gaps(ctx, members, config, result.gaps)
+        repaired = repair_gaps(ctx, members, config, result.gaps, is_off)
     if repaired:
         # 输出统一按 (周, 星期, 时段, 成员) 排序，与数据库读取顺序一致，
         # 保证「生成 -> 落库 -> 恢复」三处明细顺序稳定可对比
@@ -552,7 +585,7 @@ def generate_schedule(
             for (mid, w, d, b) in sorted(ctx.assigned, key=lambda t: (t[1], t[2], t[3], t[0]))
         ]
     result.repaired = repaired
-    result.gaps = compute_gaps(result.assignments, config)
+    result.gaps = compute_gaps(result.assignments, config, is_off)
     result.member_stats = rebuild_member_stats(members, result.assignments)
     return result
 
