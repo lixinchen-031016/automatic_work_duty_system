@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 from .calendar import TermCalendar
 from .database import Assignment, CourseRecord, Leave, Member, SpecialArrangement
@@ -56,6 +56,43 @@ class AvailabilityMatrix:
         """全员共同空闲的 (星期, 时段)，方便安排集体任务"""
         return [slot for i, slot in enumerate(self.slots)
                 if self.member_count > 0 and self.free_counts[i] == self.member_count]
+
+
+@dataclass(frozen=True)
+class CalendarGanttColumn:
+    """自然日期驱动的甘特图列。"""
+
+    date: date
+    block: int
+    logical_week: int | None = None
+    logical_weekday: int | None = None
+    is_off: bool = False
+
+
+@dataclass
+class CalendarAvailabilityMatrix:
+    """自然周甘特图：补课日归属其真实日期所在周。"""
+
+    week: int
+    member_names: list[str]
+    columns: list[CalendarGanttColumn]
+    free: list[list[bool]]
+    busy_courses: dict[tuple[int, date, int], list[str]]
+    free_counts: list[int]
+    leave_info: dict[tuple[int, date], str] = field(default_factory=dict)
+    duty_cells: set[tuple[int, date, int]] = field(default_factory=set)
+    special_info: dict[tuple[int, date, int], list[str]] = field(default_factory=dict)
+
+    @property
+    def member_count(self) -> int:
+        return len(self.member_names)
+
+    @property
+    def all_free_columns(self) -> list[CalendarGanttColumn]:
+        return [
+            column for i, column in enumerate(self.columns)
+            if self.member_count > 0 and self.free_counts[i] == self.member_count
+        ]
 
 
 def slot_header(
@@ -237,8 +274,138 @@ def build_availability(
     )
 
 
+def build_calendar_availability(
+    members: list[Member],
+    courses: list[CourseRecord],
+    calendar: TermCalendar,
+    week: int,
+    weekdays: list[int],
+    blocks: list[int],
+    leaves: list[Leave] | None = None,
+    assignments: list[Assignment] | None = None,
+    busy: dict[int, set] | None = None,
+    special_arrangements: list[SpecialArrangement] | None = None,
+) -> CalendarAvailabilityMatrix:
+    """按自然日期周构建甘特图；补课日自动纳入实际周末。"""
+    if busy is None:
+        busy = build_busy_map(members, courses)
+    special_busy = build_special_busy_map(members, special_arrangements)
+    leave_map = {
+        (leave.member_id, leave.week, leave.weekday): leave.reason
+        for leave in (leaves or [])
+    }
+    duty_set = {
+        (a.member_id, a.week, a.weekday, a.block)
+        for a in (assignments or [])
+    }
+    course_index: dict[tuple[int, int, int, int], set[str]] = {}
+    member_ids = {member.id for member in members}
+    for course in courses:
+        if course.member_id not in member_ids:
+            continue
+        for week_number in course.week_list:
+            for session in course.session_list:
+                course_index.setdefault(
+                    (course.member_id, week_number, course.weekday, session),
+                    set()).add(course.course_name)
+    special_index: dict[tuple[int, int, int, int], set[str]] = {}
+    for arrangement in special_arrangements or []:
+        if arrangement.member_id not in member_ids:
+            continue
+        label = arrangement.reason.strip() or "其他安排"
+        for week_number in arrangement.week_list:
+            for session in arrangement.session_list:
+                special_index.setdefault(
+                    (arrangement.member_id, week_number,
+                     arrangement.weekday, session), set()).add(label)
+
+    week_start = calendar.term_start + timedelta(days=(week - 1) * 7)
+    class_dates = {
+        entry.date for entry in calendar.entries if entry.override_type == "class"
+    }
+    columns: list[CalendarGanttColumn] = []
+    logical_by_column: list[tuple[int, int] | None] = []
+    for day_offset in range(7):
+        actual_date = week_start + timedelta(days=day_offset)
+        logical = calendar.date_to_logical(actual_date)
+        include = actual_date.isoweekday() in weekdays or actual_date in class_dates
+        if not include:
+            continue
+        for block in sorted(blocks):
+            columns.append(CalendarGanttColumn(
+                date=actual_date,
+                block=block,
+                logical_week=logical[0] if logical else None,
+                logical_weekday=logical[1] if logical else None,
+                is_off=logical is None,
+            ))
+            logical_by_column.append(logical)
+
+    free: list[list[bool]] = []
+    busy_courses: dict[tuple[int, date, int], list[str]] = {}
+    leave_info: dict[tuple[int, date], str] = {}
+    duty_cells: set[tuple[int, date, int]] = set()
+    special_info: dict[tuple[int, date, int], list[str]] = {}
+    for row, member in enumerate(members):
+        member_busy = busy.get(member.id, ())
+        member_special = special_busy.get(member.id, ())
+        row_free: list[bool] = []
+        for column, logical in zip(columns, logical_by_column):
+            if logical is None:
+                row_free.append(False)
+                continue
+            logical_week, logical_weekday = logical
+            if (member.id, logical_week, logical_weekday) in leave_map:
+                row_free.append(False)
+                leave_info[(row, column.date)] = leave_map[
+                    (member.id, logical_week, logical_weekday)]
+                continue
+            if (member.id, logical_week, logical_weekday, column.block) in duty_set:
+                row_free.append(False)
+                duty_cells.add((row, column.date, column.block))
+                continue
+            names: set[str] = set()
+            special_names: set[str] = set()
+            is_free = True
+            for session in BLOCK_SESSIONS[column.block]:
+                if (logical_week, logical_weekday, session) in member_busy:
+                    is_free = False
+                    names |= course_index.get(
+                        (member.id, logical_week, logical_weekday, session),
+                        set())
+                if (logical_week, logical_weekday, session) in member_special:
+                    is_free = False
+                    special_names |= special_index.get(
+                        (member.id, logical_week, logical_weekday, session),
+                        set())
+            row_free.append(is_free)
+            if names:
+                busy_courses[(row, column.date, column.block)] = sorted(names)
+            if special_names:
+                special_info[(row, column.date, column.block)] = sorted(special_names)
+        free.append(row_free)
+
+    free_counts = [
+        sum(1 for row in free if row[index])
+        for index in range(len(columns))
+    ]
+    return CalendarAvailabilityMatrix(
+        week=week,
+        member_names=[member.name for member in members],
+        columns=columns,
+        free=free,
+        busy_courses=busy_courses,
+        free_counts=free_counts,
+        leave_info=leave_info,
+        duty_cells=duty_cells,
+        special_info=special_info,
+    )
+
+
 def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
     """导出带填充色的 Excel 甘特图，返回文件字节"""
+    if isinstance(matrix, CalendarAvailabilityMatrix):
+        return _export_calendar_gantt_excel(matrix)
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -366,6 +533,104 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
     for i in range(len(columns)):
         ws.column_dimensions[get_column_letter(2 + i)].width = 10
 
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
+    """导出自然日期周版本的空闲甘特图。"""
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    FREE_FILL = PatternFill("solid", fgColor="C9F2CF")
+    BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
+    ALL_FREE_FILL = PatternFill("solid", fgColor="FFD9A8")
+    LEAVE_FILL = PatternFill("solid", fgColor="FFD6D2")
+    OFF_FILL = PatternFill("solid", fgColor="FFD6D2")
+    SPECIAL_FILL = PatternFill("solid", fgColor="E5D8FF")
+    DUTY_FILL = PatternFill("solid", fgColor="B8D9FF")
+    HEADER_FILL = PatternFill("solid", fgColor="007AFF")
+    THIN = Side(style="thin", color="FFFFFF")
+    border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"第{matrix.week}周空闲甘特图"
+    ws.cell(row=1, column=1, value="成员").font = Font(bold=True, color="FFFFFF")
+    ws.cell(row=1, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    for index, column in enumerate(matrix.columns):
+        cell = ws.cell(row=1, column=2 + index,
+                       value=f"{column.date.month:02d}-{column.date.day:02d}")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        weekday = WEEKDAY_LABELS[column.date.isoweekday()]
+        suffix = "（放假）" if column.is_off else ""
+        block = BLOCK_LABELS[column.block].split(" ")[0]
+        cell2 = ws.cell(row=2, column=2 + index,
+                        value=f"{weekday}{suffix} · {block}")
+        cell2.font = Font(bold=True, color="FFFFFF")
+        cell2.fill = HEADER_FILL
+        cell2.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row, name in enumerate(matrix.member_names):
+        excel_row = 3 + row
+        head = ws.cell(row=excel_row, column=1, value=name)
+        head.font = Font(bold=True)
+        head.alignment = Alignment(horizontal="center", vertical="center")
+        for index, column in enumerate(matrix.columns):
+            cell = ws.cell(row=excel_row, column=2 + index)
+            if column.is_off:
+                cell.value = "放假"
+                cell.fill = OFF_FILL
+                cell.font = Font(bold=True, color="B3261E")
+            elif (row, column.date) in matrix.leave_info:
+                reason = matrix.leave_info[(row, column.date)]
+                cell.value = f"请假：{reason}" if reason else "请假"
+                cell.fill = LEAVE_FILL
+                cell.font = Font(color="B3261E")
+            elif (row, column.date, column.block) in matrix.duty_cells:
+                cell.value = "值班"
+                cell.fill = DUTY_FILL
+                cell.font = Font(bold=True, color="0A5AA8")
+            elif matrix.special_info.get((row, column.date, column.block)):
+                names = matrix.special_info[(row, column.date, column.block)]
+                cell.value = "其他安排：" + "、".join(names)
+                cell.fill = SPECIAL_FILL
+                cell.font = Font(color="6E3DC2")
+            else:
+                is_free = matrix.free[row][index]
+                names = matrix.busy_courses.get((row, column.date, column.block), [])
+                cell.value = "" if is_free else "、".join(names)
+                cell.fill = FREE_FILL if is_free else BUSY_FILL
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    summary_row = 3 + len(matrix.member_names)
+    head = ws.cell(row=summary_row, column=1, value="空闲人数")
+    head.font = Font(bold=True)
+    for index, column in enumerate(matrix.columns):
+        cell = ws.cell(row=summary_row, column=2 + index)
+        if column.is_off:
+            cell.value = "放假"
+            cell.fill = OFF_FILL
+            cell.font = Font(bold=True, color="B3261E")
+        else:
+            count = matrix.free_counts[index]
+            cell.value = f"{count}/{matrix.member_count}"
+            if matrix.member_count > 0 and count == matrix.member_count:
+                cell.fill = ALL_FREE_FILL
+                cell.font = Font(bold=True, color="B25E00")
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.freeze_panes = "B3"
+    ws.column_dimensions["A"].width = 12
+    for index in range(len(matrix.columns)):
+        ws.column_dimensions[get_column_letter(2 + index)].width = 10
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

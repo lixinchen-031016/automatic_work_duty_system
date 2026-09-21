@@ -88,9 +88,8 @@ from duty_system.exporter import (
     export_leaves_excel,
 )
 from duty_system.gantt import (
-    AvailabilityMatrix,
-    build_availability,
-    display_columns,
+    CalendarAvailabilityMatrix,
+    build_calendar_availability,
     export_gantt_excel,
     slot_header,
 )
@@ -614,7 +613,7 @@ class MainWindow(QMainWindow):
             db_path = Path(stored) if stored and Path(stored).exists() else DB_PATH
         self.db = Database(db_path)
         self.result: ScheduleResult | None = None
-        self.gantt_matrix: AvailabilityMatrix | None = None
+        self.gantt_matrix: CalendarAvailabilityMatrix | None = None
         self._stale = False
         self._last_config: ScheduleConfig | None = None
         self._pivot_rows: list[tuple[int, int]] = []
@@ -714,6 +713,10 @@ class MainWindow(QMainWindow):
     def is_off_day(self, week: int, weekday: int) -> bool:
         """逻辑教学日是否为无真实日期的纯假日。"""
         return self.term_calendar().logical_to_date(week, weekday) is None
+
+    def is_class_day(self, week: int, weekday: int) -> bool:
+        """逻辑教学日是否对应一个周末补课日。"""
+        return self.term_calendar().is_class_day(week, weekday)
 
     def busy_map(self) -> dict[int, set]:
         """课程忙时表（按 成员 -> {(周, 星期, 节次)}）"""
@@ -1285,7 +1288,8 @@ class MainWindow(QMainWindow):
         result.assignments = assignments
         result.member_stats = rebuild_member_stats(members, assignments)
         result.gaps = compute_gaps(
-            assignments, config, is_off=self.is_off_day)
+            assignments, config, is_off=self.is_off_day,
+            is_class=self.is_class_day)
         self.result = result
         self._last_config = config
         self._stale = False
@@ -1939,7 +1943,8 @@ class MainWindow(QMainWindow):
         cfg = self._last_config or self._load_last_config() or self._current_config()
         diagnoses = diagnose_gaps(
             self.members(), self.busy_map(), self.leaves(), result.assignments,
-            cfg, special_arrangements=self.specials(), is_off=self.is_off_day)
+            cfg, special_arrangements=self.specials(), is_off=self.is_off_day,
+            is_class=self.is_class_day)
         self._gap_cache = (result, diagnoses)
         return diagnoses
 
@@ -2019,9 +2024,12 @@ class MainWindow(QMainWindow):
 
     def refresh_gantt(self) -> None:
         members = self.members()
-        weekdays = [d for d, cb in self.weekday_checks.items() if cb.isChecked()]
+        checked_weekdays = [
+            d for d, cb in self.weekday_checks.items() if cb.isChecked()]
         blocks = [b for b, cb in self.block_checks.items() if cb.isChecked()]
-        if not members or not weekdays or not blocks:
+        calendar = self.term_calendar()
+        week = self.gantt_week.value()
+        if not members or not blocks:
             self.gantt_matrix = None
             self.gantt_table.clearContents()
             self.gantt_table.setRowCount(0)
@@ -2030,21 +2038,24 @@ class MainWindow(QMainWindow):
             self.btn_export_gantt.setEnabled(False)
             return
 
-        matrix = build_availability(
-            members, self.courses(),
-            self.gantt_week.value(), weekdays, blocks,
+        matrix = build_calendar_availability(
+            members, self.courses(), calendar,
+            week, checked_weekdays, blocks,
             leaves=self.leaves(),
             assignments=self.result.assignments if self.result else None,
             busy=self.busy_map(),
             special_arrangements=self.specials(),
-            calendar=self.term_calendar())
+        )
         self.gantt_matrix = matrix
         self._fill_gantt_table(matrix)
 
-        all_free = matrix.all_free_slots
+        all_free = matrix.all_free_columns
         if all_free:
             text = "、".join(
-                f"{WEEKDAY_LABELS[d]} {BLOCK_LABELS[b].split(' ')[0]}" for d, b in all_free)
+                f"{column.date.month}月{column.date.day}日"
+                f" {WEEKDAY_LABELS[column.date.isoweekday()]}"
+                f" {BLOCK_LABELS[column.block].split(' ')[0]}"
+                for column in all_free)
             self.gantt_hint.setText(
                 f"第{matrix.week}周全员空闲时段共 {len(all_free)} 个（橙色高亮列）：{text}。"
                 "适合安排需要全员参加的任务。")
@@ -2097,8 +2108,8 @@ class MainWindow(QMainWindow):
         self._apply_cell(item, state)
         cache[key] = state
 
-    def _fill_gantt_table(self, m: AvailabilityMatrix) -> None:
-        """行=成员（末行为汇总），列=星期x时段；
+    def _fill_gantt_table(self, m: CalendarAvailabilityMatrix) -> None:
+        """行=成员（末行为汇总），列=自然日期x时段；
         空闲绿色、有课灰色、请假红色、特殊安排紫色、值班蓝色、全员空闲橙色。
 
         复用已有 QTableWidgetItem：成员多时表格有数千个单元格，
@@ -2115,7 +2126,7 @@ class MainWindow(QMainWindow):
         DUTY_COLOR = QColor("#0a5aa8")
         ALL_FREE_COLOR = QColor("#b25e00")
 
-        columns = display_columns(m)
+        columns = m.columns
         rows, cols = m.member_count + 1, len(columns)
         if t.rowCount() != rows or t.columnCount() != cols:
             t.clearContents()
@@ -2127,43 +2138,42 @@ class MainWindow(QMainWindow):
             cache = self._gantt_cell_state
         t.setVerticalHeaderLabels(m.member_names + ["空闲人数"])
         t.setHorizontalHeaderLabels([
-            slot_header(c.weekday, c.block, c.date, is_off=c.is_off)
+            slot_header(c.date.isoweekday(), c.block, c.date, is_off=c.is_off)
             for c in columns])
 
         week = m.week
         for r in range(m.member_count):
             free_row = m.free[r]
             for i, column in enumerate(columns):
-                d, b = column.weekday, column.block
-                leave_reason = m.leave_info.get((r, d))
+                actual = column.date
+                weekday = actual.isoweekday()
+                b = column.block
+                leave_reason = m.leave_info.get((r, actual))
                 if column.is_off:
-                    actual = column.date
-                    date_text = (f"（{actual.month}月{actual.day}日）"
-                                 if actual is not None else "")
+                    date_text = f"（{actual.month}月{actual.day}日）"
                     state = ("假", LEAVE, LEAVE_COLOR,
-                             f"第{week}周 {WEEKDAY_LABELS[d]}{date_text}：法定假日放假", True)
+                             f"第{week}周 {WEEKDAY_LABELS[weekday]}{date_text}：法定假日放假", True)
                 elif leave_reason is not None:
                     reason = f"（{leave_reason}）" if leave_reason else ""
                     state = ("假", LEAVE, LEAVE_COLOR,
-                             f"第{week}周 {WEEKDAY_LABELS[d]}：请假{reason}", True)
-                elif (r, d, b) in m.duty_cells:
+                             f"第{week}周 {WEEKDAY_LABELS[weekday]}：请假{reason}", True)
+                elif (r, actual, b) in m.duty_cells:
                     state = ("值", DUTY, DUTY_COLOR,
-                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：已排值班", True)
-                elif (r, d, b) in m.special_info:
-                    reasons = m.special_info[(r, d, b)]
+                             f"第{week}周 {WEEKDAY_LABELS[weekday]} {BLOCK_LABELS[b]}：已排值班", True)
+                elif (r, actual, b) in m.special_info:
+                    reasons = m.special_info[(r, actual, b)]
                     state = ("特", SPECIAL, SPECIAL_COLOR,
-                             f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：其他安排\n"
+                             f"第{week}周 {WEEKDAY_LABELS[weekday]} {BLOCK_LABELS[b]}：其他安排\n"
                              + "\n".join(reasons), True)
                 else:
-                    assert column.slot_index is not None
-                    if free_row[column.slot_index]:
+                    if free_row[i]:
                         state = ("", FREE, None,
-                                 f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：空闲",
+                                 f"第{week}周 {WEEKDAY_LABELS[weekday]} {BLOCK_LABELS[b]}：空闲",
                                  False)
                     else:
-                        names = m.busy_courses.get((r, d, b), [])
+                        names = m.busy_courses.get((r, actual, b), [])
                         state = ("课", BUSY, BUSY_COLOR,
-                                 f"第{week}周 {WEEKDAY_LABELS[d]} {BLOCK_LABELS[b]}：\n"
+                                 f"第{week}周 {WEEKDAY_LABELS[weekday]} {BLOCK_LABELS[b]}：\n"
                                  + "\n".join(names), True)
                 self._fill_cell(t, r, i, state, cache)
 
@@ -2171,11 +2181,10 @@ class MainWindow(QMainWindow):
         for i, column in enumerate(columns):
             if column.is_off:
                 state = ("放假", LEAVE, LEAVE_COLOR,
-                         f"第{week}周 {WEEKDAY_LABELS[column.weekday]}：法定假日放假",
+                         f"第{week}周 {WEEKDAY_LABELS[column.date.isoweekday()]}：法定假日放假",
                          True)
             else:
-                assert column.slot_index is not None
-                count = m.free_counts[column.slot_index]
+                count = m.free_counts[i]
                 all_free = count == m.member_count
                 state = (f"{count}/{m.member_count}",
                          ALL_FREE if all_free else QColor(0, 0, 0, 0),
@@ -2184,8 +2193,7 @@ class MainWindow(QMainWindow):
             head = t.horizontalHeaderItem(i)
             if head is not None:
                 highlighted = column.is_off or (
-                    not column.is_off
-                    and m.free_counts[column.slot_index] == m.member_count)
+                    not column.is_off and m.free_counts[i] == m.member_count)
                 head.setForeground(QBrush(QColor(
                     "#ff9500" if highlighted else "#86868b")))
 
@@ -2636,7 +2644,8 @@ class MainWindow(QMainWindow):
         self.result.assignments = kept
         self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
         self.result.gaps = compute_gaps(
-            kept, self._last_config, is_off=self.is_off_day)
+            kept, self._last_config, is_off=self.is_off_day,
+            is_class=self.is_class_day)
         self._gap_cache = None
         self._stale = False
         self.refresh_schedule_tabs()
@@ -2708,7 +2717,7 @@ class MainWindow(QMainWindow):
         self.result.assignments = kept
         self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
         self.result.gaps = compute_gaps(
-            kept, cfg, is_off=self.is_off_day)
+            kept, cfg, is_off=self.is_off_day, is_class=self.is_class_day)
         self._gap_cache = None
         # 只重写被调整的那一个时段，避免全表清空 + 全量重写
         self.db.replace_slot(week, weekday, block,
@@ -2823,11 +2832,21 @@ class MainWindow(QMainWindow):
             return
         weekdays = [d for d, cb in self.weekday_checks.items() if cb.isChecked()]
         blocks = [b for b, cb in self.block_checks.items() if cb.isChecked()]
-        if not weekdays or not blocks:
-            QMessageBox.warning(self, "提示", "请至少选择一个值班星期和值班时段。")
+        if not blocks:
+            QMessageBox.warning(self, "提示", "请至少选择一个值班时段。")
             return
         if self.week_from.value() > self.week_to.value():
             QMessageBox.warning(self, "提示", "起始周不能大于结束周。")
+            return
+        calendar = self.term_calendar()
+        has_class_day = any(
+            calendar.is_class_day(week, weekday)
+            for week in range(self.week_from.value(), self.week_to.value() + 1)
+            for weekday in range(1, 8)
+        )
+        if not weekdays and not has_class_day:
+            QMessageBox.warning(
+                self, "提示", "请至少选择一个值班星期；若该范围有补课日，也可自动纳入。")
             return
         config = self._current_config()
         # 按周增量：只重排所选周范围，范围外的历史排班保留并作为均衡基数
@@ -2837,17 +2856,19 @@ class MainWindow(QMainWindow):
             if a.week not in config.weeks and not self.is_off_day(a.week, a.weekday)
         ]
         courses, leaves, specials = self.courses(), self.leaves(), self.specials()
-        calendar = self.term_calendar()
 
         def is_off(week: int, weekday: int) -> bool:
             return calendar.logical_to_date(week, weekday) is None
+
+        def is_class(week: int, weekday: int) -> bool:
+            return calendar.is_class_day(week, weekday)
 
         def work() -> dict:
             # 后台线程内自行构建忙时表：避免跨线程读取主线程缓存
             result = generate_schedule(members, courses, config,
                                        leaves=leaves, base_assignments=base,
                                        special_arrangements=specials,
-                                       is_off=is_off)
+                                       is_off=is_off, is_class=is_class)
             return {
                 "result": result,
                 "fresh": [a for a in result.assignments if a.week in config.weeks],

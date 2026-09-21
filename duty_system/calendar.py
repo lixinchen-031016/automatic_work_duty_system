@@ -173,6 +173,14 @@ class TermCalendar:
         """逻辑日是否被纯放假（没有对应真实日期）。"""
         return self.logical_to_date(week, weekday) is None
 
+    def is_class_day(self, week: int, weekday: int) -> bool:
+        """逻辑日是否通过周末补课映射获得了真实上课日期。"""
+        nat = natural_date(self.term_start, week, weekday)
+        override = self._by_date.get(nat)
+        if override is None or override.override_type != "off":
+            return False
+        return len(self._classes_by_target.get((week, weekday), ())) == 1
+
     def off_natural_date(self, week: int, weekday: int) -> date | None:
         """返回逻辑工作日的自然日期；若该日设为 off，则返回该日期。"""
         nat = natural_date(self.term_start, week, weekday)

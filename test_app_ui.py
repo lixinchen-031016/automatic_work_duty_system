@@ -531,6 +531,61 @@ def test_clear_schedule_button_removes_duties(
     assert not window.btn_clear_schedule.isEnabled()
 
 
+def test_weekend_makeup_day_is_scheduled_without_weekend_checkbox(
+    window, qt_app,
+) -> None:
+    """调休补课日应自动加入排班与甘特图，无需勾选星期六。"""
+    window.db.upsert_member(ParsedSchedule(
+        name="周末补课测试", student_id="9001", class_name="测试班", courses=[]))
+    window.db.upsert_calendar([
+        CalendarEntry(date(2026, 10, 6), "off"),
+        CalendarEntry(date(2026, 9, 20), "class", 4, 2),
+    ])
+    window.invalidate_cache()
+    window.refresh_members()
+    window.term_start.setDate(
+        window.term_start.date().fromString("2026-09-14", "yyyy-MM-dd"))
+    for weekday, checkbox in window.weekday_checks.items():
+        checkbox.setChecked(weekday <= 5)
+    window.week_from.setValue(4)
+    window.week_to.setValue(4)
+    window.max_week.setValue(10)
+
+    window.generate()
+    assert wait_idle(window, qt_app)
+    assert any(
+        (a.week, a.weekday) == (4, 2)
+        for a in window.result.assignments
+    ), "补课周末对应的逻辑周二应自动排班"
+
+    window.gantt_week.setValue(1)
+    window.refresh_gantt()
+    headers = [
+        window.gantt_table.horizontalHeaderItem(i).text()
+        for i in range(window.gantt_table.columnCount())
+    ]
+    assert any("09-20" in header for header in headers), \
+        "补课日期应显示在它真实所在的自然周，无需勾选周末"
+    assert any("09-14" in header for header in headers), \
+        "同一自然周的正常工作日也应显示"
+    assert any(
+        "09-20" in header
+        and window.gantt_table.item(0, index).text() == "值"
+        for index, header in enumerate(headers)
+    ), "补课日对应的实际排班应在甘特图中标蓝"
+
+    window.gantt_week.setValue(4)
+    window.refresh_gantt()
+    week4_headers = [
+        window.gantt_table.horizontalHeaderItem(i).text()
+        for i in range(window.gantt_table.columnCount())
+    ]
+    assert any("10-06" in header for header in week4_headers), \
+        "放假的原工作日应显示在实际周次"
+    assert any("10-05" in header for header in week4_headers), \
+        "同周正常工作日仍应正常显示"
+
+
 def test_stale_marking_and_empty_state(window) -> None:
     """参数变化标记结果过期；无结果时给出引导文案"""
     window.refresh_members()
@@ -703,22 +758,23 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
     # 抽查若干单元格：状态必须与矩阵一致
     checked = {"free": 0, "busy": 0, "duty": 0}
     for r in range(m.member_count):
-        for i, (d, b) in enumerate(m.slots):
+        for i, column in enumerate(m.columns):
             item = t.item(r, i)
-            if (r, d, b) in m.duty_cells:
+            if (r, column.date, column.block) in m.duty_cells:
                 assert item.text() == "值" and "已排值班" in item.toolTip()
                 checked["duty"] += 1
             elif m.free[r][i]:
                 assert item.text() == "" and "空闲" in item.toolTip()
                 checked["free"] += 1
             else:
-                assert item.text() == "课" and m.busy_courses.get((r, d, b))
+                assert item.text() == "课" and m.busy_courses.get(
+                    (r, column.date, column.block))
                 checked["busy"] += 1
     assert checked["duty"] > 0 and checked["free"] > 0 and checked["busy"] > 0
 
     # 汇总行
     row = m.member_count
-    for i in range(len(m.slots)):
+    for i in range(len(m.columns)):
         assert t.item(row, i).text() == f"{m.free_counts[i]}/{m.member_count}"
 
     # 请假：整行标「假」并带上原因
@@ -730,8 +786,8 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
     m2 = window.gantt_matrix
     row_of = {mem.id: r for r, mem in enumerate(window.members())}
     r0 = row_of[member_id]
-    for i, (d, _b) in enumerate(m2.slots):
-        if d == 2:
+    for i, column in enumerate(m2.columns):
+        if column.logical_week == 1 and column.logical_weekday == 2:
             assert t.item(r0, i).text() == "假" and "生病" in t.item(r0, i).toolTip()
 
 
@@ -748,9 +804,12 @@ def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
     matrix = window.gantt_matrix
     assert matrix is not None
     row = next(r for r, m in enumerate(window.members()) if m.id == member_id)
-    col = matrix.slots.index((1, 1))
+    col = next(
+        i for i, column in enumerate(matrix.columns)
+        if column.logical_week == 2 and column.logical_weekday == 1
+        and column.block == 1)
     assert matrix.free[row][col] is False
-    assert matrix.special_info[(row, 1, 1)] == ["固定实习"]
+    assert matrix.special_info[(row, matrix.columns[col].date, 1)] == ["固定实习"]
     item = window.gantt_table.item(row, col)
     assert item.text() == "特" and "其他安排" in item.toolTip()
     assert item.background().color().name() == "#e5d8ff"

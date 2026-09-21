@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+from datetime import date
 
+from duty_system.calendar import CalendarEntry, TermCalendar
 from duty_system.database import Assignment, CourseRecord, Member, SpecialArrangement
 from duty_system.gantt import build_availability
 from duty_system.parser import BLOCK_SESSIONS, WHOLE_WEEK_WEEKDAY
@@ -365,3 +367,25 @@ def test_off_days_leave_grid_and_base_balancing() -> None:
     }
     assert merged.member_stats[members[0].id]["total"] == sum(
         a.member_id == members[0].id for a in merged.assignments)
+
+
+def test_makeup_weekend_is_auto_added_when_logical_weekday_unchecked() -> None:
+    """周末补课日即使所属逻辑星期未勾选，也应自动进入排班网格。"""
+    members = make_members(2)
+    calendar = TermCalendar(date(2026, 9, 14), [
+        CalendarEntry(date(2026, 10, 6), "off"),
+        CalendarEntry(date(2026, 9, 20), "class", 4, 2),
+    ])
+    config = ScheduleConfig(
+        weeks=range(4, 5), weekdays=[1], blocks=[1],
+        per_slot=1, max_per_week=2, max_per_day=1, seed=5)
+
+    result = generate_schedule(
+        members, [], config,
+        is_off=calendar.is_off, is_class=calendar.is_class_day)
+    assigned = {(a.week, a.weekday, a.block) for a in result.assignments}
+    assert (4, 2, 1) in assigned, "补课周末对应的逻辑周二应被自动加入网格"
+    assert (4, 2, 1) not in result.gaps
+    assert result.gaps == compute_gaps(
+        result.assignments, config,
+        is_off=calendar.is_off, is_class=calendar.is_class_day)
