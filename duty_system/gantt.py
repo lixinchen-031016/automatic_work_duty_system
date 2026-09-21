@@ -298,27 +298,6 @@ def build_calendar_availability(
         (a.member_id, a.week, a.weekday, a.block)
         for a in (assignments or [])
     }
-    course_index: dict[tuple[int, int, int, int], set[str]] = {}
-    member_ids = {member.id for member in members}
-    for course in courses:
-        if course.member_id not in member_ids:
-            continue
-        for week_number in course.week_list:
-            for session in course.session_list:
-                course_index.setdefault(
-                    (course.member_id, week_number, course.weekday, session),
-                    set()).add(course.course_name)
-    special_index: dict[tuple[int, int, int, int], set[str]] = {}
-    for arrangement in special_arrangements or []:
-        if arrangement.member_id not in member_ids:
-            continue
-        label = arrangement.reason.strip() or "其他安排"
-        for week_number in arrangement.week_list:
-            for session in arrangement.session_list:
-                special_index.setdefault(
-                    (arrangement.member_id, week_number,
-                     arrangement.weekday, session), set()).add(label)
-
     week_start = calendar.term_start + timedelta(days=(week - 1) * 7)
     class_dates = {
         entry.date for entry in calendar.entries if entry.override_type == "class"
@@ -340,6 +319,45 @@ def build_calendar_availability(
                 is_off=logical is None,
             ))
             logical_by_column.append(logical)
+
+    # 只索引当前自然周实际出现的逻辑日，避免 300 人场景把全部课程展开到
+    # 所有周次/节次（会放大成数十万次无用的集合写入）。
+    needed_weeks_by_weekday: dict[int, set[int]] = {}
+    for logical in logical_by_column:
+        if logical is None:
+            continue
+        logical_week, logical_weekday = logical
+        needed_weeks_by_weekday.setdefault(logical_weekday, set()).add(logical_week)
+    member_ids = {member.id for member in members}
+    course_index: dict[tuple[int, int, int, int], set[str]] = {}
+    for course in courses:
+        if course.member_id not in member_ids:
+            continue
+        needed_weeks = needed_weeks_by_weekday.get(course.weekday, set())
+        if not needed_weeks:
+            continue
+        active_weeks = needed_weeks.intersection(course.week_list)
+        if not active_weeks:
+            continue
+        for week_number in active_weeks:
+            for session in course.session_list:
+                course_index.setdefault(
+                    (course.member_id, week_number, course.weekday, session),
+                    set()).add(course.course_name)
+    special_index: dict[tuple[int, int, int, int], set[str]] = {}
+    for arrangement in special_arrangements or []:
+        needed_weeks = needed_weeks_by_weekday.get(arrangement.weekday, set())
+        if (arrangement.member_id not in member_ids or not needed_weeks):
+            continue
+        active_weeks = needed_weeks.intersection(arrangement.week_list)
+        if not active_weeks:
+            continue
+        label = arrangement.reason.strip() or "其他安排"
+        for week_number in active_weeks:
+            for session in arrangement.session_list:
+                special_index.setdefault(
+                    (arrangement.member_id, week_number,
+                     arrangement.weekday, session), set()).add(label)
 
     free: list[list[bool]] = []
     busy_courses: dict[tuple[int, date, int], list[str]] = {}
