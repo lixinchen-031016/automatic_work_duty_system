@@ -218,7 +218,7 @@ def test_gantt() -> None:
             expect_free = all((1, d, s) not in busy.get(mem.id, ()) for s in BLOCK_SESSIONS[b])
             assert m.free[r][i] == expect_free, "甘特图空闲判定与排班算法不一致"
 
-    # 汇总行：各时段空闲人数
+    # 汇总数据：各时段空闲人数
     for i in range(len(m.slots)):
         assert m.free_counts[i] == sum(1 for row in m.free if row[i]), "空闲人数统计错误"
 
@@ -233,9 +233,15 @@ def test_gantt() -> None:
     m18 = build_availability(members, courses, week=18, weekdays=weekdays, blocks=blocks)
     assert m18.member_count == 5 and len(m18.slots) == 25
 
-    # 导出带填充色的 Excel 甘特图
+    # 导出带填充色的 Excel 甘特图；行=时段、列=成员，汇总放最后一列
     data = export_gantt_excel(m)
     assert data[:2] == b"PK" and len(data) > 4000, "甘特图 Excel 导出错误"
+    from io import BytesIO
+    from openpyxl import load_workbook
+    ws = load_workbook(BytesIO(data)).active
+    assert ws.cell(1, 2).value == m.member_names[0], "Excel 横轴应为成员"
+    assert "周一" in ws.cell(3, 1).value, "Excel 纵轴应为日期x时段"
+    assert ws.cell(1, 2 + m.member_count).value == "空闲人数", "Excel 末列应为汇总"
     print(f"[6] 甘特图: 通过（{m.member_count} 成员 x {len(m.slots)} 时段，"
           f"第1周全员空闲 {len(m.all_free_slots)} 个 / 第18周 {len(m18.all_free_slots)} 个，"
           f"导出 xlsx {len(data)}B）")

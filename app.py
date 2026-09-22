@@ -1165,7 +1165,9 @@ class MainWindow(QMainWindow):
         gantt_header.setSectionResizeMode(QHeaderView.ResizeToContents)
         gantt_header.setStretchLastSection(False)
         gantt_header.setMinimumHeight(44)
-        self.gantt_table.verticalHeader().setDefaultSectionSize(28)
+        gantt_vertical_header = self.gantt_table.verticalHeader()
+        gantt_vertical_header.setDefaultSectionSize(44)
+        gantt_vertical_header.setMinimumWidth(112)
         v5.addWidget(_card(self.gantt_table), stretch=1)
         self.tabs.addTab(tab5, "空闲甘特图")
 
@@ -2057,11 +2059,11 @@ class MainWindow(QMainWindow):
                 f" {BLOCK_LABELS[column.block].split(' ')[0]}"
                 for column in all_free)
             self.gantt_hint.setText(
-                f"第{matrix.week}周全员空闲时段共 {len(all_free)} 个（橙色高亮列）：{text}。"
+                f"第{matrix.week}周全员空闲时段共 {len(all_free)} 个（橙色高亮行）：{text}。"
                 "适合安排需要全员参加的任务。")
         else:
             self.gantt_hint.setText(
-                f"第{matrix.week}周没有全员空闲的时段；汇总行为各时段空闲人数，"
+                f"第{matrix.week}周没有全员空闲的时段；汇总列为各时段空闲人数，"
                 "选择空闲人数最多的时段最容易凑齐人。")
         self.btn_export_gantt.setEnabled(True)
 
@@ -2109,7 +2111,7 @@ class MainWindow(QMainWindow):
         cache[key] = state
 
     def _fill_gantt_table(self, m: CalendarAvailabilityMatrix) -> None:
-        """行=成员（末行为汇总），列=自然日期x时段；
+        """行=自然日期x时段，列=成员（末列为汇总）；
         空闲绿色、有课灰色、请假红色、特殊安排紫色、值班蓝色、全员空闲橙色。
 
         复用已有 QTableWidgetItem：成员多时表格有数千个单元格，
@@ -2127,7 +2129,7 @@ class MainWindow(QMainWindow):
         ALL_FREE_COLOR = QColor("#b25e00")
 
         columns = m.columns
-        rows, cols = m.member_count + 1, len(columns)
+        rows, cols = len(columns), m.member_count + 1
         if t.rowCount() != rows or t.columnCount() != cols:
             t.clearContents()
             t.setRowCount(rows)
@@ -2136,8 +2138,8 @@ class MainWindow(QMainWindow):
             self._gantt_cell_state = cache
         else:
             cache = self._gantt_cell_state
-        t.setVerticalHeaderLabels(m.member_names + ["空闲人数"])
-        t.setHorizontalHeaderLabels([
+        t.setHorizontalHeaderLabels(m.member_names + ["空闲人数"])
+        t.setVerticalHeaderLabels([
             slot_header(c.date.isoweekday(), c.block, c.date, is_off=c.is_off)
             for c in columns])
 
@@ -2175,9 +2177,9 @@ class MainWindow(QMainWindow):
                         state = ("课", BUSY, BUSY_COLOR,
                                  f"第{week}周 {WEEKDAY_LABELS[weekday]} {BLOCK_LABELS[b]}：\n"
                                  + "\n".join(names), True)
-                self._fill_cell(t, r, i, state, cache)
+                self._fill_cell(t, i, r, state, cache)
 
-        r = m.member_count
+        summary_col = m.member_count
         for i, column in enumerate(columns):
             if column.is_off:
                 state = ("放假", LEAVE, LEAVE_COLOR,
@@ -2189,8 +2191,8 @@ class MainWindow(QMainWindow):
                 state = (f"{count}/{m.member_count}",
                          ALL_FREE if all_free else QColor(0, 0, 0, 0),
                          ALL_FREE_COLOR if all_free else NO_COLOR, "", True)
-            self._fill_cell(t, r, i, state, cache)
-            head = t.horizontalHeaderItem(i)
+            self._fill_cell(t, i, summary_col, state, cache)
+            head = t.verticalHeaderItem(i)
             if head is not None:
                 highlighted = column.is_off or (
                     not column.is_off and m.free_counts[i] == m.member_count)

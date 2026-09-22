@@ -371,7 +371,7 @@ def test_async_generate_updates_ui_and_db(window, qt_app) -> None:
     key = lambda a: (a.week, a.weekday, a.block, a.member_id)  # noqa: E731
     assert sorted(key(a) for a in stored) == sorted(key(a) for a in result.assignments), \
         "落库结果应与计算结果一致"
-    assert window.gantt_table.rowCount() == 13, "甘特图应已刷新（成员数 + 汇总行）"
+    assert window.gantt_table.columnCount() == 13, "甘特图应已刷新（成员列 + 汇总列）"
     assert window.btn_export_xlsx.isEnabled() and window.btn_export_png.isEnabled()
     assert "已重新排班" in window.statusBar().currentMessage()
 
@@ -406,9 +406,9 @@ def test_gantt_table_reuses_items(window, qt_app) -> None:
     clear_members(window)
     seed_members(window, 3, seed=99)
     window.refresh_gantt()
-    assert window.gantt_table.rowCount() == 4, "成员数变化后应重建表格结构"
+    assert window.gantt_table.columnCount() == 4, "成员数变化后应重建表格结构"
     assert window.gantt_table.item(0, 0) is not None
-    assert window.gantt_table.rowCount() == len(window.members()) + 1
+    assert window.gantt_table.columnCount() == len(window.members()) + 1
 
 
 def test_manual_tweak_writes_only_target_slot(window, qt_app) -> None:
@@ -561,8 +561,8 @@ def test_weekend_makeup_day_is_scheduled_without_weekend_checkbox(
     window.gantt_week.setValue(1)
     window.refresh_gantt()
     headers = [
-        window.gantt_table.horizontalHeaderItem(i).text()
-        for i in range(window.gantt_table.columnCount())
+        window.gantt_table.verticalHeaderItem(i).text()
+        for i in range(window.gantt_table.rowCount())
     ]
     assert any("09-20" in header for header in headers), \
         "补课日期应显示在它真实所在的自然周，无需勾选周末"
@@ -570,15 +570,15 @@ def test_weekend_makeup_day_is_scheduled_without_weekend_checkbox(
         "同一自然周的正常工作日也应显示"
     assert any(
         "09-20" in header
-        and window.gantt_table.item(0, index).text() == "值"
+        and window.gantt_table.item(index, 0).text() == "值"
         for index, header in enumerate(headers)
     ), "补课日对应的实际排班应在甘特图中标蓝"
 
     window.gantt_week.setValue(4)
     window.refresh_gantt()
     week4_headers = [
-        window.gantt_table.horizontalHeaderItem(i).text()
-        for i in range(window.gantt_table.columnCount())
+        window.gantt_table.verticalHeaderItem(i).text()
+        for i in range(window.gantt_table.rowCount())
     ]
     assert any("10-06" in header for header in week4_headers), \
         "放假的原工作日应显示在实际周次"
@@ -759,7 +759,7 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
     checked = {"free": 0, "busy": 0, "duty": 0}
     for r in range(m.member_count):
         for i, column in enumerate(m.columns):
-            item = t.item(r, i)
+            item = t.item(i, r)
             if (r, column.date, column.block) in m.duty_cells:
                 assert item.text() == "值" and "已排值班" in item.toolTip()
                 checked["duty"] += 1
@@ -772,10 +772,10 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
                 checked["busy"] += 1
     assert checked["duty"] > 0 and checked["free"] > 0 and checked["busy"] > 0
 
-    # 汇总行
-    row = m.member_count
+    # 汇总列
+    summary_col = m.member_count
     for i in range(len(m.columns)):
-        assert t.item(row, i).text() == f"{m.free_counts[i]}/{m.member_count}"
+        assert t.item(i, summary_col).text() == f"{m.free_counts[i]}/{m.member_count}"
 
     # 请假：整行标「假」并带上原因
     window.gantt_week.setValue(1)
@@ -788,7 +788,27 @@ def test_gantt_renders_expected_colors_and_tooltips(window, qt_app) -> None:
     r0 = row_of[member_id]
     for i, column in enumerate(m2.columns):
         if column.logical_week == 1 and column.logical_weekday == 2:
-            assert t.item(r0, i).text() == "假" and "生病" in t.item(r0, i).toolTip()
+            assert t.item(i, r0).text() == "假" and "生病" in t.item(i, r0).toolTip()
+
+
+def test_gantt_excel_uses_time_rows_and_member_columns(window, qt_app) -> None:
+    """Excel 甘特图与界面一致：日期x时段为行，成员为列，末列为汇总。"""
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+    from duty_system.gantt import export_gantt_excel
+
+    seed_members(window, 3)
+    window.refresh_gantt()
+    matrix = window.gantt_matrix
+    assert matrix is not None
+
+    ws = load_workbook(BytesIO(export_gantt_excel(matrix))).active
+    assert ws.cell(1, 2).value == matrix.member_names[0]
+    assert ws.cell(1, 2 + matrix.member_count).value == "空闲人数"
+    assert "\n" in ws.cell(3, 1).value
+    assert ws.max_row == len(matrix.columns) + 2
+    assert ws.max_column == matrix.member_count + 2
 
 
 def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
@@ -810,6 +830,6 @@ def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
         and column.block == 1)
     assert matrix.free[row][col] is False
     assert matrix.special_info[(row, matrix.columns[col].date, 1)] == ["固定实习"]
-    item = window.gantt_table.item(row, col)
+    item = window.gantt_table.item(col, row)
     assert item.text() == "特" and "其他安排" in item.toolTip()
     assert item.background().color().name() == "#e5d8ff"
