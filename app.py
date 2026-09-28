@@ -12,17 +12,16 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from collections import Counter
 from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import shiboken6
 from PySide6.QtCore import (
     QDate,
     QObject,
-    QRect,
     QRunnable,
     QSettings,
     Qt,
@@ -33,12 +32,8 @@ from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
-    QFont,
     QFontMetrics,
-    QImage,
     QKeySequence,
-    QPainter,
-    QPen,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -50,7 +45,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -102,8 +96,9 @@ from duty_system.parser import (
     BLOCK_LABELS,
     BLOCK_SESSIONS,
     WEEKDAY_LABELS,
-    parse_schedule_file,
+    parse_schedule_files,
 )
+from duty_system.rendering import BarChart, render_charts_png, render_table_png
 from duty_system.scheduler import (
     ScheduleConfig,
     ScheduleResult,
@@ -116,6 +111,15 @@ from duty_system.scheduler import (
     rebuild_member_stats,
     replacement_candidates,
     summarize_gap_causes,
+)
+from duty_system.theme import build_style
+from duty_system.ui_utils import (
+    card as _card,
+)
+from duty_system.ui_utils import (
+    fill_table,
+    special_sessions_label,
+    special_weeks_label,
 )
 
 # 数据库默认位置：
@@ -158,538 +162,15 @@ SHORTCUT_MODIFIER = "⌘" if sys.platform == "darwin" else "Ctrl+"
 # 类苹果设计语言（macOS 浅色模式）：
 #   背景 #f5f5f7 / 卡片白色圆角 / 系统蓝 #007aff / 文字 #1d1d1f·#86868b
 #   分隔线 #e5e5ea / 控件边框 #d2d2d7 / 8pt 间距网格 / 分段控件式 Tab
-STYLE = """
-* { font-size: 13px; }
-
-QMainWindow, QTabWidget::pane { background: #f5f5f7; }
-QSplitter::handle { background: transparent; }
-QSplitter::handle:horizontal { width: 16px; }
-
-QLabel { color: #1d1d1f; background: transparent; }
-QLabel#appTitle { font-size: 20px; font-weight: 700; }
-QLabel#appSubtitle { font-size: 12px; color: #86868b; }
-QLabel#summary { color: #3c3c43; }
-QLabel#secondary { color: #86868b; font-size: 12px; }
-
-Card {
-    background: #ffffff;
-    border: 1px solid #e8e8ed;
-    border-radius: 10px;
-}
-
-QGroupBox {
-    font-weight: 600; color: #1d1d1f;
-    background: #ffffff;
-    border: 1px solid #e8e8ed; border-radius: 10px;
-    margin-top: 16px; padding: 12px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin; subcontrol-position: top left;
-    left: 14px; top: 0px; padding: 0 5px;
-    background: #ffffff; color: #1d1d1f;
-}
-
-QPushButton {
-    background: #ffffff; color: #1d1d1f;
-    border: 1px solid #d2d2d7; border-radius: 7px;
-    padding: 6px 14px; font-weight: 500;
-}
-QPushButton:hover { background: #f7f7f9; }
-QPushButton:pressed { background: #e8e8ed; }
-QPushButton:disabled { color: #aeaeb2; background: #f7f7f9; border-color: #e5e5ea; }
-
-QPushButton#primary { background: #007aff; color: #ffffff; border: none; font-weight: 600; }
-QPushButton#primary:hover { background: #0071e3; }
-QPushButton#primary:pressed { background: #0062cc; }
-QPushButton#primary:disabled { background: #99c7ff; color: #ffffff; }
-
-QPushButton#danger { background: transparent; color: #ff3b30; border: 1px solid #ffb3ae; }
-QPushButton#danger:hover { background: #fff0ee; }
-QPushButton#danger:pressed { background: #ffe1dd; }
-
-QSpinBox, QComboBox, QDateEdit {
-    background: #ffffff; color: #1d1d1f;
-    border: 1px solid #d2d2d7; border-radius: 6px;
-    padding: 3px 8px;
-    selection-background-color: #007aff; selection-color: #ffffff;
-}
-QSpinBox:focus, QComboBox:focus, QDateEdit:focus { border: 1px solid #007aff; }
-QSpinBox::up-button, QSpinBox::down-button, QDateEdit::up-button, QDateEdit::down-button { width: 0; border: none; background: none; }
-QComboBox::drop-down { border: none; width: 24px; }
-QDateEdit::drop-down { border: none; width: 26px; }
-QComboBox QAbstractItemView {
-    background: #ffffff; border: 1px solid #d2d2d7; border-radius: 8px;
-    selection-background-color: #007aff; selection-color: #ffffff;
-    outline: none; padding: 2px;
-}
-
-QDialog { background: #f5f5f7; }
-QLineEdit {
-    background: #ffffff; color: #1d1d1f;
-    border: 1px solid #d2d2d7; border-radius: 6px; padding: 4px 8px;
-    selection-background-color: #007aff; selection-color: #ffffff;
-}
-QLineEdit:focus { border: 1px solid #007aff; }
-
-QCheckBox { color: #1d1d1f; background: transparent; spacing: 7px; }
-QCheckBox::indicator {
-    width: 16px; height: 16px;
-    border: 1px solid #c7c7cc; border-radius: 4px; background: #ffffff;
-}
-QCheckBox::indicator:hover { border-color: #007aff; }
-QCheckBox::indicator:checked { background: #007aff; border-color: #007aff; image: url(__CHECK__); }
-
-QListWidget {
-    background: #ffffff; border: 1px solid #e8e8ed; border-radius: 10px;
-    outline: none; padding: 5px;
-}
-QListWidget::item { padding: 6px 8px; border-radius: 7px; margin: 1px 2px; }
-QListWidget::item:hover { background: #f2f2f7; }
-QListWidget::item:selected { background: #007aff; color: #ffffff; }
-
-QTabWidget::pane { border: none; background: transparent; }
-QTabBar { background: #e9e9eb; border-radius: 9px; padding: 2px; }
-QTabBar::tab {
-    background: transparent; color: #3c3c43;
-    padding: 5px 14px; margin: 1px;
-    border: none; border-radius: 7px; font-weight: 500;
-}
-QTabBar::tab:hover { color: #1d1d1f; }
-QTabBar::tab:selected { background: #ffffff; color: #1d1d1f; font-weight: 600; }
-
-QTableWidget {
-    background: transparent; border: none;
-    gridline-color: transparent;
-    alternate-background-color: #f7f7f9;
-    selection-background-color: #007aff; selection-color: #ffffff;
-    outline: none;
-}
-QTableWidget::item { padding: 4px 8px; border: none; }
-QHeaderView::section {
-    background: transparent; color: #86868b;
-    border: none; border-bottom: 1px solid #e5e5ea;
-    padding: 7px 10px;
-    font-weight: 600; font-size: 12px;
-}
-QTableCornerButton::section { background: transparent; border: none; }
-
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: #c7c7cc; border-radius: 4px; min-height: 28px; }
-QScrollBar::handle:vertical:hover { background: #aeaeb2; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-QScrollBar::handle:horizontal { background: #c7c7cc; border-radius: 4px; min-width: 28px; }
-QScrollBar::handle:horizontal:hover { background: #aeaeb2; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
-
-QStatusBar { background: transparent; color: #86868b; font-size: 12px; }
-QStatusBar::item { border: none; }
-
-QToolTip {
-    background: #1d1d1f; color: #ffffff;
-    border: none; border-radius: 6px; padding: 6px 10px; font-size: 12px;
-}
-"""
-
-
-def _write_check_icon() -> str:
-    """生成复选框选中态的白色对勾图标，供 QSS image 引用"""
-    img = QImage(64, 64, QImage.Format_ARGB32)
-    img.fill(Qt.transparent)
-    painter = QPainter(img)
-    painter.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(QColor("#ffffff"), 8)
-    pen.setCapStyle(Qt.RoundCap)
-    pen.setJoinStyle(Qt.RoundJoin)
-    painter.setPen(pen)
-    painter.drawLine(16, 34, 27, 45)
-    painter.drawLine(27, 45, 48, 18)
-    painter.end()
-    path = Path(tempfile.gettempdir()) / "duty_check_icon.png"
-    img.save(str(path))
-    return path.as_posix()
-
-
-def build_style() -> str:
-    """装配全局样式表（注入运行时生成的对勾图标路径）"""
-    return STYLE.replace("__CHECK__", _write_check_icon())
-
-
-def special_sessions_label(session_list: list[int]) -> str:
-    """把节次列表展示成用户登记时选择的时段块。"""
-    sessions = set(session_list)
-    labels = [
-        BLOCK_LABELS[block].split(" ")[0]
-        for block in sorted(BLOCK_SESSIONS)
-        if set(BLOCK_SESSIONS[block]) <= sessions
-    ]
-    return "、".join(labels) or "自定义节次"
-
-
-def special_weeks_label(week_start: int, week_end: int) -> str:
-    return f"第{week_start}周" if week_start == week_end else f"第{week_start}–{week_end}周"
-
-
-class Card(QWidget):
-    """白色圆角卡片容器（类苹果表面样式）"""
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-
-
-def _card(widget: QWidget) -> Card:
-    """把控件包进白色圆角卡片"""
-    card = Card()
-    lay = QVBoxLayout(card)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.addWidget(widget)
-    return card
-
-
-def fill_table(table: QTableWidget, df: pd.DataFrame) -> None:
-    """把 DataFrame 填入只读 QTableWidget（苹果风格：无网格线、交替行、隐藏行号）
-
-    尺寸未变时复用既有单元格、只更新变化的文本：明细/统计等表格可能有数千个
-    单元格，反复重建 item 会让刷新明显变慢。
-    """
-    rows, cols = len(df), len(df.columns)
-    if table.rowCount() != rows or table.columnCount() != cols:
-        table.clearContents()
-        table.setRowCount(rows)
-        table.setColumnCount(cols)
-    table.setHorizontalHeaderLabels([str(c) for c in df.columns])
-    table.setShowGrid(False)
-    table.setAlternatingRowColors(True)
-    table.verticalHeader().setVisible(False)
-    table.verticalHeader().setDefaultSectionSize(30)
-    # 一次性把 DataFrame 取成字符串矩阵：pandas 的逐格标量访问（df.iat）
-    # 在单元格较多时开销极大，这里改成一次遍历后再写表。
-    values = [tuple(str(v) for v in row)
-              for row in df.itertuples(index=False, name=None)]
-    for r, row_values in enumerate(values):
-        for c, text in enumerate(row_values):
-            item = table.item(r, c)
-            if item is None:
-                item = QTableWidgetItem()
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                table.setItem(r, c, item)
-            if item.text() != text:
-                item.setText(text)
-    # 列宽：用「填完后一次性自适应」代替常驻 ResizeToContents。
-    # 后者在每次 setText/setItem 时都会重算列宽，表格越大越吃亏；
-    # 一次性 resizeColumnsToContents() 只在本次刷新结束时扫描一遍。
-    header = table.horizontalHeader()
-    if cols and header.sectionResizeMode(0) != QHeaderView.Interactive:
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-    if cols:
-        table.resizeColumnsToContents()
-
-
-def _wrap_png_text(text: str, metrics: QFontMetrics, max_width: int) -> list[str]:
-    """按像素宽度把文本拆成多行，避免 PNG 表格内容被裁切。"""
-    result: list[str] = []
-    for raw_line in str(text).split("\n"):
-        if not raw_line:
-            result.append("")
-            continue
-        current = ""
-        for char in raw_line:
-            candidate = current + char
-            if current and metrics.horizontalAdvance(candidate) > max_width:
-                result.append(current)
-                current = char
-            else:
-                current = candidate
-        result.append(current)
-    return result or [""]
-
-
-def render_table_png(df: pd.DataFrame, title: str, subtitle: str, path: Path) -> None:
-    """把表格渲染为高清 PNG，内容按列宽换行并自动调整行高，避免裁切。"""
-    margin, pad, min_row_h, min_head_h = 28, 12, 34, 38
-    line_h = 18
-    max_cell_w = 280
-    font = QFont()
-    font.setPixelSize(13)
-    bold = QFont()
-    bold.setPixelSize(13)
-    bold.setBold(True)
-    title_font = QFont()
-    title_font.setPixelSize(21)
-    title_font.setBold(True)
-    sub_font = QFont()
-    sub_font.setPixelSize(12)
-    fm, hfm, tfm, sfm = (QFontMetrics(f) for f in (font, bold, title_font, sub_font))
-
-    cols = [str(c) for c in df.columns]
-    widths: list[int] = []
-    for column_index, column_name in enumerate(cols):
-        natural_width = hfm.horizontalAdvance(column_name)
-        for row_index in range(len(df)):
-            text = str(df.iat[row_index, column_index])
-            natural_width = max(
-                natural_width,
-                max(
-                    (fm.horizontalAdvance(line) for line in text.split("\n")),
-                    default=0,
-                ),
-            )
-        widths.append(min(max(natural_width + pad * 2, 56), max_cell_w))
-
-    header_lines = [
-        _wrap_png_text(column_name, hfm, widths[index] - pad * 2)
-        for index, column_name in enumerate(cols)
-    ]
-    head_h = max(
-        min_head_h,
-        max((len(lines) for lines in header_lines), default=1) * line_h + pad * 2,
-    )
-
-    body_lines: list[list[list[str]]] = []
-    row_heights: list[int] = []
-    for row_index in range(len(df)):
-        current_row: list[list[str]] = []
-        max_lines = 1
-        for column_index, width in enumerate(widths):
-            lines = _wrap_png_text(
-                str(df.iat[row_index, column_index]),
-                fm,
-                width - pad * 2,
-            )
-            current_row.append(lines)
-            max_lines = max(max_lines, len(lines))
-        body_lines.append(current_row)
-        row_heights.append(max(min_row_h, max_lines * line_h + pad * 2))
-
-    table_w = sum(widths)
-    title_w = max(tfm.horizontalAdvance(title), sfm.horizontalAdvance(subtitle))
-    content_w = max(table_w, title_w)
-    img_w = margin * 2 + content_w
-    table_y = margin + tfm.height() + 8 + sfm.height() + 16
-    table_h = head_h + sum(row_heights)
-    img_h = table_y + table_h + margin
-
-    img = QImage(img_w * 2, img_h * 2, QImage.Format_ARGB32)
-    img.fill(Qt.white)
-    p = QPainter(img)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setRenderHint(QPainter.TextAntialiasing)
-    p.scale(2, 2)
-
-    p.setPen(QPen(QColor("#1d1d1f")))
-    p.setFont(title_font)
-    p.drawText(QRect(margin, margin, content_w, tfm.height()),
-               Qt.AlignLeft | Qt.AlignVCenter, title)
-    p.setPen(QPen(QColor("#86868b")))
-    p.setFont(sub_font)
-    p.drawText(QRect(margin, margin + tfm.height() + 8, content_w, sfm.height()),
-               Qt.AlignLeft | Qt.AlignVCenter, subtitle)
-
-    p.fillRect(QRect(margin, table_y, table_w, head_h), QColor("#f2f2f7"))
-    p.setFont(bold)
-    x = margin
-    for width, lines in zip(widths, header_lines):
-        text_y = table_y + (head_h - len(lines) * line_h) / 2
-        for line in lines:
-            p.setPen(QPen(QColor("#1d1d1f")))
-            p.drawText(QRect(x + pad, text_y, width - pad * 2, line_h),
-                       Qt.AlignCenter, line)
-            text_y += line_h
-        x += width
-
-    p.setFont(font)
-    y = table_y + head_h
-    for row_index, height in enumerate(row_heights):
-        if row_index % 2:
-            p.fillRect(QRect(margin, y, table_w, height), QColor("#f7f7f9"))
-        x = margin
-        for column_index, width in enumerate(widths):
-            lines = body_lines[row_index][column_index]
-            text_y = y + (height - len(lines) * line_h) / 2
-            for line in lines:
-                p.setPen(QPen(
-                    QColor("#aeaeb2") if line == "—" else "#1d1d1f"))
-                p.drawText(QRect(x + pad, text_y, width - pad * 2, line_h),
-                           Qt.AlignCenter, line)
-                text_y += line_h
-            x += width
-        y += height
-
-    p.setPen(QPen(QColor("#e5e5ea"), 1))
-    x = margin
-    for width in widths[:-1]:
-        x += width
-        p.drawLine(x, table_y, x, table_y + table_h)
-    y = table_y + head_h
-    for height in row_heights[:-1]:
-        y += height
-        p.drawLine(margin, y, margin + table_w, y)
-    p.setPen(QPen(QColor("#d2d2d7"), 1))
-    p.drawRect(QRect(margin, table_y, table_w, table_h))
-    p.end()
-    img.save(str(path))
-
-
-def draw_bar_chart(
-    painter: QPainter, rect: QRect, title: str,
-    items: list[tuple[str, int]], color: str = "#007aff",
-) -> None:
-    """在 rect 内绘制标题 + 柱状图（类苹果风格），供界面与 PNG 导出共用"""
-    title_font = QFont()
-    title_font.setPixelSize(13)
-    title_font.setBold(True)
-    tfm = QFontMetrics(title_font)
-    label_font = QFont()
-    label_font.setPixelSize(12)
-    lfm = QFontMetrics(label_font)
-
-    painter.setFont(title_font)
-    painter.setPen(QPen(QColor("#1d1d1f")))
-    painter.drawText(QRect(rect.left(), rect.top(), rect.width(), tfm.height()),
-                     Qt.AlignLeft | Qt.AlignVCenter, title)
-    if not items:
-        painter.setFont(label_font)
-        painter.setPen(QPen(QColor("#aeaeb2")))
-        painter.drawText(rect.adjusted(0, tfm.height() + 8, 0, 0),
-                         Qt.AlignCenter, "暂无数据")
-        return
-
-    label_area_h = lfm.height() * 2
-    top = rect.top() + tfm.height() + 14
-    bottom = rect.bottom() - label_area_h - 8
-    left = rect.left() + 30
-    right = rect.right() - 8
-    plot_h = bottom - top
-    if plot_h <= 20:
-        return
-    max_v = max(v for _, v in items)
-    top_tick = max_v if max_v % 4 == 0 else (max_v // 4 + 1) * 4
-    top_tick = max(top_tick, 4)
-
-    # 横向网格线（0/25/50/75/100% 五档）与左侧刻度值
-    painter.setFont(label_font)
-    grid_pen = QPen(QColor("#e5e5ea"), 1)
-    for i in range(5):
-        y = bottom - plot_h * i / 4
-        painter.setPen(grid_pen)
-        painter.drawLine(left, y, right, y)
-        painter.setPen(QPen(QColor("#aeaeb2")))
-        painter.drawText(QRect(left - 30, y - lfm.height() / 2, 26, lfm.height()),
-                         Qt.AlignRight | Qt.AlignVCenter, str(top_tick * i // 4))
-
-    # 柱体 + 柱顶数值 + 底部标签
-    slot_w = (right - left) / len(items)
-    bar_w = min(slot_w * 0.52, 64)
-    bar_color = QColor(color)
-    for i, (label, v) in enumerate(items):
-        cx = left + slot_w * (i + 0.5)
-        h = plot_h * v / top_tick if top_tick else 0
-        bar_rect = QRect(cx - bar_w / 2, bottom - h, bar_w, h)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(bar_color)
-        painter.drawRoundedRect(bar_rect, 3, 3)
-        painter.setPen(QPen(QColor("#1d1d1f")))
-        painter.drawText(QRect(cx - slot_w / 2, bottom - h - lfm.height() - 2,
-                               slot_w, lfm.height()),
-                         Qt.AlignCenter, str(v))
-        painter.setPen(QPen(QColor("#86868b")))
-        painter.drawText(
-            QRect(cx - slot_w / 2, bottom + 2, slot_w, label_area_h),
-            Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
-            label,
-        )
-
-
-def render_charts_png(
-    charts: list[tuple[str, list[tuple[str, int]], str]],
-    path: Path,
-) -> None:
-    """多张柱状图渲染为一张高清 PNG，按标签宽度扩展画布避免文字裁切。"""
-    if not charts:
-        return
-    margin, chart_h = 28, 300
-    label_font = QFont()
-    label_font.setPixelSize(12)
-    title_font = QFont()
-    title_font.setPixelSize(13)
-    title_font.setBold(True)
-    label_fm = QFontMetrics(label_font)
-    title_fm = QFontMetrics(title_font)
-
-    max_items = max((len(items) for _, items, _ in charts), default=1)
-    max_label_w = max(
-        (
-            label_fm.horizontalAdvance(label)
-            for _, items, _ in charts
-            for label, _ in items
-        ),
-        default=64,
-    )
-    slot_w = max(64, min(max_label_w + 18, 140))
-    content_w = 38 + slot_w * max_items
-    content_w = max(
-        content_w,
-        *(title_fm.horizontalAdvance(title) for title, _, _ in charts),
-    )
-    img_w = max(980, content_w + margin * 2)
-    img_h = margin * 2 + chart_h * len(charts) + 16 * (len(charts) - 1)
-    img = QImage(img_w * 2, img_h * 2, QImage.Format_ARGB32)
-    img.fill(Qt.white)
-    p = QPainter(img)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setRenderHint(QPainter.TextAntialiasing)
-    p.scale(2, 2)
-    for i, (title, items, color) in enumerate(charts):
-        draw_bar_chart(p, QRect(margin, margin + i * (chart_h + 16),
-                                img_w - margin * 2, chart_h), title, items, color)
-    p.end()
-    img.save(str(path))
-
-
-class BarChart(QFrame):
-    """类苹果风格柱状图（值班 / 请假情况可视化）"""
-
-    def __init__(self, title: str, color: str = "#007aff", parent: QWidget | None = None):
-        super().__init__(parent)
-        self._title = title
-        self._color = color
-        self._items: list[tuple[str, int]] = []
-        self.setMinimumHeight(220)
-        self.setStyleSheet(
-            "BarChart { background: #ffffff; border: 1px solid #e8e8ed; border-radius: 10px; }")
-
-    def set_data(self, items: list[tuple[str, int]]) -> None:
-        self._items = list(items)
-        self.update()
-
-    def data(self) -> list[tuple[str, int]]:
-        return self._items
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setRenderHint(QPainter.TextAntialiasing)
-        draw_bar_chart(p, self.rect().adjusted(16, 12, -16, -10),
-                       self._title, self._items, self._color)
-        p.end()
-
-
 class _TaskSignals(QObject):
-    """后台任务的完成/失败信号（QRunnable 本身不能带信号，需 QObject 载体）"""
+    """后台任务的完成/失败信号（QRunnable 本身不能带信号，需 QObject 载体）。"""
 
     done = Signal(object)
     failed = Signal(str)
 
 
 class _Task(QRunnable):
-    """把耗时操作（排班计算、Excel/PNG 生成）放到线程池执行，避免界面假死。
-
-    只负责执行纯计算与取数据；任何界面刷新与数据库写入都在主线程回调里做。
-    """
+    """把耗时操作放到线程池执行，完成或失败后回主线程回调。"""
 
     def __init__(self, fn: Callable[[], object]):
         super().__init__()
@@ -739,6 +220,7 @@ class MainWindow(QMainWindow):
         self._undo_limit = 50
         # 空闲时段总览单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
         self._gantt_cell_state: dict = {}
+        self._dirty_schedule_sections: set[str] = set()
         self._pool = QThreadPool.globalInstance()
         self._busy = False
         # 必须持有正在执行的任务引用：QRunnable 被 Python 回收后线程池就无法再执行它
@@ -858,6 +340,8 @@ class MainWindow(QMainWindow):
             return
         self._busy = True
         self.btn_generate.setEnabled(False)
+        self.centralWidget().setEnabled(False)
+        self.menuBar().setEnabled(False)
         self.statusBar().showMessage(f"{label}…")
         QApplication.setOverrideCursor(Qt.BusyCursor)
         task = _Task(fn)
@@ -872,6 +356,8 @@ class MainWindow(QMainWindow):
             return
         self._busy = False
         self.btn_generate.setEnabled(True)
+        self.centralWidget().setEnabled(True)
+        self.menuBar().setEnabled(True)
         QApplication.restoreOverrideCursor()
         if error is not None:
             self.statusBar().showMessage(f"操作失败：{error}")
@@ -887,9 +373,7 @@ class MainWindow(QMainWindow):
         self.undo_action = QAction("撤销", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.undo_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.undo_action.setToolTip(
-            f"撤销 {SHORTCUT_MODIFIER}Z" if SHORTCUT_MODIFIER == "⌘"
-            else f"撤销 {SHORTCUT_MODIFIER}Z")
+        self.undo_action.setToolTip(f"撤销 {SHORTCUT_MODIFIER}Z")
         self.undo_action.setEnabled(False)
         self.undo_action.triggered.connect(self.undo_tweak)
         edit_menu.addAction(self.undo_action)
@@ -1410,9 +894,13 @@ class MainWindow(QMainWindow):
         self.db_path_label.setToolTip(str(path))
 
     def change_db_location(self) -> None:
-        """更改数据库存储位置：迁移现有数据或切换到已有数据库文件"""
+        """更改数据库存储位置：迁移现有数据或切换到已有数据库文件。"""
+        if self.busy:
+            self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
+            return
         current = Path(self.db.path)
-        folder = QFileDialog.getExistingDirectory(self, "选择数据库存储位置", str(current.parent))
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择数据库存储位置", str(current.parent))
         if not folder:
             return
         new_path = Path(folder) / current.name
@@ -1430,12 +918,31 @@ class MainWindow(QMainWindow):
                 return
             migrated = False
         else:
-            # 用 SQLite 在线备份而非文件复制：WAL 模式下最新数据与 schema
-            # 可能还在 -wal 文件里，直接复制主库会得到损坏/缺失内容的副本
-            self.db.backup_to(new_path)
             migrated = True
+
+        def prepare_database() -> Database:
+            # 在线备份必须使用 SQLite API；大库备份放到后台，避免界面卡顿。
+            if migrated:
+                self.db.backup_to(new_path)
+            return Database(new_path)
+
+        self.run_async(
+            "正在准备数据库",
+            prepare_database,
+            lambda new_db: self._activate_database(
+                current, new_path, new_db, migrated),
+        )
+
+    def _activate_database(
+        self,
+        current: Path,
+        new_path: Path,
+        new_db: Database,
+        migrated: bool,
+    ) -> None:
+        """后台备份/校验成功后，在主线程切换数据库并刷新界面。"""
         QSettings().setValue("database/path", str(new_path))
-        self.db = Database(new_path)
+        self.db = new_db
         self.invalidate_cache()
         self._update_db_path_label()
         self._refresh_calendar_summary()
@@ -1446,8 +953,13 @@ class MainWindow(QMainWindow):
         self._restore_result()
         if self.result is None:
             self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
-            for tb in (self.pivot_table, self.detail_table, self.stats_table, self.gap_table):
-                fill_table(tb, pd.DataFrame())
+            for table in (
+                self.pivot_table,
+                self.detail_table,
+                self.stats_table,
+                self.gap_table,
+            ):
+                fill_table(table, pd.DataFrame())
             self.btn_export_xlsx.setEnabled(False)
             self.btn_export_csv.setEnabled(False)
             self.btn_export_png.setEnabled(False)
@@ -1728,7 +1240,6 @@ class MainWindow(QMainWindow):
         def confirm() -> None:
             week = week_spin.value()
             weekday = int(weekday_combo.currentData())
-            off_date = natural_date(self._term_start(), week, weekday)
             makeup_date = class_date_edit.date().toPython()
             entries = self._makeup_entries(
                 self._term_start(), week, weekday, makeup_date)
@@ -1808,6 +1319,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
 
         def populate(data) -> None:
+            if not shiboken6.isValid(dlg):
+                return
             preview.setRowCount(0)
             plan = build_holiday_import_plan(self._term_start(), data)
             for entry in plan.entries:
@@ -1968,8 +1481,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "日历校验失败", str(exc))
             return
-        self.db.clear_calendar()
-        self.db.upsert_calendar(entries)
+        self.db.replace_calendar(entries)
         self.invalidate_cache()
         self._refresh_calendar_summary()
         self.refresh_gantt()
@@ -1984,7 +1496,73 @@ class MainWindow(QMainWindow):
         self._save_settings()
         super().closeEvent(event)
 
-    def refresh_schedule_tabs(self) -> None:
+    def _refresh_schedule_summary(self) -> None:
+        result = self.result
+        if result is None:
+            return
+        n = len(result.assignments)
+        summary = (
+            f"排班完成：共 {n} 人次安排 | 参与成员 {len(result.member_stats)} 人 | "
+            f"人均 {n / max(len(result.member_stats), 1):.1f} 次 | "
+            f"总次数极差 {result.balanced_spread}（越小越均衡）| "
+            f"无人可用时段 {len(result.gaps)} 个")
+        if result.gaps:
+            summary += "。" + capacity_advice(
+                summarize_gap_causes(self._gap_diagnoses(result)),
+                self._config_per_slot(result),
+            )
+        self.summary_label.setText(summary)
+        has_data = bool(result.assignments)
+        self.btn_export_xlsx.setEnabled(has_data)
+        self.btn_export_csv.setEnabled(has_data)
+        self.btn_export_png.setEnabled(has_data)
+        self.btn_clear_schedule.setEnabled(has_data)
+
+    def _refresh_pivot_section(self) -> None:
+        self._refresh_schedule_summary()
+        fill_table(self.pivot_table, self._pivot_display())
+
+    def _refresh_detail_section(self) -> None:
+        if self.result is None:
+            return
+        fill_table(self.detail_table, build_detail_df(
+            self.result.assignments,
+            start_date=self._term_start(),
+            calendar=self.term_calendar(),
+        ))
+
+    def _refresh_stats_section(self) -> None:
+        result = self.result
+        if result is None:
+            return
+        fill_table(self.stats_table, build_stats_df(result.member_stats))
+        if result.gaps:
+            self.gap_title.setText(
+                f"无人可值时段（{len(result.gaps)} 个，按成因分类，可对照处理）")
+            fill_table(self.gap_table, build_gap_df(self._gap_diagnoses(result)))
+        else:
+            self.gap_title.setText("所有值班时段均已安排到位，无缺口。")
+            fill_table(self.gap_table, pd.DataFrame(
+                columns=["周次", "星期", "时段", "主要原因", "无课人数"]))
+
+    def _refresh_schedule_section(self, section: str) -> None:
+        if section == "pivot":
+            self._refresh_pivot_section()
+        elif section == "detail":
+            self._refresh_detail_section()
+        elif section == "stats":
+            self._refresh_stats_section()
+        elif section == "gantt":
+            self.refresh_gantt()
+        elif section == "charts":
+            self.refresh_charts()
+        self._dirty_schedule_sections.discard(section)
+
+    def refresh_schedule_tabs(
+        self,
+        sections: set[str] | None = None,
+    ) -> None:
+        """刷新排班相关区域；指定 sections 时只重算所需部分。"""
         result = self.result
         if result is None:
             for table in (self.pivot_table, self.detail_table,
@@ -1997,41 +1575,34 @@ class MainWindow(QMainWindow):
             self.btn_export_png.setEnabled(False)
             self.btn_clear_schedule.setEnabled(bool(self.db.load_assignments()))
             self.refresh_charts()
+            self._dirty_schedule_sections.clear()
             return
-        display = self._pivot_display()
-        fill_table(self.pivot_table, display)
-        fill_table(self.detail_table, build_detail_df(
-            result.assignments, start_date=self._term_start(),
-            calendar=self.term_calendar()))
-        fill_table(self.stats_table, build_stats_df(result.member_stats))
 
-        n = len(result.assignments)
-        summary = (
-            f"排班完成：共 {n} 人次安排 | 参与成员 {len(result.member_stats)} 人 | "
-            f"人均 {n / max(len(result.member_stats), 1):.1f} 次 | "
-            f"总次数极差 {result.balanced_spread}（越小越均衡）| "
-            f"无人可用时段 {len(result.gaps)} 个")
-        if result.gaps:
-            # 区分「排不了」（课程/特殊安排/请假冲突）与「排不下」（上限不足）：
-            # 前者只能增加成员，后者提高上限即可，给出的建议必须能落地
-            summary += "。" + capacity_advice(
-                summarize_gap_causes(self._gap_diagnoses(result)), self._config_per_slot(result))
-        self.summary_label.setText(summary)
-        has_data = bool(result.assignments)
-        self.btn_export_xlsx.setEnabled(has_data)
-        self.btn_export_csv.setEnabled(has_data)
-        self.btn_export_png.setEnabled(has_data)
-        self.btn_clear_schedule.setEnabled(has_data)
+        selected = sections or {"pivot", "detail", "stats", "charts"}
+        if "pivot" in selected:
+            self._refresh_pivot_section()
+        if "detail" in selected:
+            self._refresh_detail_section()
+        if "stats" in selected:
+            self._refresh_stats_section()
+        if "charts" in selected:
+            self.refresh_charts()
+        self._dirty_schedule_sections.difference_update(selected)
 
-        if result.gaps:
-            self.gap_title.setText(
-                f"无人可值时段（{len(result.gaps)} 个，按成因分类，可对照处理）")
-            fill_table(self.gap_table, build_gap_df(self._gap_diagnoses(result)))
-        else:
-            self.gap_title.setText("所有值班时段均已安排到位，无缺口。")
-            fill_table(self.gap_table, pd.DataFrame(
-                columns=["周次", "星期", "时段", "主要原因", "无课人数"]))
-        self.refresh_charts()
+    def _refresh_after_schedule_change(self) -> None:
+        """微调后只刷新当前可见区域，其余页签按需延迟刷新。"""
+        section_by_tab = {
+            0: "pivot",
+            1: "detail",
+            3: "stats",
+            4: "gantt",
+            5: "charts",
+        }
+        affected = {"pivot", "detail", "stats", "gantt", "charts"}
+        current = section_by_tab.get(self.tabs.currentIndex())
+        if current in affected:
+            self._refresh_schedule_section(current)
+        self._dirty_schedule_sections.update(affected - {current})
 
     # ---------- 缺口诊断 ----------
 
@@ -2113,7 +1684,17 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index: int) -> None:
         tab = self.tabs.tabText(index)
-        if tab == "空闲时段总览":
+        section_by_tab = {
+            0: "pivot",
+            1: "detail",
+            3: "stats",
+            4: "gantt",
+            5: "charts",
+        }
+        section = section_by_tab.get(index)
+        if section in self._dirty_schedule_sections:
+            self._refresh_schedule_section(section)
+        elif tab == "空闲时段总览":
             self.refresh_gantt()
         elif tab == "统计图表":
             self.refresh_charts()
@@ -2353,7 +1934,8 @@ class MainWindow(QMainWindow):
         self.run_async(
             "正在导出统计图",
             lambda: render_charts_png(charts, target),
-            lambda _r: self.statusBar().showMessage(f"已导出统计图：{target}"))
+            lambda paths: self.statusBar().showMessage(
+                f"已导出统计图（{len(paths)} 张）：{target.parent}"))
 
     # ---------- 长期特殊安排（修改课表） ----------
 
@@ -2752,8 +2334,7 @@ class MainWindow(QMainWindow):
             is_class=self.is_class_day)
         self._gap_cache = None
         self._stale = False
-        self.refresh_schedule_tabs()
-        self.refresh_gantt()
+        self._refresh_after_schedule_change()
 
     def undo_tweak(self, *_args) -> None:
         """撤销一次手动微调。"""
@@ -2828,8 +2409,7 @@ class MainWindow(QMainWindow):
                              [a.member_id for a in kept
                               if (a.week, a.weekday, a.block) == (week, weekday, block)])
         self._stale = False
-        self.refresh_schedule_tabs()
-        self.refresh_gantt()
+        self._refresh_after_schedule_change()
         out_name = members[out_id].name if out_id is not None else None
         in_name = members[in_id].name if in_id is not None else None
         slot = f"第{week}周{WEEKDAY_LABELS[weekday]}{BLOCK_LABELS[block].split(' ')[0]}"
@@ -2844,48 +2424,51 @@ class MainWindow(QMainWindow):
     # ---------- 动作 ----------
 
     def upload_files(self) -> None:
+        if self.busy:
+            self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
+            return
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择成员课表文件", str(Path.home()),
             "课表文件 (*.xls *.xlsx);;所有文件 (*)")
         if not files:
             return
         known = {(m.student_id, m.name) for m in self.members()}
-        added, updated, errors, parse_warnings = 0, 0, [], []
-        for f in files:
-            try:
-                schedule = parse_schedule_file(Path(f).read_bytes(), Path(f).name)
-            except Exception as e:
-                errors.append(f"{Path(f).name}：{e}")
-                continue
-            if not schedule.courses and not schedule.name:
-                errors.append(f"{Path(f).name}：未解析到课程信息，请确认是教务系统导出的个人课表")
-                continue
-            parse_warnings.extend(
-                f"{Path(f).name}：{warning}" for warning in schedule.warnings)
-            is_update = (schedule.student_id, schedule.name) in known
-            self.db.upsert_member(schedule)
-            known.add((schedule.student_id, schedule.name))
-            added += 0 if is_update else 1
-            updated += 1 if is_update else 0
-        self.invalidate_cache()
-        self.refresh_members()
-        if errors:
-            QMessageBox.warning(self, "部分文件导入失败", "\n".join(errors))
-        if parse_warnings:
-            QMessageBox.warning(
-                self, "课表存在未定位的集中安排",
-                "以下备注行课程没有具体星期/节次，已按整周避让：\n"
-                + "\n".join(parse_warnings),
-            )
-        parts = []
-        if added:
-            parts.append(f"新增 {added} 名成员")
-        if updated:
-            parts.append(f"更新 {updated} 份课表（同学号同名，课程整体替换）")
-        if parts:
-            self.statusBar().showMessage("、".join(parts) + f"；当前共 {len(self.members())} 名成员。")
-        else:
-            self.statusBar().showMessage("未导入任何文件。")
+
+        def apply_import(payload: tuple[list, list[str], list[str]]) -> None:
+            schedules, errors, parse_warnings = payload
+            added, updated = 0, 0
+            for schedule in schedules:
+                is_update = (schedule.student_id, schedule.name) in known
+                self.db.upsert_member(schedule)
+                known.add((schedule.student_id, schedule.name))
+                added += 0 if is_update else 1
+                updated += 1 if is_update else 0
+            self.invalidate_cache()
+            self.refresh_members()
+            if errors:
+                QMessageBox.warning(self, "部分文件导入失败", "\n".join(errors))
+            if parse_warnings:
+                QMessageBox.warning(
+                    self, "课表存在未定位的集中安排",
+                    "以下备注行课程没有具体星期/节次，已按整周避让：\n"
+                    + "\n".join(parse_warnings),
+                )
+            parts = []
+            if added:
+                parts.append(f"新增 {added} 名成员")
+            if updated:
+                parts.append(f"更新 {updated} 份课表（同学号同名，课程整体替换）")
+            if parts:
+                self.statusBar().showMessage(
+                    "、".join(parts) + f"；当前共 {len(self.members())} 名成员。")
+            else:
+                self.statusBar().showMessage("未导入任何文件。")
+
+        self.run_async(
+            "正在解析课表",
+            lambda: parse_schedule_files(files),
+            apply_import,
+        )
 
     def remove_selected_member(self) -> None:
         item = self.member_list.currentItem()
@@ -3162,7 +2745,8 @@ class MainWindow(QMainWindow):
         self.run_async(
             "正在生成图片",
             lambda: render_table_png(frame, "值班排班表", subtitle, target),
-            lambda _r: self.statusBar().showMessage(f"已导出图片（{weeks_txt}）：{target}"))
+            lambda paths: self.statusBar().showMessage(
+                f"已导出图片（{weeks_txt}，{len(paths)} 张）：{target.parent}"))
 
 
 def main() -> None:

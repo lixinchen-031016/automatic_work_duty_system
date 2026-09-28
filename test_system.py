@@ -127,7 +127,7 @@ def _setup() -> tuple[Database, list]:
 
 
 def test_database() -> None:
-    db, members = get_env()
+    _db, members = get_env()
     assert len(members) == 5
     assert all(m.course_count > 0 for m in members)
 
@@ -171,8 +171,8 @@ def test_scheduler() -> None:
     spread = max(totals) - min(totals)
     print(f"[3] 排班算法: 通过（{len(result.assignments)} 人次安排，0 冲突，"
           f"每人每天<=1 次，每周各星期均有安排，缺口 {len(result.gaps)} 个，总次数极差 {spread}）")
-    for mid, s in result.member_stats.items():
-        print(f"      - {s['name']}: {s['total']} 次")
+    for stats in result.member_stats.values():
+        print(f"      - {stats['name']}: {stats['total']} 次")
 
     db.save_assignments(result.assignments)
     loaded = db.load_assignments()
@@ -198,6 +198,7 @@ def test_exporter() -> None:
 
     # 长姓名/长日期内容应自动换行并增高，而不是被固定列宽裁切
     from io import BytesIO
+
     from openpyxl import load_workbook
 
     long_name = "张三丰" * 8
@@ -261,6 +262,7 @@ def test_gantt() -> None:
     data = export_gantt_excel(m)
     assert data[:2] == b"PK" and len(data) > 4000, "甘特图 Excel 导出错误"
     from io import BytesIO
+
     from openpyxl import load_workbook
     ws = load_workbook(BytesIO(data)).active
     assert ws.title == "第1周空闲时段总览"
@@ -415,8 +417,10 @@ def test_incremental():
     db, members = get_env()
     db.clear_assignments()
     courses = db.get_courses()
-    cfg = dict(weekdays=[1, 2, 3, 4, 5], blocks=[1, 2, 3, 4, 5],
-               per_slot=1, max_per_week=3, max_per_day=1)
+    cfg = {
+        'weekdays': [1, 2, 3, 4, 5], 'blocks': [1, 2, 3, 4, 5],
+        'per_slot': 1, 'max_per_week': 3, 'max_per_day': 1,
+    }
     first = generate_schedule(members, courses, ScheduleConfig(weeks=range(1, 4), **cfg))
     db.save_assignments(first.assignments)
 
@@ -426,7 +430,7 @@ def test_incremental():
     second = generate_schedule(members, courses, wk2, base_assignments=base)
     fresh = [a for a in second.assignments if a.week in wk2.weeks]
 
-    key = lambda a: (a.week, a.weekday, a.block, a.member_id)  # noqa: E731
+    key = lambda a: (a.week, a.weekday, a.block, a.member_id)
     assert sorted(key(a) for a in second.assignments if a.week != 2) == \
         sorted(key(a) for a in base), "范围外历史排班应原样保留在合并结果中"
 

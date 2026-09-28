@@ -42,7 +42,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from duty_system.parser import parse_schedule_path  # noqa: E402
+from duty_system.parser import parse_schedule_path
 
 SAMPLES = ROOT / "samples"
 OUT_DIR = SAMPLES / "desensitized"

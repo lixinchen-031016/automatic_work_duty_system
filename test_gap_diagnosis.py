@@ -7,9 +7,18 @@ from collections import Counter
 from duty_system.database import CourseRecord, Member, SpecialArrangement
 from duty_system.exporter import build_gap_df
 from duty_system.scheduler import (
-    GAP_DAY_CAP, GAP_ELIGIBLE, GAP_MIXED_CAP, GAP_NO_FREE, GAP_WEEK_CAP,
-    ScheduleConfig, build_busy_map, capacity_advice, compute_gaps, diagnose_gaps,
-    generate_schedule, summarize_gap_causes,
+    GAP_DAY_CAP,
+    GAP_ELIGIBLE,
+    GAP_MIXED_CAP,
+    GAP_NO_FREE,
+    GAP_WEEK_CAP,
+    ScheduleConfig,
+    build_busy_map,
+    capacity_advice,
+    compute_gaps,
+    diagnose_gaps,
+    generate_schedule,
+    summarize_gap_causes,
 )
 
 
@@ -115,7 +124,12 @@ def test_no_missed_slots_after_generation() -> None:
 
 def test_diagnosis_uses_same_context_as_scheduler() -> None:
     """诊断的分类结果必须与逐成员查看 reason() 的结论一致"""
-    from duty_system.scheduler import ScheduleContext, REASON_COURSE, REASON_DAY, REASON_WEEK
+    from duty_system.scheduler import (
+        REASON_COURSE,
+        REASON_DAY,
+        REASON_WEEK,
+        ScheduleContext,
+    )
 
     members = [member(i) for i in (1, 2, 3, 4)]
     courses = [course(1, 1, [1, 2]), course(2, 1, [3, 4])]
@@ -163,9 +177,8 @@ def test_odd_week_course_blocks_only_odd_weeks() -> None:
     from pathlib import Path
 
     from duty_system.database import Database
-    from duty_system.parser import ParsedSchedule, parse_cell
+    from duty_system.parser import BLOCK_SESSIONS, ParsedSchedule, parse_cell
     from duty_system.scheduler import ScheduleConfig, build_busy_map, generate_schedule
-    from duty_system.parser import BLOCK_SESSIONS
 
     odd_course = parse_cell("\n课程A\n张三(讲师)\n1-16单周([周])[01-02节]\n教1\n", 1)
     assert odd_course and odd_course[0].week_list == [1, 3, 5, 7, 9, 11, 13, 15]

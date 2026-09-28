@@ -68,7 +68,8 @@ def test_bash_steps_are_syntactically_valid(job: str, name: str, script: str) ->
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("环境没有 bash，跳过脚本语法检查")
-    proc = subprocess.run([bash, "-n"], input=script, text=True, capture_output=True)
+    proc = subprocess.run(
+        [bash, "-n"], input=script, text=True, capture_output=True, check=False)
     assert proc.returncode == 0, (
         f"{job} / {name} 的 shell 脚本语法错误：\n{proc.stderr.strip()}\n--- 脚本 ---\n{script}")
 

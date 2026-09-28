@@ -97,10 +97,6 @@ class ScheduleContext:
         for a in assignments:
             self.assign(a.member_id, a.week, a.weekday, a.block)
 
-    def load_assignments(self, assignments: list[Assignment]) -> None:
-        """别名，语义与 load 一致（供微调候选构建使用）"""
-        self.load(assignments)
-
     def assign(self, member_id: int, week: int, weekday: int, block: int) -> None:
         key = (member_id, week, weekday, block)
         if key in self.assigned:
@@ -610,13 +606,6 @@ def generate_schedule(
     result.gaps = compute_gaps(result.assignments, config, is_off, is_class)
     result.member_stats = rebuild_member_stats(members, result.assignments)
     return result
-
-
-def _name_of(members: list[Member], member_id: int) -> str:
-    for m in members:
-        if m.id == member_id:
-            return m.name
-    return ""
 
 
 def rebuild_member_stats(

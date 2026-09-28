@@ -856,3 +856,26 @@ def parse_schedule_path(path: str | Path) -> ParsedSchedule:
     """从本地文件路径解析课表"""
     path = Path(path)
     return parse_schedule_file(path.read_bytes(), path.name)
+
+
+def parse_schedule_files(
+    files: list[str | Path],
+) -> tuple[list[ParsedSchedule], list[str], list[str]]:
+    """批量读取并解析课表，逐文件隔离错误，返回课表、错误和警告。"""
+    schedules: list[ParsedSchedule] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    for file_name in files:
+        path = Path(file_name)
+        try:
+            schedule = parse_schedule_file(path.read_bytes(), path.name)
+        except Exception as exc:  # noqa: BLE001 - 批量导入需逐文件隔离错误
+            errors.append(f"{path.name}：{exc}")
+            continue
+        if not schedule.courses and not schedule.name:
+            errors.append(
+                f"{path.name}：未解析到课程信息，请确认是教务系统导出的个人课表")
+            continue
+        schedules.append(schedule)
+        warnings.extend(f"{path.name}：{warning}" for warning in schedule.warnings)
+    return schedules, errors, warnings

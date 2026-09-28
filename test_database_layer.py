@@ -167,6 +167,26 @@ def test_term_calendar_crud_and_validation(tmp_path: Path) -> None:
         raise AssertionError("补课项指向的自然工作日不是 off 时应报错")
 
 
+def test_replace_calendar_is_atomic(tmp_path: Path) -> None:
+    """替换日历失败时必须回滚，不能留下已清空的日历表。"""
+    db = new_db(tmp_path)
+    original = CalendarEntry(date(2026, 10, 15), "off", note="原配置")
+    replacement = CalendarEntry(date(2026, 10, 17), "class", 5, 4, "新配置")
+    db.replace_calendar([original])
+
+    db._UPSERT_CALENDAR_SQL = "INSERT INTO missing_table VALUES (?)"
+    try:
+        db.replace_calendar([replacement])
+    except sqlite3.Error:
+        pass
+    else:
+        raise AssertionError("损坏的 SQL 应触发异常")
+    finally:
+        del db._UPSERT_CALENDAR_SQL
+
+    assert db.list_calendar() == [original], "替换失败后原日历应完整保留"
+
+
 def test_upsert_replaces_courses_and_cascades(tmp_path: Path) -> None:
     """重传课表整体替换课程；删除成员级联清理课程/排班/请假"""
     from duty_system.parser import Course

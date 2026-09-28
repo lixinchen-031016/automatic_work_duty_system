@@ -146,6 +146,155 @@ def display_columns(matrix: AvailabilityMatrix) -> list[GanttColumn]:
     return columns
 
 
+@dataclass(frozen=True)
+class _AvailabilitySlot:
+    """内部统一时段键；key 为星期或真实日期，取决于输出模型。"""
+
+    key: int | date
+    logical_week: int
+    logical_weekday: int
+    block: int
+    is_off: bool = False
+
+
+def _build_course_index(
+    members: list[Member],
+    courses: list[CourseRecord],
+    slots: list[_AvailabilitySlot],
+) -> dict[tuple[int, int, int, int], set[str]]:
+    """构建当前可见逻辑日的课程名索引，包含整周集中安排。"""
+    member_ids = {member.id for member in members}
+    active_pairs = {
+        (slot.logical_week, slot.logical_weekday)
+        for slot in slots if not slot.is_off
+    }
+    active_weeks = {week for week, _weekday in active_pairs}
+    needed_weeks_by_weekday: dict[int, set[int]] = {}
+    for week, weekday in active_pairs:
+        needed_weeks_by_weekday.setdefault(weekday, set()).add(week)
+
+    index: dict[tuple[int, int, int, int], set[str]] = {}
+    for course in courses:
+        if course.member_id not in member_ids:
+            continue
+        if course.weekday == WHOLE_WEEK_WEEKDAY:
+            active = active_weeks.intersection(course.week_list)
+            for week in active:
+                for weekday in range(1, 8):
+                    for session in WHOLE_WEEK_SESSIONS:
+                        index.setdefault(
+                            (course.member_id, week, weekday, session),
+                            set()).add(course.course_name)
+            continue
+        active = needed_weeks_by_weekday.get(
+            course.weekday, set()).intersection(course.week_list)
+        for week in active:
+            for session in course.session_list:
+                index.setdefault(
+                    (course.member_id, week, course.weekday, session),
+                    set()).add(course.course_name)
+    return index
+
+
+def _build_special_index(
+    members: list[Member],
+    arrangements: list[SpecialArrangement] | None,
+    slots: list[_AvailabilitySlot],
+) -> dict[tuple[int, int, int, int], set[str]]:
+    """构建当前可见逻辑日的长期特殊安排索引。"""
+    member_ids = {member.id for member in members}
+    active_pairs = {
+        (slot.logical_week, slot.logical_weekday)
+        for slot in slots if not slot.is_off
+    }
+    index: dict[tuple[int, int, int, int], set[str]] = {}
+    for arrangement in arrangements or []:
+        if arrangement.member_id not in member_ids:
+            continue
+        label = arrangement.reason.strip() or "其他安排"
+        active = {
+            (week, arrangement.weekday)
+            for week in arrangement.week_list
+            if (week, arrangement.weekday) in active_pairs
+        }
+        for week, weekday in active:
+            for session in arrangement.session_list:
+                index.setdefault(
+                    (arrangement.member_id, week, weekday, session),
+                    set()).add(label)
+    return index
+
+
+def _fill_availability(
+    members: list[Member],
+    slots: list[_AvailabilitySlot],
+    busy: dict[int, set],
+    special_busy: dict[int, set],
+    leave_map: dict[tuple[int, int, int], str],
+    duty_set: set[tuple[int, int, int, int]],
+    course_index: dict[tuple[int, int, int, int], set[str]],
+    special_index: dict[tuple[int, int, int, int], set[str]],
+) -> tuple[
+    list[list[bool]],
+    dict[tuple[int, int | date, int], list[str]],
+    dict[tuple[int, int | date], str],
+    set[tuple[int, int | date, int]],
+    dict[tuple[int, int | date, int], list[str]],
+    list[int],
+]:
+    """按统一规则计算忙闲、课程原因、请假、值班和特殊安排。"""
+    free: list[list[bool]] = []
+    busy_courses: dict[tuple[int, int | date, int], list[str]] = {}
+    leave_info: dict[tuple[int, int | date], str] = {}
+    duty_cells: set[tuple[int, int | date, int]] = set()
+    special_info: dict[tuple[int, int | date, int], list[str]] = {}
+
+    for row, member in enumerate(members):
+        member_busy = busy.get(member.id, ())
+        member_special = special_busy.get(member.id, ())
+        row_free: list[bool] = []
+        for slot in slots:
+            if slot.is_off:
+                row_free.append(False)
+                continue
+            logical_key = (member.id, slot.logical_week, slot.logical_weekday)
+            if logical_key in leave_map:
+                row_free.append(False)
+                leave_info[(row, slot.key)] = leave_map[logical_key]
+                continue
+            duty_key = (*logical_key, slot.block)
+            if duty_key in duty_set:
+                row_free.append(False)
+                duty_cells.add((row, slot.key, slot.block))
+                continue
+
+            names: set[str] = set()
+            special_names: set[str] = set()
+            is_free = True
+            for session in BLOCK_SESSIONS[slot.block]:
+                busy_key = (slot.logical_week, slot.logical_weekday, session)
+                if busy_key in member_busy:
+                    is_free = False
+                    names |= course_index.get(
+                        (member.id, *busy_key), set())
+                if busy_key in member_special:
+                    is_free = False
+                    special_names |= special_index.get(
+                        (member.id, *busy_key), set())
+            row_free.append(is_free)
+            if names:
+                busy_courses[(row, slot.key, slot.block)] = sorted(names)
+            if special_names:
+                special_info[(row, slot.key, slot.block)] = sorted(special_names)
+        free.append(row_free)
+
+    free_counts = [
+        sum(1 for row in free if row[index])
+        for index in range(len(slots))
+    ]
+    return free, busy_courses, leave_info, duty_cells, special_info, free_counts
+
+
 def build_availability(
     members: list[Member],
     courses: list[CourseRecord],
@@ -158,11 +307,7 @@ def build_availability(
     special_arrangements: list[SpecialArrangement] | None = None,
     calendar: TermCalendar | None = None,
 ) -> AvailabilityMatrix:
-    """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）
-
-    busy 可传入调用方缓存的忙时表（见 scheduler.build_busy_map）：
-    该表展开成本高，界面按周切换空闲时段总览时无需重复构建。
-    """
+    """计算第 week 周各成员忙闲矩阵（逻辑星期版本）。"""
     if busy is None:
         busy = build_busy_map(members, courses)
     calendar_dates: dict[int, date | None] = {}
@@ -177,91 +322,40 @@ def build_availability(
                 off_dates[weekday] = off_date
             if actual_date is None:
                 off_weekdays.add(weekday)
+
+    slots = [(weekday, block) for weekday in sorted(weekdays)
+             for block in sorted(blocks)]
+    internal_slots = [
+        _AvailabilitySlot(
+            key=weekday,
+            logical_week=week,
+            logical_weekday=weekday,
+            block=block,
+            is_off=weekday in off_weekdays,
+        )
+        for weekday, block in slots
+    ]
     special_busy = build_special_busy_map(members, special_arrangements)
-    leave_map = {(l.member_id, l.weekday): l.reason
-                 for l in (leaves or []) if l.week == week}
-    duty_set = {(a.member_id, a.weekday, a.block)
-                for a in (assignments or []) if a.week == week}
-    # 课程名索引：(成员id, 星期, 节次) -> 课程名集合（供 tooltip / 单元格详情）。
-    # 先按 week_list 过滤课程，再用忙时表定位本门课的具体节次；不能只看忙时表，
-    # 因为不同课程可能占用同一星期节次，但只在其他周上课。
-    course_index: dict[tuple[int, int, int], set[str]] = {}
-    special_index: dict[tuple[int, int, int], set[str]] = {}
-    for a in special_arrangements or []:
-        if week not in a.week_list:
-            continue
-        label = a.reason.strip() or "其他安排"
-        for session in a.session_list:
-            special_index.setdefault(
-                (a.member_id, a.weekday, session), set()).add(label)
-    member_ids = {m.id for m in members}
-    for c in courses:
-        if c.member_id not in member_ids:
-            continue
-        if week not in c.week_list:
-            continue
-        member_busy = busy.get(c.member_id)
-        if not member_busy:
-            continue
-        if c.weekday == WHOLE_WEEK_WEEKDAY:
-            # 整周集中安排（军训/思政实践）没有星期与节次：该周每一天每一节都算被
-            # 占用，课程名也要挂上去——否则空闲时段总览上是一整片「忙但没有原因」的格子，
-            # 用户看不出为什么这个人整周都排不了班。
-            for day in range(1, 8):
-                for sec in WHOLE_WEEK_SESSIONS:
-                    course_index.setdefault((c.member_id, day, sec), set()).add(c.course_name)
-            continue
-        weekday = c.weekday
-        active = [sec for sec in c.session_list if (week, weekday, sec) in member_busy]
-        if not active:
-            continue
-        for session in active:
-            course_index.setdefault((c.member_id, weekday, session), set()).add(c.course_name)
-
-    slots = [(d, b) for d in sorted(weekdays) for b in sorted(blocks)]
-    free: list[list[bool]] = []
-    busy_courses: dict[tuple[int, int, int], list[str]] = {}
-    leave_info: dict[tuple[int, int], str] = {}
-    duty_cells: set[tuple[int, int, int]] = set()
-    special_info: dict[tuple[int, int, int], list[str]] = {}
-    for m in members:
-        row = len(free)  # 当前行号
-        member_busy = busy.get(m.id, ())
-        member_special = special_busy.get(m.id, ())
-        row_free: list[bool] = []
-        for d, b in slots:
-            if d in off_weekdays:
-                row_free.append(False)
-                continue
-            if (m.id, d) in leave_map:
-                row_free.append(False)
-                leave_info[(row, d)] = leave_map[(m.id, d)]
-                continue
-            if (m.id, d, b) in duty_set:
-                row_free.append(False)
-                duty_cells.add((row, d, b))
-                continue
-            names: set[str] = set()
-            special_names: set[str] = set()
-            is_free = True
-            for s in BLOCK_SESSIONS[b]:
-                if (week, d, s) in member_busy:
-                    is_free = False
-                    names |= course_index.get((m.id, d, s), set())
-                if (week, d, s) in member_special:
-                    is_free = False
-                    special_names |= special_index.get((m.id, d, s), set())
-            row_free.append(is_free)
-            if names:
-                busy_courses[(row, d, b)] = sorted(names)
-            if special_names:
-                special_info[(row, d, b)] = sorted(special_names)
-        free.append(row_free)
-
-    free_counts = [sum(1 for row in free if row[i]) for i in range(len(slots))]
+    leave_map = {
+        (leave.member_id, leave.week, leave.weekday): leave.reason
+        for leave in (leaves or []) if leave.week == week
+    }
+    duty_set = {
+        (assignment.member_id, assignment.week,
+         assignment.weekday, assignment.block)
+        for assignment in (assignments or []) if assignment.week == week
+    }
+    course_index = _build_course_index(members, courses, internal_slots)
+    special_index = _build_special_index(
+        members, special_arrangements, internal_slots)
+    free, busy_courses, leave_info, duty_cells, special_info, free_counts = (
+        _fill_availability(
+            members, internal_slots, busy, special_busy, leave_map, duty_set,
+            course_index, special_index)
+    )
     return AvailabilityMatrix(
         week=week,
-        member_names=[m.name for m in members],
+        member_names=[member.name for member in members],
         slots=slots,
         free=free,
         busy_courses=busy_courses,
@@ -290,21 +384,12 @@ def build_calendar_availability(
     """按自然日期周构建空闲时段总览；补课日自动纳入实际周末。"""
     if busy is None:
         busy = build_busy_map(members, courses)
-    special_busy = build_special_busy_map(members, special_arrangements)
-    leave_map = {
-        (leave.member_id, leave.week, leave.weekday): leave.reason
-        for leave in (leaves or [])
-    }
-    duty_set = {
-        (a.member_id, a.week, a.weekday, a.block)
-        for a in (assignments or [])
-    }
     week_start = calendar.term_start + timedelta(days=(week - 1) * 7)
     class_dates = {
         entry.date for entry in calendar.entries if entry.override_type == "class"
     }
     columns: list[CalendarGanttColumn] = []
-    logical_by_column: list[tuple[int, int] | None] = []
+    internal_slots: list[_AvailabilitySlot] = []
     for day_offset in range(7):
         actual_date = week_start + timedelta(days=day_offset)
         logical = calendar.date_to_logical(actual_date)
@@ -319,95 +404,32 @@ def build_calendar_availability(
                 logical_weekday=logical[1] if logical else None,
                 is_off=logical is None,
             ))
-            logical_by_column.append(logical)
+            internal_slots.append(_AvailabilitySlot(
+                key=actual_date,
+                logical_week=logical[0] if logical else week,
+                logical_weekday=logical[1] if logical else actual_date.isoweekday(),
+                block=block,
+                is_off=logical is None,
+            ))
 
-    # 只索引当前自然周实际出现的逻辑日，避免 300 人场景把全部课程展开到
-    # 所有周次/节次（会放大成数十万次无用的集合写入）。
-    needed_weeks_by_weekday: dict[int, set[int]] = {}
-    for logical in logical_by_column:
-        if logical is None:
-            continue
-        logical_week, logical_weekday = logical
-        needed_weeks_by_weekday.setdefault(logical_weekday, set()).add(logical_week)
-    member_ids = {member.id for member in members}
-    course_index: dict[tuple[int, int, int, int], set[str]] = {}
-    for course in courses:
-        if course.member_id not in member_ids:
-            continue
-        needed_weeks = needed_weeks_by_weekday.get(course.weekday, set())
-        if not needed_weeks:
-            continue
-        active_weeks = needed_weeks.intersection(course.week_list)
-        if not active_weeks:
-            continue
-        for week_number in active_weeks:
-            for session in course.session_list:
-                course_index.setdefault(
-                    (course.member_id, week_number, course.weekday, session),
-                    set()).add(course.course_name)
-    special_index: dict[tuple[int, int, int, int], set[str]] = {}
-    for arrangement in special_arrangements or []:
-        needed_weeks = needed_weeks_by_weekday.get(arrangement.weekday, set())
-        if (arrangement.member_id not in member_ids or not needed_weeks):
-            continue
-        active_weeks = needed_weeks.intersection(arrangement.week_list)
-        if not active_weeks:
-            continue
-        label = arrangement.reason.strip() or "其他安排"
-        for week_number in active_weeks:
-            for session in arrangement.session_list:
-                special_index.setdefault(
-                    (arrangement.member_id, week_number,
-                     arrangement.weekday, session), set()).add(label)
-
-    free: list[list[bool]] = []
-    busy_courses: dict[tuple[int, date, int], list[str]] = {}
-    leave_info: dict[tuple[int, date], str] = {}
-    duty_cells: set[tuple[int, date, int]] = set()
-    special_info: dict[tuple[int, date, int], list[str]] = {}
-    for row, member in enumerate(members):
-        member_busy = busy.get(member.id, ())
-        member_special = special_busy.get(member.id, ())
-        row_free: list[bool] = []
-        for column, logical in zip(columns, logical_by_column):
-            if logical is None:
-                row_free.append(False)
-                continue
-            logical_week, logical_weekday = logical
-            if (member.id, logical_week, logical_weekday) in leave_map:
-                row_free.append(False)
-                leave_info[(row, column.date)] = leave_map[
-                    (member.id, logical_week, logical_weekday)]
-                continue
-            if (member.id, logical_week, logical_weekday, column.block) in duty_set:
-                row_free.append(False)
-                duty_cells.add((row, column.date, column.block))
-                continue
-            names: set[str] = set()
-            special_names: set[str] = set()
-            is_free = True
-            for session in BLOCK_SESSIONS[column.block]:
-                if (logical_week, logical_weekday, session) in member_busy:
-                    is_free = False
-                    names |= course_index.get(
-                        (member.id, logical_week, logical_weekday, session),
-                        set())
-                if (logical_week, logical_weekday, session) in member_special:
-                    is_free = False
-                    special_names |= special_index.get(
-                        (member.id, logical_week, logical_weekday, session),
-                        set())
-            row_free.append(is_free)
-            if names:
-                busy_courses[(row, column.date, column.block)] = sorted(names)
-            if special_names:
-                special_info[(row, column.date, column.block)] = sorted(special_names)
-        free.append(row_free)
-
-    free_counts = [
-        sum(1 for row in free if row[index])
-        for index in range(len(columns))
-    ]
+    special_busy = build_special_busy_map(members, special_arrangements)
+    leave_map = {
+        (leave.member_id, leave.week, leave.weekday): leave.reason
+        for leave in (leaves or [])
+    }
+    duty_set = {
+        (assignment.member_id, assignment.week,
+         assignment.weekday, assignment.block)
+        for assignment in (assignments or [])
+    }
+    course_index = _build_course_index(members, courses, internal_slots)
+    special_index = _build_special_index(
+        members, special_arrangements, internal_slots)
+    free, busy_courses, leave_info, duty_cells, special_info, free_counts = (
+        _fill_availability(
+            members, internal_slots, busy, special_busy, leave_map, duty_set,
+            course_index, special_index)
+    )
     return CalendarAvailabilityMatrix(
         week=week,
         member_names=[member.name for member in members],

@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import (  # noqa: E402
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
@@ -27,11 +27,11 @@ from PySide6.QtWidgets import (  # noqa: E402
     QTableWidget,
 )
 
-import app as appmod  # noqa: E402
-from duty_system.calendar import CalendarEntry  # noqa: E402
-from duty_system.database import Member  # noqa: E402
-from duty_system.parser import BLOCK_SESSIONS, Course, ParsedSchedule  # noqa: E402
-from duty_system.scheduler import (  # noqa: E402
+import app as appmod
+from duty_system.calendar import CalendarEntry
+from duty_system.database import Member
+from duty_system.parser import BLOCK_SESSIONS, Course, ParsedSchedule
+from duty_system.scheduler import (
     build_busy_map,
     compute_gaps,
     replacement_candidates,
@@ -368,7 +368,7 @@ def test_async_generate_updates_ui_and_db(window, qt_app) -> None:
     assert window.tabs.currentIndex() == 0, "生成后应切到排班表页"
 
     stored = window.db.load_assignments()
-    key = lambda a: (a.week, a.weekday, a.block, a.member_id)  # noqa: E731
+    key = lambda a: (a.week, a.weekday, a.block, a.member_id)
     assert sorted(key(a) for a in stored) == sorted(key(a) for a in result.assignments), \
         "落库结果应与计算结果一致"
     assert window.gantt_table.columnCount() == 13, "甘特图应已刷新（成员列 + 汇总列）"
@@ -384,6 +384,46 @@ def test_async_generate_updates_ui_and_db(window, qt_app) -> None:
     after = {r[0]: r[1] for r in conn.execute("SELECT id, member_id FROM duty_assignments")}
     conn.close()
     assert before == after, "重复生成相同排班不应重写数据行"
+
+
+def test_upload_files_runs_parser_in_background(window, qt_app, monkeypatch) -> None:
+    """批量课表读取和解析应走后台任务，只把数据库写入放回主线程。"""
+    sample = (
+        Path(__file__).parent / "samples" / "desensitized"
+        / "学生个人课表_9999800598.xls"
+    )
+    monkeypatch.setattr(
+        appmod.QFileDialog,
+        "getOpenFileNames",
+        staticmethod(lambda *args, **kwargs: ([str(sample)], "")),
+    )
+
+    window.upload_files()
+    assert window.busy, "解析任务应立即进入忙碌状态"
+    assert wait_idle(window, qt_app)
+    assert len(window.members()) == 1, "后台解析完成后应写回成员"
+
+
+def test_database_backup_runs_in_background(
+    window,
+    qt_app,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """数据库迁移应后台执行，成功后主线程再切换数据库。"""
+    target_dir = tmp_path / "moved"
+    target_dir.mkdir()
+    monkeypatch.setattr(
+        appmod.QFileDialog,
+        "getExistingDirectory",
+        staticmethod(lambda *args, **kwargs: str(target_dir)),
+    )
+
+    window.change_db_location()
+    assert window.busy, "数据库备份应立即进入忙碌状态"
+    assert wait_idle(window, qt_app)
+    assert Path(window.db.path) == target_dir / "ui.db"
+    assert (target_dir / "ui.db").exists()
 
 
 def test_gantt_table_reuses_items(window, qt_app) -> None:
@@ -606,7 +646,7 @@ def test_stale_marking_and_empty_state(window) -> None:
 def test_busy_map_is_cached_and_reused(window, monkeypatch) -> None:
     """忙时表展开成本高，甘特图刷新不应重建它（改由缓存提供）"""
     seed_members(window, 8)
-    import duty_system.gantt as gantt
+    from duty_system import gantt
 
     calls = {"n": 0}
     original = appmod.build_busy_map
@@ -856,6 +896,38 @@ def test_table_png_auto_wraps_long_values(qt_app, tmp_path: Path) -> None:
     long_img = QImage(str(long_path))
     assert not short_img.isNull() and not long_img.isNull()
     assert long_img.height() > short_img.height(), "长内容应增加 PNG 行高"
+
+
+def test_png_exports_are_paginated(qt_app, tmp_path: Path) -> None:
+    """大表格和大量成员标签应分页，不能生成超宽 QImage。"""
+    import pandas as pd
+    from PySide6.QtGui import QImage
+
+    wide = pd.DataFrame({
+        "周次": ["第1周"],
+        "星期": ["周一"],
+        "日期": ["9月14日"],
+        **{f"成员{index:03d}": ["张三"] for index in range(90)},
+    })
+    table_paths = appmod.render_table_png(
+        wide, "值班排班表", "压力测试", tmp_path / "wide.png")
+    assert len(table_paths) > 1
+    for path in table_paths:
+        image = QImage(str(path))
+        assert not image.isNull()
+        assert image.width() <= 5000
+
+    charts = [(
+        "各成员值班总次数",
+        [(f"成员{index:03d}", index % 5) for index in range(120)],
+        "#007aff",
+    )]
+    chart_paths = appmod.render_charts_png(charts, tmp_path / "charts.png")
+    assert len(chart_paths) > 1
+    for path in chart_paths:
+        image = QImage(str(path))
+        assert not image.isNull()
+        assert image.width() <= 5000
 
 
 def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:

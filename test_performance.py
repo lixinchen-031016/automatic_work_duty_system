@@ -12,10 +12,9 @@ from pathlib import Path
 
 import pytest
 
-
-from duty_system.database import CourseRecord, Database, Member, Assignment
+from duty_system.database import Assignment, CourseRecord, Database, Member
 from duty_system.gantt import build_availability
-from duty_system.parser import ParsedSchedule, Course
+from duty_system.parser import Course, ParsedSchedule
 from duty_system.scheduler import ScheduleConfig, build_busy_map, generate_schedule
 
 BUDGET_S = {
@@ -177,7 +176,7 @@ def test_ui_refresh_budget_with_300_members(tmp_path) -> None:
     覆盖两条已优化的路径：表格单元格复用（fill_table / _fill_gantt_table）
     与忙时表、单元格状态缓存。
     """
-    app, win = _build_window(tmp_path, 300)
+    _app, win = _build_window(tmp_path, 300)
 
     win.refresh_schedule_tabs()
     _, tabs = timed(win.refresh_schedule_tabs)
@@ -193,7 +192,7 @@ def test_ui_refresh_budget_with_300_members(tmp_path) -> None:
 
 def test_gantt_row_toggle_is_cheap(tmp_path) -> None:
     """切换「查看周次」不应重建整表的单元格对象（缓存 + 复用生效）"""
-    app, win = _build_window(tmp_path, 120)
+    _app, win = _build_window(tmp_path, 120)
     win.refresh_gantt()
     before = win.gantt_table.item(0, 0)
 
@@ -208,7 +207,7 @@ def test_gantt_row_toggle_is_cheap(tmp_path) -> None:
 
 def test_gap_diagnosis_is_cached(tmp_path) -> None:
     """缺口诊断（逐时段逐成员判定）应缓存，重复刷新不重复计算"""
-    app, win = _build_window(tmp_path, 60)
+    _app, win = _build_window(tmp_path, 60)
     win.refresh_schedule_tabs()
     first = win._gap_cache
     assert first is not None, "首次刷新应完成诊断"

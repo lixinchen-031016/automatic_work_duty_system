@@ -18,9 +18,10 @@ from collections import Counter, deque
 from duty_system.database import CourseRecord, Member
 from duty_system.parser import BLOCK_SESSIONS
 from duty_system.scheduler import (
-    ScheduleConfig, build_busy_map, generate_schedule,
+    ScheduleConfig,
+    build_busy_map,
+    generate_schedule,
 )
-
 
 # --------------------------------------------------------------------------- #
 # 最大流（Dinic）：求覆盖最优的排班方案
@@ -117,7 +118,7 @@ def optimal_coverage(
             if any((w, d, s) in busy.get(mid, ()) for s in BLOCK_SESSIONS[b]):
                 continue
             din.add_edge(node, idx_slot[(w, d, b)], 1)
-    for slot, node in idx_slot.items():
+    for node in idx_slot.values():
         din.add_edge(node, sink, config.per_slot)
     return din.max_flow(source, sink)
 

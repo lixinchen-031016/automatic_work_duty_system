@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -205,7 +206,8 @@ class SpecialArrangement:
 class Database:
     def __init__(self, path: str | Path = "duty_system.db"):
         self.path = str(path)
-        with self._connect() as conn:
+        with self._connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
             self._migrate(conn)
 
@@ -220,15 +222,26 @@ class Database:
                 conn.execute(sql)
             conn.execute(f"PRAGMA user_version = {target}")
 
-    def _connect(self) -> sqlite3.Connection:
-        # WAL：桌面单用户场景下读写并发更稳、写入更快；
-        # busy_timeout 避免与后台线程同时写时直接抛「database is locked」
+    def _open_connection(self) -> sqlite3.Connection:
+        """创建连接并设置连接级 PRAGMA。"""
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         return conn
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """数据库写事务上下文：异常回滚，结束时始终关闭连接。"""
+        conn = self._open_connection()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ---------- 备份 / 迁移 ----------
 
@@ -241,7 +254,7 @@ class Database:
         """
         target = Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        src = self._connect()
+        src = self._open_connection()
         dst = sqlite3.connect(target)
         try:
             src.backup(dst)
@@ -256,7 +269,7 @@ class Database:
 
     def upsert_member(self, schedule: ParsedSchedule) -> int:
         """新增或更新成员（按 学号+姓名 唯一），并整体替换其课程，返回成员 id"""
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT id FROM members WHERE student_id = ? AND name = ?",
                 (schedule.student_id, schedule.name),
@@ -296,7 +309,7 @@ class Database:
             return member_id
 
     def list_members(self) -> list[Member]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT m.*, COUNT(c.id) AS course_count FROM members m
                    LEFT JOIN courses c ON c.member_id = m.id
@@ -310,11 +323,11 @@ class Database:
             ) for r in rows]
 
     def delete_member(self, member_id: int) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
 
     def get_member(self, member_id: int) -> Member | None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             r = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
             return Member(
                 id=r["id"], name=r["name"], student_id=r["student_id"], term=r["term"],
@@ -331,7 +344,7 @@ class Database:
             sql += " WHERE member_id = ?"
             params = (member_id,)
         sql += " ORDER BY member_id, weekday, course_name"
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [CourseRecord(
                 id=r["id"], member_id=r["member_id"], course_name=r["course_name"],
@@ -367,28 +380,48 @@ class Database:
             )
         raise TypeError("日历条目必须是 CalendarEntry、dict 或 tuple/list")
 
+    _UPSERT_CALENDAR_SQL = """INSERT INTO term_calendar
+        (date, override_type, maps_to_week, maps_to_weekday, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            override_type = excluded.override_type,
+            maps_to_week = excluded.maps_to_week,
+            maps_to_weekday = excluded.maps_to_weekday,
+            note = excluded.note"""
+
+    @staticmethod
+    def _calendar_values(
+        rows: Iterable[CalendarEntry],
+    ) -> list[tuple[str, str, int | None, int | None, str]]:
+        return [
+            (entry.date.isoformat(), entry.override_type, entry.maps_to_week,
+             entry.maps_to_weekday, entry.note)
+            for entry in rows
+        ]
+
     def upsert_calendar(
         self,
         entries: Iterable[CalendarEntry | dict | tuple | list],
     ) -> None:
         """按日期新增或覆盖学期日历项。"""
         rows = [self._coerce_calendar_entry(entry) for entry in entries]
-        with self._connect() as conn:
-            conn.executemany(
-                """INSERT INTO term_calendar
-                       (date, override_type, maps_to_week, maps_to_weekday, note)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(date) DO UPDATE SET
-                       override_type = excluded.override_type,
-                       maps_to_week = excluded.maps_to_week,
-                       maps_to_weekday = excluded.maps_to_weekday,
-                       note = excluded.note""",
-                [(e.date.isoformat(), e.override_type, e.maps_to_week,
-                  e.maps_to_weekday, e.note) for e in rows],
-            )
+        with self._connection() as conn:
+            conn.executemany(self._UPSERT_CALENDAR_SQL, self._calendar_values(rows))
+
+    def replace_calendar(
+        self,
+        entries: Iterable[CalendarEntry | dict | tuple | list],
+    ) -> None:
+        """原子替换全部学期日历项，失败时保留原数据。"""
+        rows = [self._coerce_calendar_entry(entry) for entry in entries]
+        values = self._calendar_values(rows)
+        with self._connection() as conn:
+            conn.execute("DELETE FROM term_calendar")
+            if values:
+                conn.executemany(self._UPSERT_CALENDAR_SQL, values)
 
     def list_calendar(self) -> list[CalendarEntry]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM term_calendar ORDER BY date, override_type"
             ).fetchall()
@@ -401,7 +434,7 @@ class Database:
             ) for r in rows]
 
     def clear_calendar(self) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM term_calendar")
 
     def validate_calendar(
@@ -422,7 +455,7 @@ class Database:
     # ---------- 值班安排 ----------
 
     def clear_assignments(self) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM duty_assignments")
 
     def delete_assignments_for_weeks(self, weeks: list[int]) -> None:
@@ -430,13 +463,13 @@ class Database:
         if not weeks:
             return
         ph = ",".join("?" * len(weeks))
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(f"DELETE FROM duty_assignments WHERE week IN ({ph})", weeks)
 
     def save_assignments(self, assignments: list[Assignment]) -> None:
         """幂等写入：唯一键冲突时不做任何改动。
         不再使用 INSERT OR REPLACE（那会先删后插，使自增 id 每轮膨胀）。"""
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executemany(
                 """INSERT INTO duty_assignments (week, weekday, block, member_id)
                    VALUES (?, ?, ?, ?)
@@ -458,7 +491,7 @@ class Database:
             return 0, 0
         want = {(a.week, a.weekday, a.block, a.member_id) for a in assignments}
         ph = ",".join("?" * len(weeks))
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 f"""SELECT week, weekday, block, member_id FROM duty_assignments
                     WHERE week IN ({ph})""",
@@ -491,7 +524,7 @@ class Database:
     ) -> None:
         """只重写单个 (周, 星期, 时段) 的安排——手动微调用，
         避免全表 clear + 全量重写的开销与中途失败风险。"""
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "DELETE FROM duty_assignments WHERE week = ? AND weekday = ? AND block = ?",
                 (week, weekday, block),
@@ -504,7 +537,7 @@ class Database:
             )
 
     def load_assignments(self) -> list[Assignment]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT a.week, a.weekday, a.block, a.member_id, m.name AS member_name
                    FROM duty_assignments a JOIN members m ON m.id = a.member_id
@@ -519,7 +552,7 @@ class Database:
 
     def add_leave(self, member_id: int, week: int, weekday: int, reason: str = "") -> None:
         """登记请假（同成员同周同星期重复登记则覆盖）"""
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO leaves (member_id, week, weekday, reason)
                    VALUES (?, ?, ?, ?)""",
@@ -527,7 +560,7 @@ class Database:
             )
 
     def remove_leave(self, leave_id: int) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM leaves WHERE id = ?", (leave_id,))
 
     def list_leaves(self, member_id: int | None = None) -> list[Leave]:
@@ -537,7 +570,7 @@ class Database:
             sql += " WHERE member_id = ?"
             params = (member_id,)
         sql += " ORDER BY week, weekday, member_id"
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [Leave(
                 id=r["id"], member_id=r["member_id"], week=r["week"],
@@ -575,7 +608,7 @@ class Database:
         """新增长期特殊安排；相同范围/星期/节次重复登记时覆盖原因。"""
         week_start, week_end, weekday, _sessions, sessions_json = self._normalize_special(
             week_start, week_end, weekday, session_list)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT INTO special_arrangements
                        (member_id, week_start, week_end, weekday, session_list, reason)
@@ -606,7 +639,7 @@ class Database:
         """修改一条长期特殊安排。"""
         week_start, week_end, weekday, _sessions, sessions_json = self._normalize_special(
             week_start, week_end, weekday, session_list)
-        with self._connect() as conn:
+        with self._connection() as conn:
             try:
                 conn.execute(
                     """UPDATE special_arrangements
@@ -637,7 +670,7 @@ class Database:
                 )
 
     def remove_special_arrangement(self, arrangement_id: int) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM special_arrangements WHERE id = ?", (arrangement_id,))
 
     def list_special_arrangements(
@@ -650,7 +683,7 @@ class Database:
             sql += " WHERE member_id = ?"
             params = (member_id,)
         sql += " ORDER BY member_id, week_start, week_end, weekday, session_list"
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [SpecialArrangement(
                 id=r["id"], member_id=r["member_id"], week_start=r["week_start"],

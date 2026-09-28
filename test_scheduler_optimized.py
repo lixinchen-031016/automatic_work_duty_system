@@ -8,7 +8,7 @@ from datetime import date
 
 from duty_system.calendar import CalendarEntry, TermCalendar
 from duty_system.database import Assignment, CourseRecord, Member, SpecialArrangement
-from duty_system.gantt import build_availability
+from duty_system.gantt import build_availability, build_calendar_availability
 from duty_system.parser import BLOCK_SESSIONS, WHOLE_WEEK_WEEKDAY
 from duty_system.scheduler import (
     REASON_COURSE,
@@ -303,6 +303,17 @@ def test_gantt_shows_reason_for_whole_week_courses() -> None:
     other = build_availability(members, courses, 12, [1, 2, 3, 4, 5], [1], assignments=[])
     assert all(other.free[0]), "非军训周不应被占用"
     assert not other.busy_courses
+
+    # 应用实际使用的自然日日历路径也必须带课程原因，不能只修旧矩阵入口。
+    calendar_matrix = build_calendar_availability(
+        members, courses, TermCalendar(date(2026, 9, 14), []),
+        11, [1, 2, 3, 4, 5], [1],
+    )
+    assert len(calendar_matrix.busy_courses) == len(calendar_matrix.columns)
+    assert all(
+        names == ["大学军事技能训练"]
+        for names in calendar_matrix.busy_courses.values()
+    )
 
 
 def test_gantt_only_shows_courses_for_selected_week() -> None:
