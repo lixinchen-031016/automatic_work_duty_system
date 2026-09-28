@@ -2,7 +2,7 @@
 
 功能：上传成员个人课表(.xls/.xlsx) -> 解析入库(SQLite) -> 按空闲时段生成排班表
      （避免课程/长期特殊安排冲突、每人每天只值一次、均衡分配）-> 界面展示与导出(Excel/CSV)
-     空闲甘特图：按周查看各成员忙闲、高亮全员空闲时段，方便安排任务
+     空闲时段总览：按周查看各成员忙闲、高亮全员空闲时段，方便安排任务
 
 运行：python app.py
 """
@@ -629,7 +629,7 @@ class MainWindow(QMainWindow):
         self._term_calendar_cache: TermCalendar | None = None
         self._calendar_error: str | None = None
         # 忙时表由「成员 + 课程」唯一决定，展开成本高（课程数 x 周次 x 节次），
-        # 甘特图与微调对话框都会用到，因此与课表缓存同生命周期
+        # 空闲时段总览与微调对话框都会用到，因此与课表缓存同生命周期
         self._busy_cache = None
         self._special_busy_cache = None
         # 缺口诊断结果（按排班结果对象缓存，避免每次刷新重复诊断）
@@ -637,7 +637,7 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[tuple[int, int, int, tuple[int, ...]]] = []
         self._redo_stack: list[tuple[int, int, int, tuple[int, ...]]] = []
         self._undo_limit = 50
-        # 甘特图单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
+        # 空闲时段总览单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
         self._gantt_cell_state: dict = {}
         self._pool = QThreadPool.globalInstance()
         self._busy = False
@@ -702,7 +702,7 @@ class MainWindow(QMainWindow):
                 cached = TermCalendar(term_start, self.calendar_entries())
             except ValueError as exc:
                 # 学期起始日调整后，历史日历项可能暂时越界。运行态先停用全部
-                # 覆盖，避免甘特图和排班刷新崩溃；保存/校验时仍会明确报错。
+                # 覆盖，避免空闲时段总览和排班刷新崩溃；保存/校验时仍会明确报错。
                 self._calendar_error = str(exc)
                 cached = TermCalendar(term_start, [])
             else:
@@ -826,7 +826,7 @@ class MainWindow(QMainWindow):
         title = QLabel("自动值班排班系统")
         title.setObjectName("appTitle")
         layout.addWidget(title)
-        subtitle = QLabel("解析课表 · 智能排班 · 空闲甘特")
+        subtitle = QLabel("解析课表 · 智能排班 · 空闲总览")
         subtitle.setObjectName("appSubtitle")
         layout.addWidget(subtitle)
 
@@ -1047,7 +1047,7 @@ class MainWindow(QMainWindow):
         grp_special = QGroupBox("长期特殊安排（修改课表）")
         grp_special.setToolTip(
             "把连续多周、每周固定星期/时段的安排补充到课表占用中；\n"
-            "自动排班、甘特图和手动微调都会避让。")
+            "自动排班、空闲时段总览和手动微调都会避让。")
         sp = QHBoxLayout(grp_special)
         sp.setContentsMargins(8, 4, 8, 8)
         sp.setSpacing(8)
@@ -1079,7 +1079,7 @@ class MainWindow(QMainWindow):
         v3.addWidget(grp_special)
 
         grp_leave = QGroupBox("请假登记（临时不可值班日）")
-        grp_leave.setToolTip("登记后重新生成排班将避开该天；甘特图中该天标红")
+        grp_leave.setToolTip("登记后重新生成排班将避开该天；空闲时段总览中该天标红")
         lv = QHBoxLayout(grp_leave)
         lv.setContentsMargins(8, 4, 8, 8)
         lv.setSpacing(8)
@@ -1126,7 +1126,7 @@ class MainWindow(QMainWindow):
         v4.addWidget(_card(self.gap_table), stretch=1)
         self.tabs.addTab(tab4, "值班统计")
 
-        # Tab5 空闲甘特图：成员空闲时段一览，方便安排任务
+        # Tab5 空闲时段总览：成员空闲时段一览，方便安排任务
         tab5 = QWidget()
         v5 = QVBoxLayout(tab5)
         v5.setContentsMargins(16, 14, 16, 16)
@@ -1136,7 +1136,7 @@ class MainWindow(QMainWindow):
         self.gantt_week = QSpinBox()
         self.gantt_week.setRange(1, 25)
         self.gantt_week.setValue(1)
-        self.gantt_week.setToolTip("甘特图按周查看（课程随周次变化）")
+        self.gantt_week.setToolTip("空闲时段总览按周查看（课程随周次变化）")
         self.gantt_week.valueChanged.connect(self.refresh_gantt)
         ctl.addWidget(self.gantt_week)
         legend = QLabel(
@@ -1149,7 +1149,7 @@ class MainWindow(QMainWindow):
         legend.setObjectName("secondary")
         ctl.addWidget(legend)
         ctl.addStretch()
-        self.btn_export_gantt = QPushButton("导出甘特图 Excel")
+        self.btn_export_gantt = QPushButton("导出空闲时段总览 Excel")
         self.btn_export_gantt.clicked.connect(self.export_gantt)
         self.btn_export_gantt.setEnabled(False)
         ctl.addWidget(self.btn_export_gantt)
@@ -1159,7 +1159,7 @@ class MainWindow(QMainWindow):
         self.gantt_hint.setWordWrap(True)
         v5.addWidget(self.gantt_hint)
         self.gantt_table = QTableWidget()
-        # 表头列宽/行高只设置一次：以前每次刷新甘特图都重设
+        # 表头列宽/行高只设置一次：以前每次刷新空闲时段总览都重设
         # ResizeToContents，会触发整表列宽重算，成员多时明显拖慢刷新
         gantt_header = self.gantt_table.horizontalHeader()
         gantt_header.setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -1169,7 +1169,7 @@ class MainWindow(QMainWindow):
         gantt_vertical_header.setDefaultSectionSize(44)
         gantt_vertical_header.setMinimumWidth(112)
         v5.addWidget(_card(self.gantt_table), stretch=1)
-        self.tabs.addTab(tab5, "空闲甘特图")
+        self.tabs.addTab(tab5, "空闲时段总览")
 
         # Tab6 统计图表：值班 / 请假情况可视化
         tab6 = QWidget()
@@ -1260,7 +1260,7 @@ class MainWindow(QMainWindow):
         if self.member_list.count() == 0:
             self.summary_label.setText(
                 "开始使用三步：① 上传成员课表（支持多选 .xls / .xlsx）→ ② 调整排班参数 → "
-                "③ 点击「生成排班表」。可在「空闲甘特图」页查看全员共同空闲时段，方便安排任务。")
+                "③ 点击「生成排班表」。可在「空闲时段总览」页查看全员共同空闲时段，方便安排任务。")
         else:
             self.summary_label.setText(
                 f"已就绪 {self.member_list.count()} 名成员，点击左下角「生成排班表」开始排班。")
@@ -2007,21 +2007,21 @@ class MainWindow(QMainWindow):
         self._clear_undo_redo()
         self.show_member_courses(index)
 
-    # ---------- 空闲甘特图 ----------
+    # ---------- 空闲时段总览 ----------
 
     def _on_tab_changed(self, index: int) -> None:
         tab = self.tabs.tabText(index)
-        if tab == "空闲甘特图":
+        if tab == "空闲时段总览":
             self.refresh_gantt()
         elif tab == "统计图表":
             self.refresh_charts()
 
     def _on_gantt_filter_changed(self) -> None:
-        if self.tabs.tabText(self.tabs.currentIndex()) == "空闲甘特图":
+        if self.tabs.tabText(self.tabs.currentIndex()) == "空闲时段总览":
             self.refresh_gantt()
 
     def _sync_gantt_week(self, week: int) -> None:
-        """值班起始周变化时甘特图跟随，切到甘特页即在排班起始周"""
+        """值班起始周变化时空闲时段总览跟随，切到总览页即在排班起始周"""
         self.gantt_week.setValue(week)
 
     def refresh_gantt(self) -> None:
@@ -2036,7 +2036,7 @@ class MainWindow(QMainWindow):
             self.gantt_table.clearContents()
             self.gantt_table.setRowCount(0)
             self.gantt_table.setColumnCount(0)
-            self.gantt_hint.setText("请先上传成员课表，并至少勾选一个值班星期和值班时段（甘特图跟随左侧筛选）。")
+            self.gantt_hint.setText("请先上传成员课表，并至少勾选一个值班星期和值班时段（空闲时段总览跟随左侧筛选）。")
             self.btn_export_gantt.setEnabled(False)
             return
 
@@ -2095,7 +2095,7 @@ class MainWindow(QMainWindow):
         先在 Python 里比较期望状态与上次写入的状态：完全一致就直接跳过，
         一次 Qt 属性访问都不做。读取 Qt 属性（text/background/foreground/
         toolTip/alignment）看似便宜，但成员多时每帧要读数万次，实测是
-        甘特图刷新里最大的一块开销。
+        空闲时段总览刷新里最大的一块开销。
         """
         key = (r, c)
         if cache.get(key) == state:
@@ -2204,14 +2204,14 @@ class MainWindow(QMainWindow):
         if m is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出甘特图 Excel", f"空闲甘特图_第{m.week}周.xlsx", "Excel 文件 (*.xlsx)")
+            self, "导出空闲时段总览 Excel", f"空闲时段总览_第{m.week}周.xlsx", "Excel 文件 (*.xlsx)")
         if not path:
             return
         target = Path(path)
         self.run_async(
-            "正在导出甘特图",
+            "正在导出空闲时段总览",
             lambda: target.write_bytes(export_gantt_excel(m)),
-            lambda _r: self.statusBar().showMessage(f"已导出甘特图 Excel：{target}"))
+            lambda _r: self.statusBar().showMessage(f"已导出空闲时段总览 Excel：{target}"))
 
     # ---------- 统计图表 ----------
 

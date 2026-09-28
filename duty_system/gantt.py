@@ -1,9 +1,9 @@
-"""成员空闲时段甘特图
+"""成员空闲时段总览
 
 数据层：计算第 W 周内各成员在每个 (星期, 时段块) 的忙闲状态，
 空闲判定与排班算法完全一致（时段块内每一节均无课、无长期特殊安排才算空闲）。
-展示：app.py 用 QTableWidget 染色绘制甘特图；本模块提供导出
-带填充色的 Excel 甘特图（行=星期x时段，列=成员，绿=空闲）。
+展示：app.py 用 QTableWidget 染色绘制空闲时段总览；本模块提供导出
+带填充色的 Excel 空闲时段总览（行=日期x时段，列=成员，绿=空闲）。
 
 性能：build_availability 接受调用方传入的 busy 忙时表（缓存后按周切换
 无需重建）；课程名索引复用忙时表判断「本周是否上课」，避免在 week_list
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import io
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -27,10 +28,80 @@ from .parser import (
 )
 from .scheduler import build_busy_map, build_special_busy_map
 
+_EXCEL_MAX_COLUMN_WIDTH = 42.0
+_EXCEL_LINE_HEIGHT = 16.0
+_EXCEL_ROW_PADDING = 5.0
+
+
+def _excel_text_width(text: str) -> int:
+    """按 Excel 字符宽近似计算文本宽度，中日韩字符按 2 个字符计。"""
+    return sum(
+        2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        for char in text
+    )
+
+
+def _excel_line_count(text: str, column_width: float) -> int:
+    """估算文本在指定列宽下换行后的行数。"""
+    from math import ceil
+
+    usable_width = max(4.0, column_width - 2.0)
+    return sum(
+        max(1, ceil(_excel_text_width(line) / usable_width))
+        for line in text.split("\n")
+    )
+
+
+def _fit_excel_layout(ws) -> None:
+    """按单元格内容设置列宽和行高，确保日期、课程无需手工调整即可完整显示。"""
+    from openpyxl.utils import get_column_letter
+
+    widths: dict[int, float] = {}
+    for column_index in range(1, ws.max_column + 1):
+        if column_index == 1:
+            widths[column_index] = 26.0
+        elif column_index == ws.max_column:
+            widths[column_index] = 12.0
+        else:
+            widths[column_index] = 14.0
+
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None or str(cell.value) == "":
+                continue
+            longest_line = max(
+                _excel_text_width(line)
+                for line in str(cell.value).split("\n")
+            )
+            widths[cell.column] = max(
+                widths[cell.column],
+                min(longest_line + 2.0, _EXCEL_MAX_COLUMN_WIDTH),
+            )
+
+    for column_index, width in widths.items():
+        ws.column_dimensions[get_column_letter(column_index)].width = width
+
+    # 前两行是成员表头；合并单元格需要预留两行高度。
+    ws.row_dimensions[1].height = 22.0
+    ws.row_dimensions[2].height = 22.0
+    for row in ws.iter_rows(min_row=3):
+        required_lines = 1
+        for cell in row:
+            if cell.value is None or str(cell.value) == "":
+                continue
+            required_lines = max(
+                required_lines,
+                _excel_line_count(str(cell.value), widths[cell.column]),
+            )
+        ws.row_dimensions[row[0].row].height = min(
+            409.0,
+            max(32.0, required_lines * _EXCEL_LINE_HEIGHT + _EXCEL_ROW_PADDING),
+        )
+
 
 @dataclass
 class AvailabilityMatrix:
-    """第 week 周各成员忙闲矩阵（甘特图数据源）"""
+    """第 week 周各成员忙闲矩阵（空闲时段总览数据源）"""
     week: int
     member_names: list[str]                                 # 行标签
     slots: list[tuple[int, int]]                            # 列 (星期, 时段块)
@@ -60,7 +131,7 @@ class AvailabilityMatrix:
 
 @dataclass(frozen=True)
 class CalendarGanttColumn:
-    """自然日期驱动的甘特图时段项。"""
+    """自然日期驱动的空闲时段总览时段项。"""
 
     date: date
     block: int
@@ -71,7 +142,7 @@ class CalendarGanttColumn:
 
 @dataclass
 class CalendarAvailabilityMatrix:
-    """自然周甘特图：补课日归属其真实日期所在周。"""
+    """自然周空闲时段总览：补课日归属其真实日期所在周。"""
 
     week: int
     member_names: list[str]
@@ -102,7 +173,7 @@ def slot_header(
     *,
     is_off: bool = False,
 ) -> str:
-    """甘特图时段标签，两行显示：真实日期 / 节次。"""
+    """空闲时段总览时段标签，两行显示：真实日期 / 节次。"""
     if actual_date is None:
         return f"{WEEKDAY_LABELS[weekday]}\n{BLOCK_LABELS[block].split(' ')[0]}"
     day = WEEKDAY_LABELS[actual_date.isoweekday()]
@@ -113,7 +184,7 @@ def slot_header(
 
 @dataclass(frozen=True)
 class GanttColumn:
-    """甘特图展示时段项；补课时可额外保留原始放假日项。"""
+    """空闲时段总览展示时段项；补课时可额外保留原始放假日项。"""
 
     weekday: int
     block: int
@@ -160,7 +231,7 @@ def build_availability(
     """计算第 week 周各成员忙闲矩阵（请假成员当天整行不可用，已排值班单元格标蓝）
 
     busy 可传入调用方缓存的忙时表（见 scheduler.build_busy_map）：
-    该表展开成本高，界面按周切换甘特图时无需重复构建。
+    该表展开成本高，界面按周切换空闲时段总览时无需重复构建。
     """
     if busy is None:
         busy = build_busy_map(members, courses)
@@ -204,7 +275,7 @@ def build_availability(
             continue
         if c.weekday == WHOLE_WEEK_WEEKDAY:
             # 整周集中安排（军训/思政实践）没有星期与节次：该周每一天每一节都算被
-            # 占用，课程名也要挂上去——否则甘特图上是一整片「忙但没有原因」的格子，
+            # 占用，课程名也要挂上去——否则空闲时段总览上是一整片「忙但没有原因」的格子，
             # 用户看不出为什么这个人整周都排不了班。
             for day in range(1, 8):
                 for sec in WHOLE_WEEK_SESSIONS:
@@ -286,7 +357,7 @@ def build_calendar_availability(
     busy: dict[int, set] | None = None,
     special_arrangements: list[SpecialArrangement] | None = None,
 ) -> CalendarAvailabilityMatrix:
-    """按自然日期周构建甘特图；补课日自动纳入实际周末。"""
+    """按自然日期周构建空闲时段总览；补课日自动纳入实际周末。"""
     if busy is None:
         busy = build_busy_map(members, courses)
     special_busy = build_special_busy_map(members, special_arrangements)
@@ -421,12 +492,11 @@ def build_calendar_availability(
 
 
 def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
-    """导出带填充色的 Excel 甘特图，返回文件字节。"""
+    """导出带填充色的 Excel 空闲时段总览，返回文件字节。"""
     if isinstance(matrix, CalendarAvailabilityMatrix):
         return _export_calendar_gantt_excel(matrix)
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
 
     FREE_FILL = PatternFill("solid", fgColor="C9F2CF")
     BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
@@ -441,7 +511,7 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"第{matrix.week}周空闲甘特图"
+    ws.title = f"第{matrix.week}周空闲时段总览"
 
     columns = display_columns(matrix)
     summary_col = 2 + matrix.member_count
@@ -499,17 +569,17 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
                 cell.font = Font(bold=True, color="0A5AA8")
             elif matrix.special_info.get((member_index, d, b)):
                 special_names = matrix.special_info[(member_index, d, b)]
-                cell.value = "其他安排：" + "、".join(special_names)
+                cell.value = "其他安排：\n" + "\n".join(special_names)
                 cell.fill = SPECIAL_FILL
                 cell.font = Font(color="6E3DC2")
             else:
                 assert column.slot_index is not None
                 is_free = matrix.free[member_index][column.slot_index]
                 names = matrix.busy_courses.get((member_index, d, b), [])
-                cell.value = "" if is_free else "、".join(names)
+                cell.value = "" if is_free else "\n".join(names)
                 cell.fill = FREE_FILL if is_free else BUSY_FILL
             cell.border = border
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         summary = ws.cell(row=row, column=summary_col)
         if column.is_off:
@@ -529,20 +599,16 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         summary.border = border
 
     ws.freeze_panes = "B3"
-    ws.column_dimensions["A"].width = 24
-    for index in range(matrix.member_count):
-        ws.column_dimensions[get_column_letter(2 + index)].width = 12
-    ws.column_dimensions[get_column_letter(summary_col)].width = 12
+    _fit_excel_layout(ws)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
 def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
-    """导出自然日期周版本的空闲甘特图（横轴=成员，纵轴=日期x时段）。"""
+    """导出自然日期周版本的空闲时段总览（横轴=成员，纵轴=日期x时段）。"""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
 
     FREE_FILL = PatternFill("solid", fgColor="C9F2CF")
     BUSY_FILL = PatternFill("solid", fgColor="F2F2F7")
@@ -557,7 +623,7 @@ def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"第{matrix.week}周空闲甘特图"
+    ws.title = f"第{matrix.week}周空闲时段总览"
     summary_col = 2 + matrix.member_count
 
     # 横轴=成员，纵轴=自然日期x时段；汇总人数放最后一列。
@@ -609,17 +675,17 @@ def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
                 cell.font = Font(bold=True, color="0A5AA8")
             elif matrix.special_info.get((member_index, column.date, column.block)):
                 names = matrix.special_info[(member_index, column.date, column.block)]
-                cell.value = "其他安排：" + "、".join(names)
+                cell.value = "其他安排：\n" + "\n".join(names)
                 cell.fill = SPECIAL_FILL
                 cell.font = Font(color="6E3DC2")
             else:
                 is_free = matrix.free[member_index][index]
                 names = matrix.busy_courses.get(
                     (member_index, column.date, column.block), [])
-                cell.value = "" if is_free else "、".join(names)
+                cell.value = "" if is_free else "\n".join(names)
                 cell.fill = FREE_FILL if is_free else BUSY_FILL
             cell.border = border
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         summary = ws.cell(row=excel_row, column=summary_col)
         if column.is_off:
@@ -636,10 +702,7 @@ def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
         summary.alignment = Alignment(horizontal="center", vertical="center")
 
     ws.freeze_panes = "B3"
-    ws.column_dimensions["A"].width = 24
-    for index in range(matrix.member_count):
-        ws.column_dimensions[get_column_letter(2 + index)].width = 12
-    ws.column_dimensions[get_column_letter(summary_col)].width = 12
+    _fit_excel_layout(ws)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

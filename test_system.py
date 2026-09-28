@@ -239,9 +239,13 @@ def test_gantt() -> None:
     from io import BytesIO
     from openpyxl import load_workbook
     ws = load_workbook(BytesIO(data)).active
+    assert ws.title == "第1周空闲时段总览"
     assert ws.cell(1, 2).value == m.member_names[0], "Excel 横轴应为成员"
     assert "周一" in ws.cell(3, 1).value, "Excel 纵轴应为日期x时段"
     assert ws.cell(1, 2 + m.member_count).value == "空闲人数", "Excel 末列应为汇总"
+    assert ws.cell(3, 1).alignment.wrap_text is True
+    assert ws.column_dimensions["A"].width >= 26
+    assert ws.row_dimensions[3].height >= 32
     print(f"[6] 甘特图: 通过（{m.member_count} 成员 x {len(m.slots)} 时段，"
           f"第1周全员空闲 {len(m.all_free_slots)} 个 / 第18周 {len(m18.all_free_slots)} 个，"
           f"导出 xlsx {len(data)}B）")

@@ -796,17 +796,34 @@ def test_gantt_excel_uses_time_rows_and_member_columns(window, qt_app) -> None:
     from io import BytesIO
 
     from openpyxl import load_workbook
+
     from duty_system.gantt import export_gantt_excel
 
+    assert window.tabs.tabText(4) == "空闲时段总览"
     seed_members(window, 3)
     window.refresh_gantt()
     matrix = window.gantt_matrix
     assert matrix is not None
 
+    first_column = matrix.columns[0]
+    busy_key = (0, first_column.date, first_column.block)
+    matrix.free[0][0] = False
+    matrix.busy_courses[busy_key] = [
+        "数据结构与算法设计",
+        "大学生职业生涯规划",
+    ]
+
     ws = load_workbook(BytesIO(export_gantt_excel(matrix))).active
+    assert ws.title == "第1周空闲时段总览"
     assert ws.cell(1, 2).value == matrix.member_names[0]
     assert ws.cell(1, 2 + matrix.member_count).value == "空闲人数"
     assert "\n" in ws.cell(3, 1).value
+    assert ws.row_dimensions[3].height >= 32
+    course_cell = ws.cell(3, 2)
+    assert course_cell.value == "数据结构与算法设计\n大学生职业生涯规划"
+    assert course_cell.alignment.wrap_text is True
+    assert ws.column_dimensions["B"].width >= 20
+    assert ws.row_dimensions[3].height >= 34
     assert ws.max_row == len(matrix.columns) + 2
     assert ws.max_column == matrix.member_count + 2
 
