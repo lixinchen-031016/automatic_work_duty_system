@@ -13,12 +13,12 @@
 from __future__ import annotations
 
 import io
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from .calendar import TermCalendar
 from .database import Assignment, CourseRecord, Leave, Member, SpecialArrangement
+from .excel_layout import fit_excel_layout
 from .parser import (
     BLOCK_LABELS,
     BLOCK_SESSIONS,
@@ -27,76 +27,6 @@ from .parser import (
     WHOLE_WEEK_WEEKDAY,
 )
 from .scheduler import build_busy_map, build_special_busy_map
-
-_EXCEL_MAX_COLUMN_WIDTH = 42.0
-_EXCEL_LINE_HEIGHT = 16.0
-_EXCEL_ROW_PADDING = 5.0
-
-
-def _excel_text_width(text: str) -> int:
-    """按 Excel 字符宽近似计算文本宽度，中日韩字符按 2 个字符计。"""
-    return sum(
-        2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-        for char in text
-    )
-
-
-def _excel_line_count(text: str, column_width: float) -> int:
-    """估算文本在指定列宽下换行后的行数。"""
-    from math import ceil
-
-    usable_width = max(4.0, column_width - 2.0)
-    return sum(
-        max(1, ceil(_excel_text_width(line) / usable_width))
-        for line in text.split("\n")
-    )
-
-
-def _fit_excel_layout(ws) -> None:
-    """按单元格内容设置列宽和行高，确保日期、课程无需手工调整即可完整显示。"""
-    from openpyxl.utils import get_column_letter
-
-    widths: dict[int, float] = {}
-    for column_index in range(1, ws.max_column + 1):
-        if column_index == 1:
-            widths[column_index] = 26.0
-        elif column_index == ws.max_column:
-            widths[column_index] = 12.0
-        else:
-            widths[column_index] = 14.0
-
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.value is None or str(cell.value) == "":
-                continue
-            longest_line = max(
-                _excel_text_width(line)
-                for line in str(cell.value).split("\n")
-            )
-            widths[cell.column] = max(
-                widths[cell.column],
-                min(longest_line + 2.0, _EXCEL_MAX_COLUMN_WIDTH),
-            )
-
-    for column_index, width in widths.items():
-        ws.column_dimensions[get_column_letter(column_index)].width = width
-
-    # 前两行是成员表头；合并单元格需要预留两行高度。
-    ws.row_dimensions[1].height = 22.0
-    ws.row_dimensions[2].height = 22.0
-    for row in ws.iter_rows(min_row=3):
-        required_lines = 1
-        for cell in row:
-            if cell.value is None or str(cell.value) == "":
-                continue
-            required_lines = max(
-                required_lines,
-                _excel_line_count(str(cell.value), widths[cell.column]),
-            )
-        ws.row_dimensions[row[0].row].height = min(
-            409.0,
-            max(32.0, required_lines * _EXCEL_LINE_HEIGHT + _EXCEL_ROW_PADDING),
-        )
 
 
 @dataclass
@@ -599,7 +529,16 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         summary.border = border
 
     ws.freeze_panes = "B3"
-    _fit_excel_layout(ws)
+    fit_excel_layout(
+        ws,
+        min_widths={
+            1: 26.0,
+            **{2 + index: 14.0 for index in range(matrix.member_count)},
+            summary_col: 12.0,
+        },
+        header_rows=2,
+        min_row_height=32.0,
+    )
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -702,7 +641,16 @@ def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
         summary.alignment = Alignment(horizontal="center", vertical="center")
 
     ws.freeze_panes = "B3"
-    _fit_excel_layout(ws)
+    fit_excel_layout(
+        ws,
+        min_widths={
+            1: 26.0,
+            **{2 + index: 14.0 for index in range(matrix.member_count)},
+            summary_col: 12.0,
+        },
+        header_rows=2,
+        min_row_height=32.0,
+    )
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

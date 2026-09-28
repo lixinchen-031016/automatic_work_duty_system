@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 from collections import defaultdict
 from datetime import date, timedelta
@@ -10,6 +11,7 @@ import pandas as pd
 
 from .calendar import TermCalendar
 from .database import Assignment, Leave, Member
+from .excel_layout import fit_excel_layout
 from .parser import BLOCK_LABELS, WEEKDAY_LABELS
 
 
@@ -170,21 +172,15 @@ def export_excel(
 
 
 def _beautify(writer: pd.ExcelWriter) -> None:
-    """简单美化：列宽自适应、表头加粗"""
+    """美化表格：内容自适应列宽/行高，表头加粗并冻结。"""
     from openpyxl.styles import Font, PatternFill
 
     for ws in writer.book.worksheets:
-        for col_idx, column_cells in enumerate(ws.columns, start=1):
-            width = max(
-                (len(str(c.value)) + sum(1 for ch in str(c.value) if '\u4e00' <= ch <= '\u9fff')
-                 for c in column_cells if c.value is not None),
-                default=8,
-            )
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(
-                width + 4, 40)
+        fit_excel_layout(ws, header_rows=1, min_row_height=24.0)
         for cell in ws[1]:
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill("solid", fgColor="4472C4")
+        ws.freeze_panes = "A2"
 
 
 def export_csv(
@@ -192,10 +188,17 @@ def export_csv(
     start_date: date | None = None,
     calendar: TermCalendar | None = None,
 ) -> bytes:
-    """导出 CSV（UTF-8 BOM，Excel 可直接打开）"""
+    """导出 CSV（UTF-8 BOM、CRLF、全字段引号，完整保留日期与姓名文本）。
+
+    CSV 格式本身不保存列宽/行高；需要自动适配显示时请使用 Excel 导出。
+    """
     return build_detail_df(
         assignments, start_date=start_date, calendar=calendar
-    ).to_csv(index=False).encode("utf-8-sig")
+    ).to_csv(
+        index=False,
+        quoting=csv.QUOTE_ALL,
+        lineterminator="\r\n",
+    ).encode("utf-8-sig")
 
 
 def build_leaves_df(

@@ -389,9 +389,30 @@ def fill_table(table: QTableWidget, df: pd.DataFrame) -> None:
         table.resizeColumnsToContents()
 
 
+def _wrap_png_text(text: str, metrics: QFontMetrics, max_width: int) -> list[str]:
+    """按像素宽度把文本拆成多行，避免 PNG 表格内容被裁切。"""
+    result: list[str] = []
+    for raw_line in str(text).split("\n"):
+        if not raw_line:
+            result.append("")
+            continue
+        current = ""
+        for char in raw_line:
+            candidate = current + char
+            if current and metrics.horizontalAdvance(candidate) > max_width:
+                result.append(current)
+                current = char
+            else:
+                current = candidate
+        result.append(current)
+    return result or [""]
+
+
 def render_table_png(df: pd.DataFrame, title: str, subtitle: str, path: Path) -> None:
-    """把表格渲染为高清 PNG（2x 缩放、类苹果表格样式），方便发群通知 / 打印张贴"""
-    margin, pad, row_h, head_h = 28, 12, 34, 38
+    """把表格渲染为高清 PNG，内容按列宽换行并自动调整行高，避免裁切。"""
+    margin, pad, min_row_h, min_head_h = 28, 12, 34, 38
+    line_h = 18
+    max_cell_w = 280
     font = QFont()
     font.setPixelSize(13)
     bold = QFont()
@@ -405,15 +426,53 @@ def render_table_png(df: pd.DataFrame, title: str, subtitle: str, path: Path) ->
     fm, hfm, tfm, sfm = (QFontMetrics(f) for f in (font, bold, title_font, sub_font))
 
     cols = [str(c) for c in df.columns]
-    widths = []
-    for c in range(len(cols)):
-        w = hfm.horizontalAdvance(cols[c])
-        if len(df):
-            w = max(w, max(fm.horizontalAdvance(str(df.iat[r, c])) for r in range(len(df))))
-        widths.append(max(w + pad * 2, 56))
+    widths: list[int] = []
+    for column_index, column_name in enumerate(cols):
+        natural_width = hfm.horizontalAdvance(column_name)
+        for row_index in range(len(df)):
+            text = str(df.iat[row_index, column_index])
+            natural_width = max(
+                natural_width,
+                max(
+                    (fm.horizontalAdvance(line) for line in text.split("\n")),
+                    default=0,
+                ),
+            )
+        widths.append(min(max(natural_width + pad * 2, 56), max_cell_w))
 
-    img_w = margin * 2 + sum(widths)
-    img_h = margin + tfm.height() + 8 + sfm.height() + 16 + head_h + row_h * len(df) + margin
+    header_lines = [
+        _wrap_png_text(column_name, hfm, widths[index] - pad * 2)
+        for index, column_name in enumerate(cols)
+    ]
+    head_h = max(
+        min_head_h,
+        max((len(lines) for lines in header_lines), default=1) * line_h + pad * 2,
+    )
+
+    body_lines: list[list[list[str]]] = []
+    row_heights: list[int] = []
+    for row_index in range(len(df)):
+        current_row: list[list[str]] = []
+        max_lines = 1
+        for column_index, width in enumerate(widths):
+            lines = _wrap_png_text(
+                str(df.iat[row_index, column_index]),
+                fm,
+                width - pad * 2,
+            )
+            current_row.append(lines)
+            max_lines = max(max_lines, len(lines))
+        body_lines.append(current_row)
+        row_heights.append(max(min_row_h, max_lines * line_h + pad * 2))
+
+    table_w = sum(widths)
+    title_w = max(tfm.horizontalAdvance(title), sfm.horizontalAdvance(subtitle))
+    content_w = max(table_w, title_w)
+    img_w = margin * 2 + content_w
+    table_y = margin + tfm.height() + 8 + sfm.height() + 16
+    table_h = head_h + sum(row_heights)
+    img_h = table_y + table_h + margin
+
     img = QImage(img_w * 2, img_h * 2, QImage.Format_ARGB32)
     img.fill(Qt.white)
     p = QPainter(img)
@@ -423,46 +482,54 @@ def render_table_png(df: pd.DataFrame, title: str, subtitle: str, path: Path) ->
 
     p.setPen(QPen(QColor("#1d1d1f")))
     p.setFont(title_font)
-    p.drawText(QRect(margin, margin, img_w - margin * 2, tfm.height()),
+    p.drawText(QRect(margin, margin, content_w, tfm.height()),
                Qt.AlignLeft | Qt.AlignVCenter, title)
     p.setPen(QPen(QColor("#86868b")))
     p.setFont(sub_font)
-    p.drawText(QRect(margin, margin + tfm.height() + 8, img_w - margin * 2, sfm.height()),
+    p.drawText(QRect(margin, margin + tfm.height() + 8, content_w, sfm.height()),
                Qt.AlignLeft | Qt.AlignVCenter, subtitle)
 
-    y0 = margin + tfm.height() + 8 + sfm.height() + 16
-    table_h = head_h + row_h * len(df)
-    p.fillRect(QRect(margin, y0, img_w - margin * 2, head_h), QColor("#f2f2f7"))
+    p.fillRect(QRect(margin, table_y, table_w, head_h), QColor("#f2f2f7"))
     p.setFont(bold)
     x = margin
-    for w, c in zip(widths, cols):
-        p.setPen(QPen(QColor("#1d1d1f")))
-        p.drawText(QRect(x, y0, w, head_h), Qt.AlignCenter, c)
-        x += w
+    for width, lines in zip(widths, header_lines):
+        text_y = table_y + (head_h - len(lines) * line_h) / 2
+        for line in lines:
+            p.setPen(QPen(QColor("#1d1d1f")))
+            p.drawText(QRect(x + pad, text_y, width - pad * 2, line_h),
+                       Qt.AlignCenter, line)
+            text_y += line_h
+        x += width
 
     p.setFont(font)
-    for r in range(len(df)):
-        y = y0 + head_h + r * row_h
-        if r % 2:
-            p.fillRect(QRect(margin, y, img_w - margin * 2, row_h), QColor("#f7f7f9"))
+    y = table_y + head_h
+    for row_index, height in enumerate(row_heights):
+        if row_index % 2:
+            p.fillRect(QRect(margin, y, table_w, height), QColor("#f7f7f9"))
         x = margin
-        for c, w in enumerate(widths):
-            text = str(df.iat[r, c])
-            p.setPen(QPen(QColor("#aeaeb2") if text == "—" else "#1d1d1f"))
-            p.drawText(QRect(x, y, w, row_h), Qt.AlignCenter, text)
-            x += w
+        for column_index, width in enumerate(widths):
+            lines = body_lines[row_index][column_index]
+            text_y = y + (height - len(lines) * line_h) / 2
+            for line in lines:
+                p.setPen(QPen(
+                    QColor("#aeaeb2") if line == "—" else "#1d1d1f"))
+                p.drawText(QRect(x + pad, text_y, width - pad * 2, line_h),
+                           Qt.AlignCenter, line)
+                text_y += line_h
+            x += width
+        y += height
 
     p.setPen(QPen(QColor("#e5e5ea"), 1))
     x = margin
-    for w in widths[:-1]:
-        x += w
-        p.drawLine(x, y0, x, y0 + table_h)
-    y = y0 + head_h
-    for _ in range(len(df) - 1):
-        y += row_h
-        p.drawLine(margin, y, img_w - margin, y)
+    for width in widths[:-1]:
+        x += width
+        p.drawLine(x, table_y, x, table_y + table_h)
+    y = table_y + head_h
+    for height in row_heights[:-1]:
+        y += height
+        p.drawLine(margin, y, margin + table_w, y)
     p.setPen(QPen(QColor("#d2d2d7"), 1))
-    p.drawRect(QRect(margin, y0, img_w - margin * 2, table_h))
+    p.drawRect(QRect(margin, table_y, table_w, table_h))
     p.end()
     img.save(str(path))
 
@@ -491,8 +558,9 @@ def draw_bar_chart(
                          Qt.AlignCenter, "暂无数据")
         return
 
+    label_area_h = lfm.height() * 2
     top = rect.top() + tfm.height() + 14
-    bottom = rect.bottom() - lfm.height() - 8
+    bottom = rect.bottom() - label_area_h - 8
     left = rect.left() + 30
     right = rect.right() - 8
     plot_h = bottom - top
@@ -529,13 +597,45 @@ def draw_bar_chart(
                                slot_w, lfm.height()),
                          Qt.AlignCenter, str(v))
         painter.setPen(QPen(QColor("#86868b")))
-        painter.drawText(QRect(cx - slot_w / 2, bottom + 2, slot_w, lfm.height()),
-                         Qt.AlignCenter, label)
+        painter.drawText(
+            QRect(cx - slot_w / 2, bottom + 2, slot_w, label_area_h),
+            Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
+            label,
+        )
 
 
-def render_charts_png(charts: list[tuple[str, list[tuple[str, int]], str]], path: Path) -> None:
-    """多张柱状图渲染为一张高清 PNG（2x 缩放，纵向排列）"""
-    margin, chart_h, img_w = 28, 280, 980
+def render_charts_png(
+    charts: list[tuple[str, list[tuple[str, int]], str]],
+    path: Path,
+) -> None:
+    """多张柱状图渲染为一张高清 PNG，按标签宽度扩展画布避免文字裁切。"""
+    if not charts:
+        return
+    margin, chart_h = 28, 300
+    label_font = QFont()
+    label_font.setPixelSize(12)
+    title_font = QFont()
+    title_font.setPixelSize(13)
+    title_font.setBold(True)
+    label_fm = QFontMetrics(label_font)
+    title_fm = QFontMetrics(title_font)
+
+    max_items = max((len(items) for _, items, _ in charts), default=1)
+    max_label_w = max(
+        (
+            label_fm.horizontalAdvance(label)
+            for _, items, _ in charts
+            for label, _ in items
+        ),
+        default=64,
+    )
+    slot_w = max(64, min(max_label_w + 18, 140))
+    content_w = 38 + slot_w * max_items
+    content_w = max(
+        content_w,
+        *(title_fm.horizontalAdvance(title) for title, _, _ in charts),
+    )
+    img_w = max(980, content_w + margin * 2)
     img_h = margin * 2 + chart_h * len(charts) + 16 * (len(charts) - 1)
     img = QImage(img_w * 2, img_h * 2, QImage.Format_ARGB32)
     img.fill(Qt.white)
@@ -997,11 +1097,13 @@ class MainWindow(QMainWindow):
         v1.addWidget(self.summary_label)
         btn_row = QHBoxLayout()
         self.btn_export_xlsx = QPushButton("导出 Excel")
+        self.btn_export_xlsx.setToolTip("按日期与值班人内容自动适配列宽、行高，打开即可完整查看")
         self.btn_export_xlsx.clicked.connect(self.export_xlsx)
         self.btn_export_csv = QPushButton("导出 CSV")
+        self.btn_export_csv.setToolTip("完整保留日期与姓名文本；CSV 不支持列宽，排版查看请用 Excel")
         self.btn_export_csv.clicked.connect(self.export_csv)
         self.btn_export_png = QPushButton("导出图片")
-        self.btn_export_png.setToolTip("把值班表导出为 PNG 图片，方便发群通知 / 打印张贴")
+        self.btn_export_png.setToolTip("按内容自动换行、调整行高，避免日期与值班人被裁切")
         self.btn_export_png.clicked.connect(self.export_png)
         self.btn_export_xlsx.setEnabled(False)
         self.btn_export_csv.setEnabled(False)

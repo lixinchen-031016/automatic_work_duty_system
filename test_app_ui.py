@@ -828,6 +828,36 @@ def test_gantt_excel_uses_time_rows_and_member_columns(window, qt_app) -> None:
     assert ws.max_column == matrix.member_count + 2
 
 
+def test_table_png_auto_wraps_long_values(qt_app, tmp_path: Path) -> None:
+    """PNG 表格应对长日期/长姓名自动折行并增高，而不是裁切文本。"""
+    import pandas as pd
+    from PySide6.QtGui import QImage
+
+    short_path = tmp_path / "short.png"
+    long_path = tmp_path / "long.png"
+    appmod.render_table_png(
+        pd.DataFrame([{"日期": "9月14日", "值班时段": "1-2节", "值班人": "张三"}]),
+        "值班排班表",
+        "第1周",
+        short_path,
+    )
+    appmod.render_table_png(
+        pd.DataFrame([{
+            "日期": "9月14日",
+            "值班时段": "1-2节",
+            "值班人": "张三丰" * 12,
+        }]),
+        "值班排班表",
+        "第1周",
+        long_path,
+    )
+
+    short_img = QImage(str(short_path))
+    long_img = QImage(str(long_path))
+    assert not short_img.isNull() and not long_img.isNull()
+    assert long_img.height() > short_img.height(), "长内容应增加 PNG 行高"
+
+
 def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
     """长期特殊安排应在甘特图中显示为紫色「其他安排」并计入忙时。"""
     seed_members(window, 3)

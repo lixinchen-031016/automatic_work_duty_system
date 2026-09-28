@@ -191,6 +191,30 @@ def test_exporter() -> None:
     csv_bytes = export_csv(result.assignments)
     (out / "排班表.csv").write_bytes(csv_bytes)
     assert csv_bytes[:3] == b"\xef\xbb\xbf" and len(csv_bytes) > 100
+    csv_text = csv_bytes.decode("utf-8-sig")
+    assert (
+        csv_text.startswith('"周次"') and "\r\n" in csv_text
+    ), "CSV 应采用全字段引号与 CRLF，便于 Excel 完整解析"
+
+    # 长姓名/长日期内容应自动换行并增高，而不是被固定列宽裁切
+    from io import BytesIO
+    from openpyxl import load_workbook
+
+    long_name = "张三丰" * 8
+    wrapped = [Assignment(1, 1, 1, 1, long_name)]
+    wrapped_stats = {1: {"name": long_name, "total": 1, "weeks": [1]}}
+    wrapped_xlsx = export_excel(
+        wrapped, wrapped_stats, [], start_date=date(2026, 9, 14))
+    wb = load_workbook(BytesIO(wrapped_xlsx))
+    detail_ws = wb["值班明细"]
+    headers = {cell.value: cell.column for cell in detail_ws[1]}
+    name_cell = detail_ws.cell(2, headers["值班人"])
+    date_cell = detail_ws.cell(2, headers["日期"])
+    assert name_cell.value == long_name
+    assert name_cell.alignment.wrap_text is True
+    assert date_cell.alignment.wrap_text is True
+    assert detail_ws.row_dimensions[2].height >= 37
+    assert detail_ws.column_dimensions[name_cell.column_letter].width >= 20
 
     detail = build_detail_df(result.assignments)
     pivot = build_pivot_df(result.assignments)
