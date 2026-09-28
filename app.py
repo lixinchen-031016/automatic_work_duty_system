@@ -45,6 +45,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -56,8 +58,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -160,7 +164,7 @@ else:
 SHORTCUT_MODIFIER = "⌘" if sys.platform == "darwin" else "Ctrl+"
 
 # 类苹果设计语言（macOS 浅色模式）：
-#   背景 #f5f5f7 / 卡片白色圆角 / 系统蓝 #007aff / 文字 #1d1d1f·#86868b
+#   背景 #f3f6fb / 卡片白色圆角 / 主色 #2563eb / 文字 #132238·#66758a
 #   分隔线 #e5e5ea / 控件边框 #d2d2d7 / 8pt 间距网格 / 分段控件式 Tab
 class _TaskSignals(QObject):
     """后台任务的完成/失败信号（QRunnable 本身不能带信号，需 QObject 载体）。"""
@@ -227,7 +231,8 @@ class MainWindow(QMainWindow):
         self._active_task = None
         self._closing = False
         self.setWindowTitle("自动值班排班系统")
-        self.resize(1280, 800)
+        self.setMinimumSize(1120, 700)
+        self.resize(1440, 900)
         self._build_ui()
         self._load_settings()
         self.refresh_members()
@@ -342,6 +347,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(False)
         self.centralWidget().setEnabled(False)
         self.menuBar().setEnabled(False)
+        self._set_app_status(label, "info")
         self.statusBar().showMessage(f"{label}…")
         QApplication.setOverrideCursor(Qt.BusyCursor)
         task = _Task(fn)
@@ -360,9 +366,11 @@ class MainWindow(QMainWindow):
         self.menuBar().setEnabled(True)
         QApplication.restoreOverrideCursor()
         if error is not None:
+            self._set_app_status("操作失败", "danger")
             self.statusBar().showMessage(f"操作失败：{error}")
             QMessageBox.warning(self, "操作失败", error)
             return
+        self._set_app_status("处理完成", "success")
         if on_done is not None:
             on_done(result)
 
@@ -393,34 +401,72 @@ class MainWindow(QMainWindow):
         self.redo_action.triggered.connect(self.redo_tweak)
         edit_menu.addAction(self.redo_action)
 
+        root = QWidget()
+        root.setObjectName("appRoot")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        top_bar = QFrame()
+        top_bar.setObjectName("topBar")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(18, 10, 18, 10)
+        top_layout.setSpacing(11)
+
+        brand_mark = QLabel("值")
+        brand_mark.setObjectName("brandMark")
+        brand_mark.setAlignment(Qt.AlignCenter)
+        brand_mark.setFixedSize(38, 38)
+        top_layout.addWidget(brand_mark)
+
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(1)
+        title = QLabel("自动值班排班系统")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("课表识别 · 冲突避让 · 均衡排班")
+        subtitle.setObjectName("appSubtitle")
+        brand_text.addWidget(title)
+        brand_text.addWidget(subtitle)
+        top_layout.addLayout(brand_text)
+
+        top_layout.addSpacing(12)
+        self.app_status_label = QLabel("等待生成排班")
+        self.app_status_label.setObjectName("statusPill")
+        top_layout.addWidget(self.app_status_label)
+        top_layout.addStretch(1)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_left_panel())
+        left_scroll = QScrollArea()
+        left_scroll.setObjectName("leftScroll")
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setWidget(self._build_left_panel())
+        splitter.addWidget(left_scroll)
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([340, 940])
-        self.setCentralWidget(splitter)
+        splitter.setSizes([340, 1020])
+        root_layout.addWidget(top_bar)
+        root_layout.addWidget(splitter, stretch=1)
+        self.setCentralWidget(root)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("leftPanel")
+        panel.setMinimumWidth(320)
+        panel.setMaximumWidth(400)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(16, 16, 8, 16)
+        layout.setContentsMargins(12, 14, 8, 14)
         layout.setSpacing(12)
 
-        title = QLabel("自动值班排班系统")
-        title.setObjectName("appTitle")
-        layout.addWidget(title)
-        subtitle = QLabel("解析课表 · 智能排班 · 空闲总览")
-        subtitle.setObjectName("appSubtitle")
-        layout.addWidget(subtitle)
+        self.btn_upload = QPushButton("上传成员课表")
+        self.btn_upload.setObjectName("primary")
+        self.btn_upload.setMinimumHeight(40)
+        self.btn_upload.setToolTip("一次选择多份教务系统导出的 .xls / .xlsx 课表")
+        self.btn_upload.clicked.connect(self.upload_files)
+        layout.addWidget(self.btn_upload)
 
-        btn_upload = QPushButton("上传成员课表…")
-        btn_upload.setObjectName("primary")
-        btn_upload.setMinimumHeight(36)
-        btn_upload.clicked.connect(self.upload_files)
-        layout.addWidget(btn_upload)
-
-        grp_members = QGroupBox("成员")
+        grp_members = QGroupBox("成员课表")
         members_layout = QVBoxLayout(grp_members)
         members_layout.setContentsMargins(8, 4, 8, 8)
         members_layout.setSpacing(8)
@@ -448,7 +494,9 @@ class MainWindow(QMainWindow):
         grp_cfg = QGroupBox("排班参数")
         form = QFormLayout(grp_cfg)
         form.setContentsMargins(8, 4, 8, 8)
-        form.setSpacing(10)
+        form.setSpacing(9)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         week_row = QHBoxLayout()
         self.week_from = QSpinBox()
         self.week_from.setRange(1, 25)
@@ -465,59 +513,58 @@ class MainWindow(QMainWindow):
         form.addRow("值班周范围", week_row)
 
         self.weekday_checks: dict[int, QCheckBox] = {}
-        wd_row = QHBoxLayout()
-        for d in (1, 2, 3, 4, 5, 6, 7):
-            cb = QCheckBox(WEEKDAY_LABELS[d])
-            cb.setChecked(d <= 5)
+        wd_grid = QGridLayout()
+        wd_grid.setHorizontalSpacing(8)
+        wd_grid.setVerticalSpacing(6)
+        for index, weekday in enumerate((1, 2, 3, 4, 5, 6, 7)):
+            cb = QCheckBox(WEEKDAY_LABELS[weekday].replace("周", ""))
+            cb.setToolTip(WEEKDAY_LABELS[weekday])
+            cb.setChecked(weekday <= 5)
             cb.stateChanged.connect(self._on_gantt_filter_changed)
             cb.stateChanged.connect(self._mark_stale)
-            self.weekday_checks[d] = cb
-            wd_row.addWidget(cb)
-        form.addRow("值班星期", wd_row)
+            self.weekday_checks[weekday] = cb
+            wd_grid.addWidget(cb, index // 4, index % 4)
+        form.addRow("值班星期", wd_grid)
 
         self.block_checks: dict[int, QCheckBox] = {}
-        blk_row = QHBoxLayout()
-        for b in (1, 2, 3, 4, 5):
-            cb = QCheckBox(BLOCK_LABELS[b].split(" ")[0])
+        blk_grid = QGridLayout()
+        blk_grid.setHorizontalSpacing(8)
+        blk_grid.setVerticalSpacing(6)
+        for index, block in enumerate((1, 2, 3, 4, 5)):
+            cb = QCheckBox(BLOCK_LABELS[block].split(" ")[0].replace("节", ""))
             cb.setChecked(True)
-            cb.setToolTip(BLOCK_LABELS[b])
+            cb.setToolTip(BLOCK_LABELS[block])
             cb.stateChanged.connect(self._on_gantt_filter_changed)
             cb.stateChanged.connect(self._mark_stale)
-            self.block_checks[b] = cb
-            blk_row.addWidget(cb)
-        form.addRow("值班时段", blk_row)
+            self.block_checks[block] = cb
+            blk_grid.addWidget(cb, index // 3, index % 3)
+        form.addRow("值班时段", blk_grid)
 
-        num_row1 = QHBoxLayout()
         self.per_slot = QSpinBox()
         self.per_slot.setRange(1, 5)
         self.per_slot.valueChanged.connect(self._mark_stale)
+        form.addRow("每时段人数", self.per_slot)
+
         self.max_week = QSpinBox()
         self.max_week.setRange(1, 10)
         self.max_week.setValue(3)
         self.max_week.setToolTip("每人每周最多值班次数")
         self.max_week.valueChanged.connect(self._mark_stale)
-        num_row1.addWidget(QLabel("每时段人数"))
-        num_row1.addWidget(self.per_slot)
-        num_row1.addWidget(QLabel("每周上限"))
-        num_row1.addWidget(self.max_week)
-        form.addRow("", num_row1)
+        form.addRow("每周上限", self.max_week)
 
-        num_row2 = QHBoxLayout()
         self.max_day = QSpinBox()
         self.max_day.setRange(1, 5)
         self.max_day.setValue(1)
         self.max_day.setToolTip("每人每天最多值班次数")
         self.max_day.valueChanged.connect(self._mark_stale)
+        form.addRow("每天上限", self.max_day)
+
         self.seed = QSpinBox()
         self.seed.setRange(0, 9999)
         self.seed.setValue(42)
         self.seed.setToolTip("平手时决定分给谁，固定种子可复现")
         self.seed.valueChanged.connect(self._mark_stale)
-        num_row2.addWidget(QLabel("每天上限"))
-        num_row2.addWidget(self.max_day)
-        num_row2.addWidget(QLabel("随机种子"))
-        num_row2.addWidget(self.seed)
-        form.addRow("", num_row2)
+        form.addRow("随机种子", self.seed)
 
         self.term_start = QDateEdit()
         self.term_start.setCalendarPopup(True)
@@ -567,6 +614,24 @@ class MainWindow(QMainWindow):
         self._refresh_calendar_summary()
         return panel
 
+    @staticmethod
+    def _metric_card(label_text: str) -> tuple[QFrame, QLabel, QLabel]:
+        card = QFrame()
+        card.setObjectName("metricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(13, 11, 13, 11)
+        layout.setSpacing(4)
+        label = QLabel(label_text)
+        label.setObjectName("metricLabel")
+        value = QLabel("—")
+        value.setObjectName("metricValue")
+        hint = QLabel("等待排班结果")
+        hint.setObjectName("metricHint")
+        layout.addWidget(label)
+        layout.addWidget(value)
+        layout.addWidget(hint)
+        return card, value, hint
+
     def _build_right_panel(self) -> QWidget:
         self.tabs = QTabWidget()
 
@@ -575,18 +640,43 @@ class MainWindow(QMainWindow):
         v1 = QVBoxLayout(tab1)
         v1.setContentsMargins(16, 14, 16, 16)
         v1.setSpacing(12)
+        summary_card = QFrame()
+        summary_card.setObjectName("summaryCard")
+        summary_layout = QVBoxLayout(summary_card)
+        summary_layout.setContentsMargins(15, 13, 15, 13)
+        summary_layout.setSpacing(10)
         self.summary_label = QLabel("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
         self.summary_label.setObjectName("summary")
         self.summary_label.setWordWrap(True)
-        v1.addWidget(self.summary_label)
+        summary_layout.addWidget(self.summary_label)
+
+        metric_row = QHBoxLayout()
+        metric_row.setSpacing(9)
+        metric_specs = (
+            ("duties", "本周安排", "尚未生成"),
+            ("members", "参与成员", "尚未生成"),
+            ("spread", "次数极差", "尚未生成"),
+            ("gaps", "待处理缺口", "尚未生成"),
+        )
+        for key, label_text, hint_text in metric_specs:
+            card, value, hint = self._metric_card(label_text)
+            hint.setText(hint_text)
+            setattr(self, f"metric_{key}", value)
+            setattr(self, f"metric_{key}_hint", hint)
+            metric_row.addWidget(card, stretch=1)
+        summary_layout.addLayout(metric_row)
+
         btn_row = QHBoxLayout()
-        self.btn_export_xlsx = QPushButton("导出 Excel")
+        export_title = QLabel("结果导出")
+        export_title.setObjectName("secondary")
+        btn_row.addWidget(export_title)
+        self.btn_export_xlsx = QPushButton("Excel")
         self.btn_export_xlsx.setToolTip("按日期与值班人内容自动适配列宽、行高，打开即可完整查看")
         self.btn_export_xlsx.clicked.connect(self.export_xlsx)
-        self.btn_export_csv = QPushButton("导出 CSV")
+        self.btn_export_csv = QPushButton("CSV")
         self.btn_export_csv.setToolTip("完整保留日期与姓名文本；CSV 不支持列宽，排版查看请用 Excel")
         self.btn_export_csv.clicked.connect(self.export_csv)
-        self.btn_export_png = QPushButton("导出图片")
+        self.btn_export_png = QPushButton("PNG")
         self.btn_export_png.setToolTip("按内容自动换行、调整行高，避免日期与值班人被裁切")
         self.btn_export_png.clicked.connect(self.export_png)
         self.btn_export_xlsx.setEnabled(False)
@@ -596,17 +686,49 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_export_csv)
         btn_row.addWidget(self.btn_export_png)
         btn_row.addStretch()
-        v1.addLayout(btn_row)
+        summary_layout.addLayout(btn_row)
+        v1.addWidget(summary_card)
         self.pivot_table = QTableWidget()
         self.pivot_table.setToolTip("双击值班单元格可手动调整该时段值班人")
         self.pivot_table.cellDoubleClicked.connect(self._on_pivot_cell_double_clicked)
-        v1.addWidget(_card(self.pivot_table), stretch=1)
+        self.pivot_stack = QStackedWidget()
+        self.pivot_stack.addWidget(_card(self.pivot_table))
+
+        pivot_empty = QFrame()
+        pivot_empty.setObjectName("emptyState")
+        empty_layout = QVBoxLayout(pivot_empty)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.addStretch(1)
+        empty_title = QLabel("还没有排班结果")
+        empty_title.setObjectName("pageTitle")
+        empty_title.setAlignment(Qt.AlignCenter)
+        empty_text = QLabel("上传成员课表并设置排班规则后，点击左侧「生成排班表」。")
+        empty_text.setObjectName("secondary")
+        empty_text.setAlignment(Qt.AlignCenter)
+        empty_text.setWordWrap(True)
+        empty_action = QPushButton("上传成员课表")
+        empty_action.setObjectName("primary")
+        empty_action.clicked.connect(self.upload_files)
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_text)
+        empty_layout.addSpacing(6)
+        empty_layout.addWidget(empty_action, alignment=Qt.AlignCenter)
+        empty_layout.addStretch(1)
+        self.pivot_stack.addWidget(pivot_empty)
+        v1.addWidget(self.pivot_stack, stretch=1)
         self.tabs.addTab(tab1, "值班排班表")
 
         # Tab2 值班明细
         tab2 = QWidget()
         v2 = QVBoxLayout(tab2)
         v2.setContentsMargins(16, 14, 16, 16)
+        v2.setSpacing(10)
+        detail_title = QLabel("值班明细")
+        detail_title.setObjectName("pageTitle")
+        detail_hint = QLabel("逐条查看周次、星期、日期、时段与值班人")
+        detail_hint.setObjectName("secondary")
+        v2.addWidget(detail_title)
+        v2.addWidget(detail_hint)
         self.detail_table = QTableWidget()
         v2.addWidget(_card(self.detail_table))
         self.tabs.addTab(tab2, "值班明细")
@@ -616,6 +738,9 @@ class MainWindow(QMainWindow):
         v3 = QVBoxLayout(tab3)
         v3.setContentsMargins(16, 14, 16, 16)
         v3.setSpacing(12)
+        member_title = QLabel("成员课表与不可用安排")
+        member_title.setObjectName("pageTitle")
+        v3.addWidget(member_title)
         sel_row = QHBoxLayout()
         sel_row.addWidget(QLabel("选择成员"))
         self.member_combo = QComboBox()
@@ -700,8 +825,8 @@ class MainWindow(QMainWindow):
         v4 = QVBoxLayout(tab4)
         v4.setContentsMargins(16, 14, 16, 16)
         v4.setSpacing(12)
-        stats_title = QLabel("各成员值班次数统计（均衡性参考）")
-        stats_title.setObjectName("secondary")
+        stats_title = QLabel("值班统计")
+        stats_title.setObjectName("pageTitle")
         v4.addWidget(stats_title)
         self.stats_table = QTableWidget()
         v4.addWidget(_card(self.stats_table), stretch=2)
@@ -717,6 +842,9 @@ class MainWindow(QMainWindow):
         v5 = QVBoxLayout(tab5)
         v5.setContentsMargins(16, 14, 16, 16)
         v5.setSpacing(12)
+        gantt_title = QLabel("空闲时段总览")
+        gantt_title.setObjectName("pageTitle")
+        v5.addWidget(gantt_title)
         ctl = QHBoxLayout()
         ctl.addWidget(QLabel("查看周次"))
         self.gantt_week = QSpinBox()
@@ -725,14 +853,24 @@ class MainWindow(QMainWindow):
         self.gantt_week.setToolTip("空闲时段总览按周查看（课程随周次变化）")
         self.gantt_week.valueChanged.connect(self.refresh_gantt)
         ctl.addWidget(self.gantt_week)
-        legend = QLabel(
-            '<span style="background:#c9f2cf;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 空闲&nbsp;&nbsp;'
-            '<span style="background:#f2f2f7;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 有课&nbsp;&nbsp;'
-            '<span style="background:#b8d9ff;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 已排值班&nbsp;&nbsp;'
-            '<span style="background:#ffd9a8;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 全员空闲&nbsp;&nbsp;'
-            '<span style="background:#ffd6d2;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 请假&nbsp;&nbsp;'
-            '<span style="background:#e5d8ff;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 其他安排')
-        legend.setObjectName("secondary")
+        legend = QFrame()
+        legend.setObjectName("legendBar")
+        legend_layout = QGridLayout(legend)
+        legend_layout.setContentsMargins(8, 4, 8, 4)
+        legend_layout.setHorizontalSpacing(10)
+        legend_layout.setVerticalSpacing(3)
+        legend_items = (
+            ("#c9f2cf", "空闲"), ("#f2f2f7", "有课"), ("#b8d9ff", "值班"),
+            ("#ffd9a8", "全员空闲"), ("#ffd6d2", "请假"), ("#e5d8ff", "其他安排"),
+        )
+        for index, (color, text_value) in enumerate(legend_items):
+            dot = QLabel()
+            dot.setFixedSize(9, 9)
+            dot.setStyleSheet(f"background:{color};border-radius:3px;")
+            label = QLabel(text_value)
+            label.setObjectName("legendText")
+            legend_layout.addWidget(dot, index // 3, (index % 3) * 2)
+            legend_layout.addWidget(label, index // 3, (index % 3) * 2 + 1)
         ctl.addWidget(legend)
         ctl.addStretch()
         self.btn_export_gantt = QPushButton("导出空闲时段总览 Excel")
@@ -762,6 +900,9 @@ class MainWindow(QMainWindow):
         v6 = QVBoxLayout(tab6)
         v6.setContentsMargins(16, 14, 16, 16)
         v6.setSpacing(12)
+        chart_title = QLabel("统计图表")
+        chart_title.setObjectName("pageTitle")
+        v6.addWidget(chart_title)
         chart_ctl = QHBoxLayout()
         self.charts_hint = QLabel("值班与请假情况一览，可导出为 PNG 汇报")
         self.charts_hint.setObjectName("secondary")
@@ -775,9 +916,9 @@ class MainWindow(QMainWindow):
         v6.addLayout(chart_ctl)
         charts_row = QHBoxLayout()
         charts_row.setSpacing(12)
-        self.chart_duty = BarChart("各成员值班总次数", "#007aff")
-        self.chart_weekly = BarChart("每周值班人次", "#34c759")
-        self.chart_leave = BarChart("各成员请假天数", "#ff453a")
+        self.chart_duty = BarChart("各成员值班总次数", "#2563eb")
+        self.chart_weekly = BarChart("每周值班人次", "#059669")
+        self.chart_leave = BarChart("各成员请假天数", "#dc2626")
         for c in (self.chart_duty, self.chart_weekly, self.chart_leave):
             charts_row.addWidget(c, stretch=1)
         v6.addLayout(charts_row, stretch=1)
@@ -850,6 +991,8 @@ class MainWindow(QMainWindow):
         else:
             self.summary_label.setText(
                 f"已就绪 {self.member_list.count()} 名成员，点击左下角「生成排班表」开始排班。")
+        self._reset_metric_cards()
+        self.pivot_stack.setCurrentIndex(1)
 
     def _mark_stale(self) -> None:
         """参数或成员变化后标记结果过期，提示重新生成"""
@@ -858,6 +1001,7 @@ class MainWindow(QMainWindow):
         self._stale = True
         self.summary_label.setText(
             "⚠ 排班参数或成员已变化，下方结果可能过期——请点击「生成排班表」重新生成。")
+        self._set_app_status("结果可能过期", "warning")
 
     def _restore_result(self) -> None:
         """启动时从数据库恢复上次的排班结果（关闭程序不会丢失）"""
@@ -953,6 +1097,8 @@ class MainWindow(QMainWindow):
         self._restore_result()
         if self.result is None:
             self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
+            self.pivot_stack.setCurrentIndex(1)
+            self._reset_metric_cards()
             for table in (
                 self.pivot_table,
                 self.detail_table,
@@ -1496,22 +1642,62 @@ class MainWindow(QMainWindow):
         self._save_settings()
         super().closeEvent(event)
 
+    def _set_app_status(self, text: str, tone: str = "neutral") -> None:
+        tones = {
+            "neutral": ("#475569", "#eef2f7", "#dbe3ee"),
+            "info": ("#1d4ed8", "#dbeafe", "#bfdbfe"),
+            "success": ("#047857", "#d1fae5", "#a7f3d0"),
+            "warning": ("#b45309", "#fef3c7", "#fde68a"),
+            "danger": ("#b91c1c", "#fee2e2", "#fecaca"),
+        }
+        foreground, background, border = tones.get(tone, tones["neutral"])
+        self.app_status_label.setText(text)
+        self.app_status_label.setStyleSheet(
+            f"color:{foreground};background:{background};border:1px solid {border};")
+
+    def _reset_metric_cards(self) -> None:
+        for key in ("duties", "members", "spread", "gaps"):
+            getattr(self, f"metric_{key}").setText("—")
+            hint = getattr(self, f"metric_{key}_hint")
+            hint.setText("等待排班结果")
+            hint.setStyleSheet("")
+        self._set_app_status("等待生成排班")
+
     def _refresh_schedule_summary(self) -> None:
         result = self.result
         if result is None:
+            self._reset_metric_cards()
             return
         n = len(result.assignments)
+        member_count = len(result.member_stats)
+        slot_count = len({(a.week, a.weekday, a.block) for a in result.assignments})
+        self.metric_duties.setText(f"{n} 人次")
+        self.metric_duties_hint.setText(f"覆盖 {slot_count} 个时段")
+        self.metric_members.setText(f"{member_count} 人")
+        self.metric_members_hint.setText(
+            f"人均 {n / max(member_count, 1):.1f} 次")
+        self.metric_spread.setText(f"{result.balanced_spread} 次")
+        self.metric_spread_hint.setText("越小越均衡")
+        gap_count = len(result.gaps)
+        self.metric_gaps.setText(f"{gap_count} 个")
+        self.metric_gaps_hint.setText(
+            "已全部覆盖" if gap_count == 0 else "需要处理")
+        self.metric_gaps_hint.setStyleSheet(
+            "" if gap_count == 0 else "color:#d97706;")
+
         summary = (
-            f"排班完成：共 {n} 人次安排 | 参与成员 {len(result.member_stats)} 人 | "
-            f"人均 {n / max(len(result.member_stats), 1):.1f} 次 | "
-            f"总次数极差 {result.balanced_spread}（越小越均衡）| "
-            f"无人可用时段 {len(result.gaps)} 个")
+            f"当前结果共 {n} 人次安排，参与成员 {member_count} 人，"
+            f"总次数极差 {result.balanced_spread}。")
         if result.gaps:
-            summary += "。" + capacity_advice(
+            summary += capacity_advice(
                 summarize_gap_causes(self._gap_diagnoses(result)),
                 self._config_per_slot(result),
             )
         self.summary_label.setText(summary)
+        self._set_app_status(
+            "排班已生成" if gap_count == 0 else "存在待处理缺口",
+            "success" if gap_count == 0 else "warning",
+        )
         has_data = bool(result.assignments)
         self.btn_export_xlsx.setEnabled(has_data)
         self.btn_export_csv.setEnabled(has_data)
@@ -1519,6 +1705,10 @@ class MainWindow(QMainWindow):
         self.btn_clear_schedule.setEnabled(has_data)
 
     def _refresh_pivot_section(self) -> None:
+        if self.result is None:
+            self.pivot_stack.setCurrentIndex(1)
+            return
+        self.pivot_stack.setCurrentIndex(0)
         self._refresh_schedule_summary()
         fill_table(self.pivot_table, self._pivot_display())
 
@@ -1569,6 +1759,8 @@ class MainWindow(QMainWindow):
                           self.stats_table, self.gap_table):
                 fill_table(table, pd.DataFrame())
             self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
+            self.pivot_stack.setCurrentIndex(1)
+            self._reset_metric_cards()
             self.gap_title.setText("无人可值时段")
             self.btn_export_xlsx.setEnabled(False)
             self.btn_export_csv.setEnabled(False)
@@ -1922,9 +2114,9 @@ class MainWindow(QMainWindow):
 
     def export_charts(self) -> None:
         charts = [
-            ("各成员值班总次数", self.chart_duty.data(), "#007aff"),
-            ("每周值班人次", self.chart_weekly.data(), "#34c759"),
-            ("各成员请假天数", self.chart_leave.data(), "#ff453a"),
+            ("各成员值班总次数", self.chart_duty.data(), "#2563eb"),
+            ("每周值班人次", self.chart_weekly.data(), "#059669"),
+            ("各成员请假天数", self.chart_leave.data(), "#dc2626"),
         ]
         path, _ = QFileDialog.getSaveFileName(
             self, "导出统计图", "值班请假统计图.png", "PNG 图片 (*.png)")

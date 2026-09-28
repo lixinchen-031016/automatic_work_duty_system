@@ -295,7 +295,7 @@ def _draw_bar_chart(
     rect: QRect,
     title: str,
     items: list[tuple[str, int]],
-    color: str = "#007aff",
+    color: str = "#2563eb",
 ) -> None:
     """在 rect 内绘制标题 + 柱状图（类苹果风格）。"""
     title_font = QFont()
@@ -464,7 +464,7 @@ class BarChart(QFrame):
     def __init__(
         self,
         title: str,
-        color: str = "#007aff",
+        color: str = "#2563eb",
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -473,8 +473,8 @@ class BarChart(QFrame):
         self._items: list[tuple[str, int]] = []
         self.setMinimumHeight(220)
         self.setStyleSheet(
-            "BarChart { background: #ffffff; border: 1px solid #e8e8ed; "
-            "border-radius: 10px; }")
+            "BarChart { background: #ffffff; border: 1px solid #dde5f0; "
+            "border-radius: 14px; }")
 
     def set_data(self, items: list[tuple[str, int]]) -> None:
         self._items = list(items)

@@ -373,6 +373,9 @@ def test_async_generate_updates_ui_and_db(window, qt_app) -> None:
         "落库结果应与计算结果一致"
     assert window.gantt_table.columnCount() == 13, "甘特图应已刷新（成员列 + 汇总列）"
     assert window.btn_export_xlsx.isEnabled() and window.btn_export_png.isEnabled()
+    assert window.metric_duties.text().endswith("人次")
+    assert window.metric_members.text().endswith("人")
+    assert window.pivot_stack.currentIndex() == 0
     assert "已重新排班" in window.statusBar().currentMessage()
 
     # 相同参数的第二次生成：未变化的安排应保持原行（不整周删除重建）
@@ -636,12 +639,16 @@ def test_stale_marking_and_empty_state(window) -> None:
     window.result = None
     window._update_empty_state()
     assert "3 名成员" in window.summary_label.text()
+    assert window.metric_duties.text() == "—"
+    assert window.app_status_label.text() == "等待生成排班"
+    assert window.pivot_stack.currentIndex() == 1
 
     # 有结果后改参数 -> 提示过期
     window.result = appmod.ScheduleResult()
     window._stale = False
     window._mark_stale()
     assert "过期" in window.summary_label.text()
+    assert window.app_status_label.text() == "结果可能过期"
 
 def test_busy_map_is_cached_and_reused(window, monkeypatch) -> None:
     """忙时表展开成本高，甘特图刷新不应重建它（改由缓存提供）"""
