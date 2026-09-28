@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QTableWidget,
 )
@@ -1047,3 +1048,71 @@ def test_gantt_filter_keeps_only_short_video_and_image_studios(window, qt_app) -
     assert {m.name for m in window.gantt_members()} == {"短视频成员", "图片成员"}
     assert window.gantt_matrix is not None
     assert set(window.gantt_matrix.member_names) == {"短视频成员", "图片成员"}
+
+
+def test_batch_edit_studio_dialog_updates_checked_members(window, qt_app) -> None:
+    seed_members(window, 3)
+    member_ids = [member.id for member in window.members()]
+
+    def interact() -> None:
+        dialog = qt_app.activeModalWidget()
+        assert isinstance(dialog, QDialog)
+        member_list = dialog.findChild(QListWidget)
+        assert member_list is not None
+        member_list.item(0).setCheckState(Qt.Checked)
+        member_list.item(2).setCheckState(Qt.Checked)
+        studio_combo = dialog.findChild(QComboBox)
+        assert studio_combo is not None
+        studio_combo.setCurrentText("图片工作室")
+        save_button = next(
+            button for button in dialog.findChildren(QPushButton)
+            if button.text() == "保存")
+        save_button.click()
+
+    QTimer.singleShot(0, interact)
+    window.batch_edit_members_studio()
+
+    members = {member.id: member for member in window.members()}
+    assert members[member_ids[0]].studio == "图片工作室"
+    assert members[member_ids[1]].studio == "未指定工作室"
+    assert members[member_ids[2]].studio == "图片工作室"
+    assert members[member_ids[0]].studio_locked is True
+
+
+def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
+    seed_members(window, 1)
+    member = window.members()[0]
+    original_course_count = member.course_count
+    window.member_combo.setCurrentIndex(window.member_combo.findData(member.id))
+
+    def interact() -> None:
+        dialog = qt_app.activeModalWidget()
+        assert isinstance(dialog, QDialog)
+        edits = dialog.findChildren(QLineEdit)
+        # 可编辑工作室下拉框内部也包含一个 QLineEdit。
+        assert len(edits) >= 6
+        edits[0].setText("新姓名")
+        edits[1].setText("9001")
+        edits[2].setText("新班级")
+        edits[3].setText("2027-2028-1")
+        edits[4].setText("新专业")
+        edits[5].setText("新学院")
+        studio_combo = dialog.findChild(QComboBox)
+        assert studio_combo is not None
+        studio_combo.setCurrentText("短视频工作室")
+        save_button = next(
+            button for button in dialog.findChildren(QPushButton)
+            if button.text() == "保存")
+        save_button.click()
+
+    QTimer.singleShot(0, interact)
+    window.edit_member_profile()
+
+    updated = window.db.get_member(member.id)
+    assert updated is not None
+    assert (updated.name, updated.student_id, updated.class_name) == (
+        "新姓名", "9001", "新班级")
+    assert (updated.term, updated.major, updated.department) == (
+        "2027-2028-1", "新专业", "新学院")
+    assert updated.studio == "短视频工作室"
+    assert len(window.db.get_courses(member.id)) == original_course_count

@@ -495,14 +495,54 @@ class Database:
             ).fetchall()
             return [row["studio"] for row in rows]
 
-    def set_member_studio(self, member_id: int, studio: str) -> None:
-        """手工修改工作室后锁定，后续重导花名册不会覆盖。"""
+    def set_members_studio(self, member_ids: Iterable[int], studio: str) -> int:
+        """批量修改工作室并锁定，返回实际处理的成员数。"""
+        ids = list(dict.fromkeys(int(member_id) for member_id in member_ids))
+        if not ids:
+            return 0
         normalized = (studio or "").strip() or UNKNOWN_STUDIO
         with self._connection() as conn:
-            conn.execute(
+            conn.executemany(
                 "UPDATE members SET studio = ?, studio_locked = 1 WHERE id = ?",
-                (normalized, member_id),
+                [(normalized, member_id) for member_id in ids],
             )
+        return len(ids)
+
+    def set_member_studio(self, member_id: int, studio: str) -> None:
+        """手工修改工作室后锁定，后续重导花名册不会覆盖。"""
+        self.set_members_studio([member_id], studio)
+
+    def update_member_profile(
+        self,
+        member_id: int,
+        *,
+        name: str,
+        student_id: str,
+        term: str = "",
+        class_name: str = "",
+        major: str = "",
+        department: str = "",
+    ) -> None:
+        """修改成员个人信息；课程与历史排班仍按内部 id 保留。"""
+        normalized_name = (name or "").strip()
+        if not normalized_name:
+            raise ValueError("姓名不能为空")
+        normalized_id = normalize_student_id(student_id)
+        try:
+            with self._connection() as conn:
+                cursor = conn.execute(
+                    """UPDATE members
+                       SET name = ?, student_id = ?, term = ?, class_name = ?,
+                           major = ?, department = ?
+                       WHERE id = ?""",
+                    (normalized_name, normalized_id, (term or "").strip(),
+                     (class_name or "").strip(), (major or "").strip(),
+                     (department or "").strip(), member_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ValueError("成员不存在或已被删除")
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("已存在相同学号和姓名的成员") from exc
 
     def list_members(self) -> list[Member]:
         with self._connection() as conn:

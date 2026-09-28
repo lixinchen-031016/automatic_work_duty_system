@@ -6,6 +6,8 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from duty_system.calendar import CalendarEntry
 from duty_system.database import MIGRATIONS, SCHEMA, Assignment, Database
 from duty_system.parser import ParsedSchedule
@@ -301,3 +303,46 @@ def test_backup_to_is_wal_safe(tmp_path: Path) -> None:
     assert len(restored.load_assignments()) == 2
     # 副本是一个可用数据库，不只是能读
     assert restored.sync_assignments_for_weeks([1], [Assignment(1, 1, 1, ids[1])]) == (1, 2)
+
+
+def test_batch_studio_update_locks_each_member(tmp_path: Path) -> None:
+    db = new_db(tmp_path)
+    member_ids = add_members(db, ["甲", "乙", "丙"])
+
+    assert db.set_members_studio(member_ids[:2], "图片工作室") == 2
+
+    members = {member.name: member for member in db.list_members()}
+    assert members["甲"].studio == "图片工作室"
+    assert members["乙"].studio == "图片工作室"
+    assert members["甲"].studio_locked is True
+    assert members["丙"].studio == "未指定工作室"
+
+
+def test_profile_update_preserves_related_records_and_checks_duplicate(
+    tmp_path: Path,
+) -> None:
+    db = new_db(tmp_path)
+    member_id = db.upsert_member(ParsedSchedule(
+        name="甲", student_id="1", class_name="旧班", major="旧专业",
+        department="旧学院", courses=[]))
+    other_id = db.upsert_member(ParsedSchedule(
+        name="乙", student_id="2", courses=[]))
+    db.save_assignments([Assignment(1, 1, 1, member_id)])
+
+    db.update_member_profile(
+        member_id, name="甲同学", student_id="1001", term="2026-2027-1",
+        class_name="新班", major="新专业", department="新学院")
+
+    member = db.get_member(member_id)
+    assert member is not None
+    assert (member.name, member.student_id, member.term) == (
+        "甲同学", "1001", "2026-2027-1")
+    assert (member.class_name, member.major, member.department) == (
+        "新班", "新专业", "新学院")
+    assignments = db.load_assignments()
+    assert [(a.week, a.weekday, a.block, a.member_id)
+            for a in assignments] == [(1, 1, 1, member_id)]
+    assert assignments[0].member_name == "甲同学"
+
+    with pytest.raises(ValueError, match="已存在"):
+        db.update_member_profile(other_id, name="甲同学", student_id="1001")

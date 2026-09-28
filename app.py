@@ -577,6 +577,8 @@ class MainWindow(QMainWindow):
         self.member_studio_filter.setAccessibleName("工作室筛选")
         self.member_list.setAccessibleName("成员列表")
         self.btn_edit_studio.setAccessibleName("修改选中成员工作室")
+        self.btn_batch_studio.setAccessibleName("批量修改成员工作室")
+        self.btn_edit_member_profile.setAccessibleName("修改成员个人信息")
         self.btn_remove.setAccessibleName("删除选中成员")
         self.week_from.setAccessibleName("起始周")
         self.week_to.setAccessibleName("结束周")
@@ -601,6 +603,7 @@ class MainWindow(QMainWindow):
             self.member_studio_filter,
             self.member_list,
             self.btn_edit_studio,
+            self.btn_batch_studio,
             self.btn_remove,
             self.week_from,
             self.week_to,
@@ -614,6 +617,8 @@ class MainWindow(QMainWindow):
             self.btn_calendar,
             self.btn_generate,
             self.btn_clear_schedule,
+            self.member_combo,
+            self.btn_edit_member_profile,
             self.tabs,
         ]
         for first, second in pairwise(order):
@@ -677,6 +682,11 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self.remove_selected_member)
         member_actions.addWidget(self.btn_remove)
         members_layout.addLayout(member_actions)
+        self.btn_batch_studio = QPushButton("批量修改工作室…")
+        self.btn_batch_studio.setToolTip(
+            "按当前搜索/筛选结果勾选多人，一次修改并锁定工作室归属")
+        self.btn_batch_studio.clicked.connect(self.batch_edit_members_studio)
+        members_layout.addWidget(self.btn_batch_studio)
         layout.addWidget(grp_members, stretch=1)
 
         grp_cfg = QGroupBox("排班参数")
@@ -966,6 +976,11 @@ class MainWindow(QMainWindow):
         self.member_combo.setMinimumWidth(220)
         self.member_combo.currentIndexChanged.connect(self._on_member_combo_changed)
         sel_row.addWidget(self.member_combo)
+        self.btn_edit_member_profile = QPushButton("修改个人信息…")
+        self.btn_edit_member_profile.setToolTip(
+            "修改姓名、学号、班级、学期、专业和院系；课程与历史排班仍保留")
+        self.btn_edit_member_profile.clicked.connect(self.edit_member_profile)
+        sel_row.addWidget(self.btn_edit_member_profile)
         sel_row.addStretch()
         v3.addLayout(sel_row)
         self.member_info = QLabel("")
@@ -1200,6 +1215,8 @@ class MainWindow(QMainWindow):
                 m.id)
         self.member_combo.blockSignals(False)
         self.action_participation.setEnabled(bool(members))
+        self.btn_edit_member_profile.setEnabled(bool(members))
+        self.btn_batch_studio.setEnabled(bool(members))
         self.action_export_roster.setEnabled(bool(members or self.roster_entries()))
         if selected_id is not None:
             for row in range(self.member_list.count()):
@@ -3114,6 +3131,16 @@ class MainWindow(QMainWindow):
             apply_import,
         )
 
+    def _studio_options(self, *current_values: str) -> list[str]:
+        options = set(self.db.roster_studios())
+        options.update(TARGET_AVAILABILITY_STUDIOS)
+        options.add(UNKNOWN_STUDIO)
+        options.update(
+            (member.studio or UNKNOWN_STUDIO).strip() for member in self.members())
+        options.update(
+            (studio or "").strip() for studio in current_values if studio)
+        return sorted(option for option in options if option)
+
     def edit_selected_member_studio(self) -> None:
         item = self.member_list.currentItem()
         if item is None:
@@ -3123,13 +3150,8 @@ class MainWindow(QMainWindow):
         member = self.db.get_member(member_id)
         if member is None:
             return
-        studios = set(self.db.roster_studios())
-        studios.update(TARGET_AVAILABILITY_STUDIOS)
-        studios.add(UNKNOWN_STUDIO)
-        if member.studio:
-            studios.add(member.studio)
-        options = sorted(studios)
         current = member.studio or UNKNOWN_STUDIO
+        options = self._studio_options(current)
         studio, accepted = QInputDialog.getItem(
             self, "修改工作室",
             f"设置「{member.name}」的工作室归属：\n"
@@ -3146,6 +3168,190 @@ class MainWindow(QMainWindow):
         self.refresh_members()
         self.statusBar().showMessage(
             f"已将 {member.name} 的工作室修改为“{studio}”，并锁定该归属。")
+
+    def batch_edit_members_studio(self) -> None:
+        visible_members = [
+            self.member_list.item(row).data(Qt.UserRole)
+            for row in range(self.member_list.count())
+            if not self.member_list.item(row).isHidden()
+        ]
+        member_by_id = {member.id: member for member in self.members()}
+        visible_members = [
+            member_by_id[member_id] for member_id in visible_members
+            if member_id in member_by_id
+        ]
+        if not visible_members:
+            QMessageBox.information(self, "提示", "当前筛选结果中没有成员。")
+            return
+
+        selected_item = self.member_list.currentItem()
+        selected_id = selected_item.data(Qt.UserRole) if selected_item else None
+        current_member = member_by_id.get(selected_id) if selected_id else None
+        current_studio = (
+            current_member.studio if current_member is not None
+            else visible_members[0].studio
+        ) or UNKNOWN_STUDIO
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("批量修改工作室")
+        dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "批量修改工作室",
+            f"列表显示当前搜索/筛选结果（{len(visible_members)} 人）。"
+            "勾选成员后统一设置工作室，并锁定归属以防重导花名册覆盖。"))
+
+        select_row = QHBoxLayout()
+        btn_select_all = QPushButton("全选")
+        btn_select_none = QPushButton("清空")
+        select_row.addWidget(btn_select_all)
+        select_row.addWidget(btn_select_none)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        member_list = QListWidget()
+        member_list.setMinimumHeight(260)
+        for member in visible_members:
+            studio = member.studio or UNKNOWN_STUDIO
+            item = QListWidgetItem(
+                f"{member.name}（学号 {member.student_id or '—'} · "
+                f"当前 {studio}）")
+            item.setData(Qt.UserRole, member.id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            checked = member.id == selected_id if selected_id is not None else False
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            member_list.addItem(item)
+        layout.addWidget(member_list, stretch=1)
+
+        form = QFormLayout()
+        studio_combo = QComboBox()
+        studio_combo.setEditable(True)
+        studio_combo.addItems(self._studio_options(current_studio))
+        studio_combo.setCurrentText(current_studio)
+        form.addRow("目标工作室", studio_combo)
+        layout.addLayout(form)
+
+        def set_all(checked: bool) -> None:
+            state = Qt.Checked if checked else Qt.Unchecked
+            for row in range(member_list.count()):
+                member_list.item(row).setCheckState(state)
+
+        btn_select_all.clicked.connect(lambda: set_all(True))
+        btn_select_none.clicked.connect(lambda: set_all(False))
+
+        buttons = dialog_buttons("保存")
+
+        def accept_batch() -> None:
+            selected_ids = [
+                member_list.item(row).data(Qt.UserRole)
+                for row in range(member_list.count())
+                if member_list.item(row).checkState() == Qt.Checked
+            ]
+            studio = studio_combo.currentText().strip()
+            if not selected_ids:
+                QMessageBox.information(dlg, "提示", "请至少勾选一名成员。")
+                return
+            if not studio:
+                QMessageBox.information(dlg, "提示", "工作室名称不能为空。")
+                return
+            dlg.accept()
+
+        buttons.accepted.connect(accept_batch)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        selected_ids = [
+            member_list.item(row).data(Qt.UserRole)
+            for row in range(member_list.count())
+            if member_list.item(row).checkState() == Qt.Checked
+        ]
+        studio = studio_combo.currentText().strip()
+        changed = self.db.set_members_studio(selected_ids, studio)
+        self.invalidate_cache()
+        self.refresh_members()
+        self.statusBar().showMessage(
+            f"已将 {changed} 名成员的工作室批量修改为“{studio}”，并锁定归属。")
+
+    def edit_member_profile(self) -> None:
+        if self.member_combo.currentIndex() < 0:
+            QMessageBox.information(self, "提示", "请先上传成员课表。")
+            return
+        member_id = self.member_combo.currentData()
+        member = self.db.get_member(member_id)
+        if member is None:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("修改个人信息")
+        dlg.setMinimumWidth(460)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "修改个人信息",
+            f"正在修改：{member.name}。课程、值班、请假与特殊安排记录不会丢失。"))
+        form = QFormLayout()
+        form.setSpacing(10)
+        fields = {
+            "name": ("姓名", member.name),
+            "student_id": ("学号", member.student_id),
+            "class_name": ("班级", member.class_name),
+            "term": ("学期", member.term),
+            "major": ("专业", member.major),
+            "department": ("院系", member.department),
+        }
+        edits: dict[str, QLineEdit] = {}
+        for key, (label_text, value) in fields.items():
+            edit = QLineEdit(value)
+            if key == "name":
+                edit.setPlaceholderText("必填")
+            edits[key] = edit
+            form.addRow(label_text, edit)
+        studio_combo = QComboBox()
+        studio_combo.setEditable(True)
+        studio_combo.addItems(self._studio_options(
+            member.studio or UNKNOWN_STUDIO))
+        studio_combo.setCurrentText(member.studio or UNKNOWN_STUDIO)
+        form.addRow("工作室", studio_combo)
+        layout.addLayout(form)
+
+        buttons = dialog_buttons("保存")
+
+        def save_profile() -> None:
+            try:
+                self.db.update_member_profile(
+                    member_id,
+                    name=edits["name"].text(),
+                    student_id=edits["student_id"].text(),
+                    class_name=edits["class_name"].text(),
+                    term=edits["term"].text(),
+                    major=edits["major"].text(),
+                    department=edits["department"].text(),
+                )
+            except ValueError as exc:
+                QMessageBox.warning(dlg, "无法保存", str(exc))
+                return
+            studio = studio_combo.currentText().strip() or UNKNOWN_STUDIO
+            if studio != (member.studio or UNKNOWN_STUDIO):
+                self.db.set_member_studio(member_id, studio)
+            dlg.accept()
+
+        buttons.accepted.connect(save_profile)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        self.invalidate_cache()
+        self.refresh_members()
+        index = self.member_combo.findData(member_id)
+        if index >= 0:
+            self.member_combo.setCurrentIndex(index)
+        self.statusBar().showMessage(f"已更新 {edits['name'].text().strip()} 的个人信息。")
 
     def export_roster(self) -> None:
         members = self.members()
