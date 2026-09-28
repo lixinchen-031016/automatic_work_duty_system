@@ -34,6 +34,7 @@ from PySide6.QtGui import (
     QColor,
     QFontMetrics,
     QKeySequence,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -162,6 +163,13 @@ else:
     DB_PATH = Path(__file__).parent / "duty_system.db"
 
 SHORTCUT_MODIFIER = "⌘" if sys.platform == "darwin" else "Ctrl+"
+
+
+def resource_path(relative_path: str | Path) -> Path:
+    """返回源码运行或 PyInstaller 解包目录中的资源路径。"""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative_path
+
 
 # 类苹果设计语言（macOS 浅色模式）：
 #   背景 #f3f6fb / 卡片白色圆角 / 主色 #2563eb / 文字 #132238·#66758a
@@ -413,10 +421,21 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(18, 10, 18, 10)
         top_layout.setSpacing(11)
 
-        brand_mark = QLabel("值")
-        brand_mark.setObjectName("brandMark")
+        brand_mark = QLabel()
+        brand_mark.setObjectName("brandLogo")
         brand_mark.setAlignment(Qt.AlignCenter)
-        brand_mark.setFixedSize(38, 38)
+        brand_mark.setToolTip("成都工业学院")
+        logo = QPixmap(str(resource_path(
+            Path("assets") / "chengdu_technological_university_logo_mark.png")))
+        if logo.isNull():
+            brand_mark.setObjectName("brandMark")
+            brand_mark.setText("值")
+            brand_mark.setFixedSize(38, 38)
+        else:
+            scaled_logo = logo.scaledToHeight(42, Qt.SmoothTransformation)
+            brand_mark.setPixmap(scaled_logo)
+            brand_mark.setFixedSize(scaled_logo.size())
+        self.brand_logo = brand_mark
         top_layout.addWidget(brand_mark)
 
         brand_text = QVBoxLayout()

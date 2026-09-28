@@ -118,6 +118,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed
           --name ${{ env.APP_NAME }}
           --hidden-import xlrd
+          --add-data "assets;assets"
           app.py
 
       - name: 冒烟启动 Windows 应用
@@ -170,6 +171,7 @@ jobs:
           pyinstaller --noconfirm --clean --windowed
           --name ${{ env.APP_NAME }}
           --hidden-import xlrd
+          --add-data "assets:assets"
           app.py
 
       - name: 冒烟启动 macOS 应用

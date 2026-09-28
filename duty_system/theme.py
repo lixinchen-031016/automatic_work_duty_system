@@ -33,6 +33,10 @@ QSplitter::handle { background: transparent; }
 QSplitter::handle:horizontal { width: 14px; }
 
 QLabel { color: #132238; background: transparent; }
+QLabel#brandLogo {
+    background: transparent;
+    border: none;
+}
 QLabel#brandMark {
     color: #ffffff;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,

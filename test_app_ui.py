@@ -640,6 +640,8 @@ def test_stale_marking_and_empty_state(window) -> None:
     window._update_empty_state()
     assert "3 名成员" in window.summary_label.text()
     assert window.metric_duties.text() == "—"
+    assert window.brand_logo.pixmap() is not None
+    assert not window.brand_logo.pixmap().isNull()
     assert window.app_status_label.text() == "等待生成排班"
     assert window.pivot_stack.currentIndex() == 1
 

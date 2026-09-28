@@ -114,3 +114,18 @@ def test_test_step_uses_offscreen_qt() -> None:
                     f"{job} 的测试步骤缺少 QT_QPA_PLATFORM=offscreen"
                 return
     pytest.fail("工作流里没有找到运行 pytest 的步骤")
+
+
+def test_brand_assets_are_bundled_into_builds() -> None:
+    """品牌标识必须随 PyInstaller 打包，避免安装版顶部栏缺少 Logo。"""
+    root = Path(__file__).parent
+    assert (root / "assets" / "chengdu_technological_university_logo_mark.png").exists()
+    assert (root / "assets" / "chengdu_technological_university_logo.jpg").exists()
+
+    jobs = _workflow()["jobs"]
+    windows_scripts = "\n".join(
+        step.get("run", "") for step in jobs["build-windows"]["steps"])
+    macos_scripts = "\n".join(
+        step.get("run", "") for step in jobs["build-macos"]["steps"])
+    assert '--add-data "assets;assets"' in windows_scripts
+    assert '--add-data "assets:assets"' in macos_scripts

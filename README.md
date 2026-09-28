@@ -360,6 +360,7 @@ automatic_work_duty_system/
 ├── requirements-dev.txt      # 开发依赖（pytest）
 ├── pytest.ini                # 测试发现配置
 ├── duty_system.db            # SQLite 数据库（运行时自动创建）
+├── assets/                   # 品牌与界面静态资源
 ├── samples/                  # 课表示例
 │   ├── *.xls                 #   同学提供的原始课表（含个人信息，.gitignore 忽略）
 │   └── desensitized/         #   脱敏副本（随仓库提交，测试与 CI 用）
