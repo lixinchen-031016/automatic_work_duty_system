@@ -15,6 +15,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from datetime import date, timedelta
+from itertools import pairwise
 from pathlib import Path
 
 import pandas as pd
@@ -43,7 +44,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -122,6 +122,8 @@ from duty_system.ui_utils import (
     card as _card,
 )
 from duty_system.ui_utils import (
+    dialog_buttons,
+    dialog_header,
     fill_table,
     special_sessions_label,
     special_weeks_label,
@@ -353,6 +355,7 @@ class MainWindow(QMainWindow):
             return
         self._busy = True
         self.btn_generate.setEnabled(False)
+        self.action_generate.setEnabled(False)
         self.centralWidget().setEnabled(False)
         self.menuBar().setEnabled(False)
         self._set_app_status(label, "info")
@@ -370,6 +373,7 @@ class MainWindow(QMainWindow):
             return
         self._busy = False
         self.btn_generate.setEnabled(True)
+        self.action_generate.setEnabled(True)
         self.centralWidget().setEnabled(True)
         self.menuBar().setEnabled(True)
         QApplication.restoreOverrideCursor()
@@ -385,6 +389,44 @@ class MainWindow(QMainWindow):
     # ---------- 界面构建 ----------
 
     def _build_ui(self) -> None:
+        file_menu = self.menuBar().addMenu("文件")
+        self.action_upload = QAction("上传成员课表…", self)
+        self.action_upload.setShortcut(QKeySequence.StandardKey.Open)
+        self.action_upload.triggered.connect(self.upload_files)
+        file_menu.addAction(self.action_upload)
+
+        export_menu = file_menu.addMenu("导出当前结果")
+        self.action_export_excel = QAction("导出 Excel…", self)
+        self.action_export_excel.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.action_export_excel.triggered.connect(self.export_xlsx)
+        self.action_export_csv = QAction("导出 CSV…", self)
+        self.action_export_csv.triggered.connect(self.export_csv)
+        self.action_export_png = QAction("导出 PNG…", self)
+        self.action_export_png.triggered.connect(self.export_png)
+        for action in (
+            self.action_export_excel,
+            self.action_export_csv,
+            self.action_export_png,
+        ):
+            action.setEnabled(False)
+            export_menu.addAction(action)
+
+        self.action_quit = QAction("退出", self)
+        self.action_quit.setShortcut(QKeySequence.StandardKey.Quit)
+        self.action_quit.triggered.connect(self.close)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_quit)
+
+        schedule_menu = self.menuBar().addMenu("排班")
+        self.action_generate = QAction("生成排班表", self)
+        self.action_generate.setShortcut(QKeySequence("Ctrl+G"))
+        self.action_generate.triggered.connect(self.generate)
+        schedule_menu.addAction(self.action_generate)
+        self.action_clear_schedule = QAction("清空排班…", self)
+        self.action_clear_schedule.setEnabled(False)
+        self.action_clear_schedule.triggered.connect(self.clear_schedule)
+        schedule_menu.addAction(self.action_clear_schedule)
+
         edit_menu = self.menuBar().addMenu("编辑")
         self.undo_action = QAction("撤销", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
@@ -408,6 +450,11 @@ class MainWindow(QMainWindow):
         self.redo_action.setEnabled(False)
         self.redo_action.triggered.connect(self.redo_tweak)
         edit_menu.addAction(self.redo_action)
+
+        self.action_focus_search = QAction("搜索成员", self)
+        self.action_focus_search.setShortcut(QKeySequence.StandardKey.Find)
+        self.action_focus_search.triggered.connect(self._focus_member_search)
+        self.addAction(self.action_focus_search)
 
         root = QWidget()
         root.setObjectName("appRoot")
@@ -468,6 +515,57 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(top_bar)
         root_layout.addWidget(splitter, stretch=1)
         self.setCentralWidget(root)
+        self._configure_accessibility()
+
+    def _focus_member_search(self) -> None:
+        self.member_search.setFocus(Qt.ShortcutFocusReason)
+        self.member_search.selectAll()
+
+    def _configure_accessibility(self) -> None:
+        """设置可访问名称、说明和明确的键盘 Tab 顺序。"""
+        self.btn_upload.setAccessibleName("上传成员课表")
+        self.member_search.setAccessibleName("搜索成员")
+        self.member_search.setAccessibleDescription("按姓名、学号或班级筛选成员")
+        self.member_class_filter.setAccessibleName("班级筛选")
+        self.member_list.setAccessibleName("成员列表")
+        self.btn_remove.setAccessibleName("删除选中成员")
+        self.week_from.setAccessibleName("起始周")
+        self.week_to.setAccessibleName("结束周")
+        self.per_slot.setAccessibleName("每时段值班人数")
+        self.max_week.setAccessibleName("每人每周上限")
+        self.max_day.setAccessibleName("每人每天上限")
+        self.seed.setAccessibleName("随机种子")
+        self.term_start.setAccessibleName("学期起始日")
+        self.btn_calendar.setAccessibleName("管理学期日历")
+        self.btn_generate.setAccessibleName("生成排班表")
+        self.btn_clear_schedule.setAccessibleName("清空排班")
+        self.tabs.setAccessibleName("排班功能页签")
+        self.app_status_label.setAccessibleName("当前状态")
+        self.brand_logo.setAccessibleName("成都工业学院校徽")
+        self.pivot_table.setAccessibleName("值班排班表")
+
+        order = [
+            self.btn_upload,
+            self.member_search,
+            self.member_class_filter,
+            self.member_list,
+            self.btn_remove,
+            self.week_from,
+            self.week_to,
+            *self.weekday_checks.values(),
+            *self.block_checks.values(),
+            self.per_slot,
+            self.max_week,
+            self.max_day,
+            self.seed,
+            self.term_start,
+            self.btn_calendar,
+            self.btn_generate,
+            self.btn_clear_schedule,
+            self.tabs,
+        ]
+        for first, second in pairwise(order):
+            QWidget.setTabOrder(first, second)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -504,10 +602,10 @@ class MainWindow(QMainWindow):
         self.member_search.textChanged.connect(self._apply_member_filter)
         self.member_class_filter.currentIndexChanged.connect(self._apply_member_filter)
         members_layout.addWidget(self.member_list)
-        btn_remove = QPushButton("删除选中成员")
-        btn_remove.setObjectName("danger")
-        btn_remove.clicked.connect(self.remove_selected_member)
-        members_layout.addWidget(btn_remove)
+        self.btn_remove = QPushButton("删除选中成员")
+        self.btn_remove.setObjectName("danger")
+        self.btn_remove.clicked.connect(self.remove_selected_member)
+        members_layout.addWidget(self.btn_remove)
         layout.addWidget(grp_members, stretch=1)
 
         grp_cfg = QGroupBox("排班参数")
@@ -596,11 +694,11 @@ class MainWindow(QMainWindow):
         calendar_row = QHBoxLayout()
         self.calendar_label = QLabel("未设置")
         self.calendar_label.setObjectName("secondary")
-        btn_calendar = QPushButton("管理日历…")
-        btn_calendar.setToolTip("批量设置法定假日与周末补课映射")
-        btn_calendar.clicked.connect(self.open_calendar_dialog)
+        self.btn_calendar = QPushButton("管理日历…")
+        self.btn_calendar.setToolTip("批量设置法定假日与周末补课映射")
+        self.btn_calendar.clicked.connect(self.open_calendar_dialog)
         calendar_row.addWidget(self.calendar_label, stretch=1)
-        calendar_row.addWidget(btn_calendar)
+        calendar_row.addWidget(self.btn_calendar)
         form.addRow("学期日历", calendar_row)
         layout.addWidget(grp_cfg)
 
@@ -718,20 +816,51 @@ class MainWindow(QMainWindow):
         empty_layout = QVBoxLayout(pivot_empty)
         empty_layout.setContentsMargins(24, 24, 24, 24)
         empty_layout.addStretch(1)
-        empty_title = QLabel("还没有排班结果")
-        empty_title.setObjectName("pageTitle")
-        empty_title.setAlignment(Qt.AlignCenter)
-        empty_text = QLabel("上传成员课表并设置排班规则后，点击左侧「生成排班表」。")
-        empty_text.setObjectName("secondary")
-        empty_text.setAlignment(Qt.AlignCenter)
-        empty_text.setWordWrap(True)
-        empty_action = QPushButton("上传成员课表")
-        empty_action.setObjectName("primary")
-        empty_action.clicked.connect(self.upload_files)
-        empty_layout.addWidget(empty_title)
-        empty_layout.addWidget(empty_text)
-        empty_layout.addSpacing(6)
-        empty_layout.addWidget(empty_action, alignment=Qt.AlignCenter)
+        self.empty_title = QLabel("三步完成第一次排班")
+        self.empty_title.setObjectName("pageTitle")
+        self.empty_title.setAlignment(Qt.AlignCenter)
+        self.empty_text = QLabel("先导入课表，再确认排班参数，最后生成结果。")
+        self.empty_text.setObjectName("secondary")
+        self.empty_text.setAlignment(Qt.AlignCenter)
+        self.empty_text.setWordWrap(True)
+        empty_layout.addWidget(self.empty_title)
+        empty_layout.addWidget(self.empty_text)
+        empty_layout.addSpacing(12)
+
+        steps_row = QHBoxLayout()
+        steps_row.setSpacing(10)
+        self.empty_step_cards: list[QFrame] = []
+        step_specs = (
+            ("1", "导入课表", "上传成员的 .xls / .xlsx 文件"),
+            ("2", "设置规则", "选择周次、星期、时段与上限"),
+            ("3", "生成导出", "生成排班并导出 Excel / PNG"),
+        )
+        for number, title_text, detail_text in step_specs:
+            step = QFrame()
+            step.setObjectName("guideStep")
+            step_layout = QVBoxLayout(step)
+            step_layout.setContentsMargins(14, 12, 14, 12)
+            step_layout.setSpacing(5)
+            number_label = QLabel(number)
+            number_label.setObjectName("guideNumber")
+            number_label.setAlignment(Qt.AlignCenter)
+            number_label.setFixedSize(24, 24)
+            title_label = QLabel(title_text)
+            title_label.setObjectName("guideTitle")
+            detail_label = QLabel(detail_text)
+            detail_label.setObjectName("secondary")
+            detail_label.setWordWrap(True)
+            step_layout.addWidget(number_label)
+            step_layout.addWidget(title_label)
+            step_layout.addWidget(detail_label)
+            self.empty_step_cards.append(step)
+            steps_row.addWidget(step, stretch=1)
+        empty_layout.addLayout(steps_row)
+        empty_layout.addSpacing(14)
+        self.empty_action = QPushButton("上传成员课表")
+        self.empty_action.setObjectName("primary")
+        self.empty_action.clicked.connect(self._on_empty_action)
+        empty_layout.addWidget(self.empty_action, alignment=Qt.AlignCenter)
         empty_layout.addStretch(1)
         self.pivot_stack.addWidget(pivot_empty)
         v1.addWidget(self.pivot_stack, stretch=1)
@@ -999,17 +1128,40 @@ class MainWindow(QMainWindow):
             matches_class = not selected_class or class_name == selected_class
             item.setHidden(not (matches_query and matches_class))
 
+    def _on_empty_action(self) -> None:
+        if self.members():
+            self.generate()
+        else:
+            self.upload_files()
+
     def _update_empty_state(self) -> None:
         """无排班结果时，给出下一步引导文案"""
         if self.result is not None:
             return
-        if self.member_list.count() == 0:
+        member_count = self.member_list.count()
+        if member_count == 0:
+            self.empty_title.setText("三步完成第一次排班")
+            self.empty_text.setText("先导入课表，再确认排班参数，最后生成结果。")
+            self.empty_action.setText("上传成员课表")
             self.summary_label.setText(
                 "开始使用三步：① 上传成员课表（支持多选 .xls / .xlsx）→ ② 调整排班参数 → "
                 "③ 点击「生成排班表」。可在「空闲时段总览」页查看全员共同空闲时段，方便安排任务。")
+            self.empty_step_cards[0].setProperty("state", "active")
+            self.empty_step_cards[1].setProperty("state", "")
+            self.empty_step_cards[2].setProperty("state", "")
         else:
+            self.empty_title.setText("已准备就绪，可以生成排班")
+            self.empty_text.setText(
+                f"已导入 {member_count} 名成员。确认左侧规则后，点击下方按钮生成排班表。")
+            self.empty_action.setText("生成排班表")
             self.summary_label.setText(
-                f"已就绪 {self.member_list.count()} 名成员，点击左下角「生成排班表」开始排班。")
+                f"已就绪 {member_count} 名成员，点击「生成排班表」开始排班。")
+            self.empty_step_cards[0].setProperty("state", "done")
+            self.empty_step_cards[1].setProperty("state", "active")
+            self.empty_step_cards[2].setProperty("state", "")
+        for step in self.empty_step_cards:
+            step.style().unpolish(step)
+            step.style().polish(step)
         self._reset_metric_cards()
         self.pivot_stack.setCurrentIndex(1)
 
@@ -1115,9 +1267,7 @@ class MainWindow(QMainWindow):
         self.refresh_members()
         self._restore_result()
         if self.result is None:
-            self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
-            self.pivot_stack.setCurrentIndex(1)
-            self._reset_metric_cards()
+            self._update_empty_state()
             for table in (
                 self.pivot_table,
                 self.detail_table,
@@ -1128,6 +1278,10 @@ class MainWindow(QMainWindow):
             self.btn_export_xlsx.setEnabled(False)
             self.btn_export_csv.setEnabled(False)
             self.btn_export_png.setEnabled(False)
+            self.action_export_excel.setEnabled(False)
+            self.action_export_csv.setEnabled(False)
+            self.action_export_png.setEnabled(False)
+            self.action_clear_schedule.setEnabled(False)
             self.gap_title.setText("无人可值时段")
         self.refresh_gantt()
         self.refresh_charts()
@@ -1352,9 +1506,15 @@ class MainWindow(QMainWindow):
         """一键生成互补的 off/class，并在加入编辑表前校验 maps_to。"""
         dlg = QDialog(self)
         dlg.setWindowTitle("添加调休")
-        form = QFormLayout(dlg)
-        form.setContentsMargins(16, 16, 16, 12)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "添加调休",
+            "选择代表周次和星期，系统会自动生成放假与周末补课映射。"))
+        form = QFormLayout()
         form.setSpacing(10)
+        layout.addLayout(form, stretch=1)
 
         week_spin = QSpinBox()
         week_spin.setRange(1, 25)
@@ -1397,10 +1557,8 @@ class MainWindow(QMainWindow):
         weekday_combo.currentIndexChanged.connect(sync_off_date)
         sync_off_date()
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("添加")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        form.addRow(buttons)
+        buttons = dialog_buttons("添加")
+        layout.addWidget(buttons)
 
         def confirm() -> None:
             week = week_spin.value()
@@ -1434,13 +1592,11 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle("导入国家调休日历")
         dlg.resize(960, 620)
         layout = QVBoxLayout(dlg)
-
-        tip = QLabel(
-            "选择年份后加载国家法定节假日和调休上班日。补课日对应的逻辑周/星期"
-            "为自动推断结果，请逐行确认后再导入。")
-        tip.setObjectName("secondary")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "导入国家调休日历",
+            "加载法定节假日和调休上班日；补课日代表的逻辑周和星期会自动推断，请逐行确认。"))
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("数据年份"))
@@ -1478,9 +1634,7 @@ class MainWindow(QMainWindow):
         warning_label.setWordWrap(True)
         layout.addWidget(warning_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("导入到日历")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons = dialog_buttons("导入到日历")
         layout.addWidget(buttons)
 
         def populate(data) -> None:
@@ -1568,6 +1722,11 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle("学期日历覆盖")
         dlg.resize(900, 520)
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "学期日历覆盖",
+            "统一维护法定假日与周末补课映射，保存前会自动检查成对关系。"))
         tip = QLabel(
             "「放假 off」表示逻辑教学日放假；「补课 class」选择周末日期，"
             "并指定它代表的逻辑教学周与星期。")
@@ -1630,9 +1789,7 @@ class MainWindow(QMainWindow):
         options.addStretch(1)
         options.addWidget(allow_unpaired)
         layout.addLayout(options)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons = dialog_buttons("保存")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
@@ -1722,6 +1879,10 @@ class MainWindow(QMainWindow):
         self.btn_export_csv.setEnabled(has_data)
         self.btn_export_png.setEnabled(has_data)
         self.btn_clear_schedule.setEnabled(has_data)
+        self.action_export_excel.setEnabled(has_data)
+        self.action_export_csv.setEnabled(has_data)
+        self.action_export_png.setEnabled(has_data)
+        self.action_clear_schedule.setEnabled(has_data)
 
     def _refresh_pivot_section(self) -> None:
         if self.result is None:
@@ -1777,14 +1938,17 @@ class MainWindow(QMainWindow):
             for table in (self.pivot_table, self.detail_table,
                           self.stats_table, self.gap_table):
                 fill_table(table, pd.DataFrame())
-            self.summary_label.setText("尚未生成排班表。设置左侧参数后点击「生成排班表」。")
-            self.pivot_stack.setCurrentIndex(1)
-            self._reset_metric_cards()
+            self._update_empty_state()
             self.gap_title.setText("无人可值时段")
             self.btn_export_xlsx.setEnabled(False)
             self.btn_export_csv.setEnabled(False)
             self.btn_export_png.setEnabled(False)
-            self.btn_clear_schedule.setEnabled(bool(self.db.load_assignments()))
+            has_stored = bool(self.db.load_assignments())
+            self.btn_clear_schedule.setEnabled(has_stored)
+            self.action_export_excel.setEnabled(False)
+            self.action_export_csv.setEnabled(False)
+            self.action_export_png.setEnabled(False)
+            self.action_clear_schedule.setEnabled(has_stored)
             self.refresh_charts()
             self._dirty_schedule_sections.clear()
             return
@@ -2190,8 +2354,15 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("修改特殊安排" if arrangement else "添加特殊安排")
         dlg.setMinimumWidth(500)
-        form = QFormLayout(dlg)
-        form.setContentsMargins(16, 16, 16, 12)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "修改特殊安排" if arrangement else "添加特殊安排",
+            "补充连续多周的课表外占用，排班和空闲总览会统一避让。"))
+        form = QFormLayout()
+        form.setSpacing(10)
+        layout.addLayout(form, stretch=1)
 
         tips = QLabel(
             f"成员：{member.name}\n"
@@ -2234,12 +2405,10 @@ class MainWindow(QMainWindow):
         reason.setPlaceholderText("如：固定实习、球队训练、长期治疗（可空）")
         form.addRow("原因", reason)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons = dialog_buttons("保存")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
 
         if dlg.exec() != QDialog.Accepted:
             return
@@ -2316,8 +2485,15 @@ class MainWindow(QMainWindow):
             return
         dlg = QDialog(self)
         dlg.setWindowTitle("添加请假")
-        form = QFormLayout(dlg)
-        form.setContentsMargins(16, 16, 16, 12)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "添加请假",
+            "登记后该成员当天不再参与排班，空闲时段总览会将整行标红。"))
+        form = QFormLayout()
+        form.setSpacing(10)
+        layout.addLayout(form, stretch=1)
         week = QSpinBox()
         week.setRange(1, 25)
         week.setValue(self.gantt_week.value())
@@ -2329,12 +2505,10 @@ class MainWindow(QMainWindow):
         form.addRow("周次", week)
         form.addRow("星期", wd)
         form.addRow("原因", reason)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("添加")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons = dialog_buttons("添加")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
         if dlg.exec() != QDialog.Accepted:
             return
         m = self.db.get_member(member_id)
@@ -2414,14 +2588,16 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("手动微调")
         dlg.setMinimumWidth(440)
-        form = QFormLayout(dlg)
-        form.setContentsMargins(16, 16, 16, 12)
-        info = QLabel(
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "手动微调",
             f"第{week}周 {WEEKDAY_LABELS[weekday]} · {BLOCK_LABELS[block]}　"
-            f"当前值班：{'、'.join(a.member_name for a in slot_assignments) or '（空缺）'}")
-        info.setObjectName("secondary")
-        info.setWordWrap(True)
-        form.addRow(info)
+            f"当前值班：{'、'.join(a.member_name for a in slot_assignments) or '（空缺）'}"))
+        form = QFormLayout()
+        form.setSpacing(10)
+        layout.addLayout(form, stretch=1)
 
         target = QComboBox()
         for a in slot_assignments:
@@ -2440,12 +2616,10 @@ class MainWindow(QMainWindow):
             lambda _: self._fill_tweak_candidates(cand_list, cands, target.currentData()))
         form.addRow("新值班人", cand_list)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("应用")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons = dialog_buttons("应用")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
         if dlg.exec() != QDialog.Accepted:
             return
         sel = cand_list.currentItem()

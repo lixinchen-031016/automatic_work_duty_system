@@ -375,6 +375,7 @@ def test_async_generate_updates_ui_and_db(window, qt_app) -> None:
     assert window.btn_export_xlsx.isEnabled() and window.btn_export_png.isEnabled()
     assert window.metric_duties.text().endswith("人次")
     assert window.metric_members.text().endswith("人")
+    assert window.action_export_excel.isEnabled()
     assert window.pivot_stack.currentIndex() == 0
     assert "已重新排班" in window.statusBar().currentMessage()
 
@@ -629,10 +630,21 @@ def test_weekend_makeup_day_is_scheduled_without_weekend_checkbox(
         "同周正常工作日仍应正常显示"
 
 
+def test_keyboard_shortcuts_and_accessible_names(window) -> None:
+    """常用动作应有快捷键，关键控件应有可访问名称。"""
+    assert window.action_upload.shortcut().toString()
+    assert window.action_generate.shortcut().toString() == "Ctrl+G"
+    assert window.action_focus_search.shortcut().toString() == "Ctrl+F"
+    assert window.member_search.accessibleName() == "搜索成员"
+    assert window.btn_generate.accessibleName() == "生成排班表"
+    assert window.brand_logo.accessibleName() == "成都工业学院校徽"
+
+
 def test_stale_marking_and_empty_state(window) -> None:
     """参数变化标记结果过期；无结果时给出引导文案"""
     window.refresh_members()
     assert "请上传" in window.summary_label.text() or "开始使用" in window.summary_label.text()
+    assert window.empty_action.text() == "上传成员课表"
 
     seed_members(window, 3)
     window.refresh_members()
@@ -644,6 +656,9 @@ def test_stale_marking_and_empty_state(window) -> None:
     assert not window.brand_logo.pixmap().isNull()
     assert window.app_status_label.text() == "等待生成排班"
     assert window.pivot_stack.currentIndex() == 1
+    assert window.empty_action.text() == "生成排班表"
+    assert window.empty_step_cards[0].property("state") == "done"
+    assert window.empty_step_cards[1].property("state") == "active"
 
     # 有结果后改参数 -> 提示过期
     window.result = appmod.ScheduleResult()

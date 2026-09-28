@@ -5,7 +5,10 @@ from __future__ import annotations
 import pandas as pd
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QDialogButtonBox,
+    QFrame,
     QHeaderView,
+    QLabel,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -83,3 +86,37 @@ def special_weeks_label(week_start: int, week_end: int) -> str:
     if week_start == week_end:
         return f"第{week_start}周"
     return f"第{week_start}–{week_end}周"
+
+
+def dialog_header(title: str, subtitle: str = "") -> QFrame:
+    """创建统一弹窗标题区。"""
+    header = QFrame()
+    header.setObjectName("dialogHeader")
+    layout = QVBoxLayout(header)
+    layout.setContentsMargins(0, 0, 0, 10)
+    layout.setSpacing(4)
+    title_label = QLabel(title)
+    title_label.setObjectName("dialogTitle")
+    layout.addWidget(title_label)
+    if subtitle:
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("secondary")
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(subtitle_label)
+    return header
+
+
+def dialog_buttons(
+    accept_text: str = "确定",
+    cancel_text: str = "取消",
+) -> QDialogButtonBox:
+    """创建支持 Enter 确认、Esc 取消的标准弹窗按钮区。"""
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    accept = buttons.button(QDialogButtonBox.Ok)
+    cancel = buttons.button(QDialogButtonBox.Cancel)
+    accept.setText(accept_text)
+    cancel.setText(cancel_text)
+    accept.setDefault(True)
+    accept.setAutoDefault(True)
+    cancel.setAutoDefault(True)
+    return buttons

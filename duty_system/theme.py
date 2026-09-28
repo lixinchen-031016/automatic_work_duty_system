@@ -47,7 +47,7 @@ QLabel#brandMark {
 }
 QLabel#appTitle { font-size: 19px; font-weight: 600; }
 QLabel#appSubtitle { font-size: 11px; color: #66758a; }
-QLabel#pageTitle { font-size: 18px; font-weight: 600; color: #132238; }
+QLabel#pageTitle, QLabel#dialogTitle { font-size: 18px; font-weight: 600; color: #132238; }
 QLabel#legendText { color: #66758a; font-size: 11px; }
 QLabel#summary { color: #526177; font-size: 12px; }
 QLabel#secondary { color: #66758a; font-size: 12px; }
@@ -154,6 +154,30 @@ QComboBox QAbstractItemView {
 }
 
 QDialog { background: #f3f6fb; }
+QFrame#guideStep {
+    background: #f8fafc;
+    border: 1px solid #dde5f0;
+    border-radius: 13px;
+}
+QFrame#guideStep[state="active"] {
+    background: #eff6ff;
+    border-color: #93c5fd;
+}
+QFrame#guideStep[state="done"] {
+    background: #f0fdf4;
+    border-color: #86efac;
+}
+QLabel#guideNumber {
+    color: #1d4ed8;
+    background: #dbeafe;
+    border-radius: 8px;
+    font-weight: 600;
+}
+QLabel#guideTitle { font-size: 13px; font-weight: 600; color: #132238; }
+QFrame#dialogHeader {
+    background: transparent;
+    border-bottom: 1px solid #dde5f0;
+}
 QCheckBox { color: #132238; background: transparent; spacing: 7px; }
 QCheckBox::indicator {
     width: 16px;
