@@ -11,7 +11,7 @@
 #              + tag 正式发布），避免每次代码更新都膨胀版本号
 #
 # 触发条件 : 推送 main 分支 / 推送 v* 标签 / 向 main 发起 PR / 手动触发
-# 作业结构 : test →(门禁)→ build-macos / build-windows 并行构建 →(汇合)→ deploy
+# 作业结构 : test →(门禁)→ build-windows(x64/arm64 矩阵) / build-macos 并行构建 →(汇合)→ deploy
 # 条件部署 : 仅「推送（main 或 tag）」时执行 deploy，PR 与手动触发不发布
 #
 # 版本策略（避免代码更新后的版本号问题）：
@@ -88,32 +88,67 @@ jobs:
         run: pytest -q
 
   # ---------------------------------------------------------------------------
-  # 1) 构建 Windows x86_64 单文件 exe
+  # 1) 构建 Windows 单文件 exe（x86_64 / ARM64 原生矩阵）
+  #    - x86_64: windows-latest + x64 CPython
+  #    - ARM64 : windows-11-arm + ARM64 CPython，生成 Windows on ARM 原生程序
+  #    - fail-fast: false 保证一个架构失败时另一架构仍能完成并上传诊断产物
   # ---------------------------------------------------------------------------
   build-windows:
-    name: 构建 Windows x86_64 (.exe)
+    name: 构建 Windows ${{ matrix.arch }} (.exe)
     needs: test
-    runs-on: windows-latest # GitHub Windows 运行器均为 x86_64（Intel/AMD 64 位）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            python_arch: x64
+            expected_machine: AMD64
+            artifact_name: windows-x64
+            asset_name: DutyScheduler.exe
+          - arch: arm64
+            runner: windows-11-arm
+            python_arch: arm64
+            expected_machine: ARM64
+            artifact_name: windows-arm64
+            asset_name: DutyScheduler-windows-arm64.exe
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 配置 Python
+      - name: 配置 Python（${{ matrix.arch }}）
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.python_arch }}
           cache: pip
           cache-dependency-path: requirements.txt
 
       - name: 安装依赖
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: 校验 x86_64 架构
-        run: python -c "import platform, sys; print(sys.version); assert platform.machine() in ('AMD64', 'x86_64'), platform.machine()"
+      - name: 校验 Python 与 ${{ matrix.arch }} 架构
+        shell: pwsh
+        run: |
+          $details = python -c "import platform, struct; print(platform.machine(), struct.calcsize('P') * 8, sep='|')"
+          $parts = $details -split '\|'
+          $machine = $parts[0]
+          $bits = [int]$parts[1]
+          python --version
+          Write-Host "platform.machine=$machine, pointer-bits=$bits"
+          if ($machine -ne "${{ matrix.expected_machine }}") {
+            throw "期望架构 ${{ matrix.expected_machine }}，实际为 $machine"
+          }
+          if ($bits -ne 64) {
+            throw "期望 64 位 Python，实际指针宽度为 $bits 位"
+          }
 
       - name: 打包单文件 exe（无控制台窗口）
+        shell: pwsh
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name ${{ env.APP_NAME }}
@@ -121,22 +156,34 @@ jobs:
           --add-data "assets;assets"
           app.py
 
-      - name: 冒烟启动 Windows 应用
+      - name: 生成架构标识产物名
         shell: pwsh
         run: |
-          # onefile 首次启动需解压运行时（PySide6+pandas 约 100MB），预留 25 秒
-          $process = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" -PassThru
-          Start-Sleep -Seconds 25
+          $source = "dist/${{ env.APP_NAME }}.exe"
+          $target = "dist/${{ matrix.asset_name }}"
+          if ($source -ne $target) {
+            Move-Item -Force -Path $source -Destination $target
+          }
+
+      - name: 冒烟启动 Windows 应用
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          # onefile 首次启动需解压运行时（PySide6+pandas 约 100MB），ARM64 预留更久
+          $exe = "dist/${{ matrix.asset_name }}"
+          $process = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 30
           if ($process.HasExited) {
-            throw "${{ env.APP_NAME }}.exe 在启动后提前退出，退出码: $($process.ExitCode)"
+            throw "${{ matrix.asset_name }} 在启动后提前退出，退出码: $($process.ExitCode)"
           }
           Stop-Process -Id $process.Id -Force
 
-      - name: 上传 Windows 构建产物
+      - name: 上传 Windows ${{ matrix.arch }} 构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: dist/${{ env.APP_NAME }}.exe
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.asset_name }}
           if-no-files-found: error # .exe 是核心产物，缺失即视为失败
           retention-days: 30
 
@@ -221,11 +268,17 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载 Windows 产物
+      - name: 下载 Windows x64 产物
         uses: actions/download-artifact@v4
         with:
-          name: windows-exe
-          path: artifacts/windows
+          name: windows-x64
+          path: artifacts/windows-x64
+
+      - name: 下载 Windows ARM64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64
+          path: artifacts/windows-arm64
 
       - name: 下载 macOS 产物
         uses: actions/download-artifact@v4
@@ -262,5 +315,6 @@ jobs:
             --title "${{ steps.meta.outputs.title }}" \
             --generate-notes \
             $([ "${{ steps.meta.outputs.prerelease }}" = "true" ] && echo "--prerelease") \
-            "artifacts/windows/${{ env.APP_NAME }}.exe" \
+            "artifacts/windows-x64/${{ env.APP_NAME }}.exe" \
+            "artifacts/windows-arm64/${{ env.APP_NAME }}-windows-arm64.exe" \
             "artifacts/macos/${{ env.APP_NAME }}-macOS-arm64.dmg"

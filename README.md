@@ -294,7 +294,7 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py   # 只看端到
 | --- | --- |
 | `test_parser_robustness.py` | 课表解析：九份样例（37/57/57/49/39/45/40/30/36 门）元信息与课程数基线 + 备注行反查、整周集中安排、跨节次去重、无地点课程、同课换教室、多人授课、职称括号换行、学号文件名后缀、单双周/表头写法/全角字符/空行异常/无空行多课程/合并单元格、格式嗅探与损坏文件报错 |
 | `test_sample_privacy.py` | 样例隐私门禁：脱敏样例已随仓库提交、manifest 与样例一致、学号为 9999 段虚构号、课程数据保真（地点/跨节次课程仍在）、原始课表被 `.gitignore` 忽略 |
-| `test_workflow_config.py` | CI 工作流静态校验：YAML 可解析、每个 bash 步骤过 `bash -n`、引号成对、Qt 安装失败可容忍、测试步骤用 offscreen |
+| `test_workflow_config.py` | CI 工作流静态校验：YAML 可解析、Windows x64/ARM64 构建矩阵、ARM64 发布产物、每个 bash 步骤过 `bash -n`、引号成对、Qt 安装失败可容忍、测试步骤用 offscreen |
 | `test_system.py` | 13 组端到端场景：解析器（37 门课程格式）、数据库幂等、排班硬约束与均衡、导出（xlsx/csv/日期列）、空闲时段总览一致性、请假避让、手动微调候选、周次换算（跨月/跨年）、按周增量、结果恢复、按周导出、空闲时段总览值班标记 |
 | `test_scheduler_optimized.py` | 约束判定单一入口一致性、长期特殊安排跨周避让、缺口修复效果与硬约束、稀缺度排序收益、同种子可复现、`assign/unassign` 对称性 |
 | `test_database_layer.py` | 幂等写入不膨胀 id、按周增量同步保持未变化行、特殊安排 CRUD/规范化、索引/WAL/迁移、老库兼容、级联删除 |
@@ -312,12 +312,15 @@ CI 中 **测试是打包的前置门禁**：`test` 作业不通过则不会构�
 
 ## 打包发布（GitHub Actions）
 
-仓库内置工作流 [`.github/workflows/build.yml`](.github/workflows/build.yml)：**构建 Windows / macOS（并行）→ 发布**，任一构建失败即中止发布。
+仓库内置工作流 [`.github/workflows/build.yml`](.github/workflows/build.yml)：**构建 Windows（x64 / ARM64 并行矩阵）/ macOS → 发布**，任一构建失败即中止发布。
 
 | 产物 | 运行器 | 架构 | 说明 |
 | --- | --- | --- | --- |
 | `DutyScheduler.exe` | `windows-latest` | x86_64（Intel/AMD 64 位） | 单文件、无控制台窗口，双击运行 |
+| `DutyScheduler-windows-arm64.exe` | `windows-11-arm` | arm64（Windows on ARM 原生） | 适用于骁龙 X、ARM64 Surface 等设备；单文件、无控制台窗口 |
 | `DutyScheduler-macOS-arm64.dmg` | `macos-latest` | arm64（Apple Silicon 原生） | 含 Applications 拖拽安装 |
+
+> Windows 用户请按系统类型选择：Intel/AMD 电脑下载 `DutyScheduler.exe`；Windows on ARM 电脑下载 `DutyScheduler-windows-arm64.exe`（ARM64 版本不会依赖 x64 仿真运行）。
 
 **双轨发布（避免代码更新后的版本号问题）**：
 
@@ -342,11 +345,15 @@ CI 中 **测试是打包的前置门禁**：`test` 作业不通过则不会构�
 ```bash
 pip install -r requirements.txt pyinstaller
 
-# Windows（PowerShell）
-pyinstaller --noconfirm --clean --onefile --windowed --name DutyScheduler --hidden-import xlrd app.py
+# Windows x64（PowerShell，x64 Python 环境）
+pyinstaller --noconfirm --clean --onefile --windowed --name DutyScheduler --hidden-import xlrd --add-data "assets;assets" app.py
+
+# Windows on ARM（PowerShell，ARM64 Python 环境；产物需要带架构标识以免与 x64 混淆）
+pyinstaller --noconfirm --clean --onefile --windowed --name DutyScheduler --hidden-import xlrd --add-data "assets;assets" app.py
+Move-Item -Force dist\DutyScheduler.exe dist\DutyScheduler-windows-arm64.exe
 
 # macOS（Apple Silicon 原生）
-pyinstaller --noconfirm --clean --windowed --name DutyScheduler --hidden-import xlrd app.py
+pyinstaller --noconfirm --clean --windowed --name DutyScheduler --hidden-import xlrd --add-data "assets:assets" app.py
 rm -rf dmg && mkdir dmg
 cp -R "dist/DutyScheduler.app" dmg/ && ln -s /Applications dmg/Applications
 hdiutil create -volname "DutyScheduler" -srcfolder dmg -ov -format UDZO "DutyScheduler-macOS-arm64.dmg"

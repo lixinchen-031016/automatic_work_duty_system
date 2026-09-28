@@ -34,6 +34,14 @@ def _workflow() -> dict:
     return data
 
 
+def _windows_matrix_entries() -> list[dict]:
+    """返回 Windows 构建矩阵项，并约束其结构可被测试继续校验。"""
+    matrix = _workflow()["jobs"]["build-windows"]["strategy"]["matrix"]["include"]
+    assert isinstance(matrix, list) and matrix, "Windows 构建矩阵不能为空"
+    assert all(isinstance(entry, dict) for entry in matrix), "Windows 构建矩阵项应是映射"
+    return matrix
+
+
 def _bash_steps() -> list[tuple[str, str, str]]:
     """收集所有 bash 步骤，返回 (job, step 名, 脚本) 列表"""
     steps: list[tuple[str, str, str]] = []
@@ -55,6 +63,51 @@ def test_workflow_yaml_is_parseable() -> None:
     jobs = _workflow()["jobs"]
     assert {"test", "build-windows", "build-macos"} <= set(jobs), f"作业缺失：{list(jobs)}"
     assert "needs" in jobs["build-windows"], "构建作业应依赖测试门禁"
+
+
+def test_windows_build_matrix_covers_x64_and_arm64() -> None:
+    """Windows 必须同时构建 x64 与 ARM64 原生产物。"""
+    entries = _windows_matrix_entries()
+    by_arch = {entry["arch"]: entry for entry in entries}
+
+    assert set(by_arch) == {"x86_64", "arm64"}, f"Windows 架构不完整：{set(by_arch)}"
+    assert by_arch["x86_64"]["runner"] == "windows-latest"
+    assert by_arch["x86_64"]["python_arch"] == "x64"
+    assert by_arch["x86_64"]["expected_machine"] == "AMD64"
+    assert by_arch["arm64"]["runner"] == "windows-11-arm"
+    assert by_arch["arm64"]["python_arch"] == "arm64"
+    assert by_arch["arm64"]["expected_machine"] == "ARM64"
+
+    artifact_names = {entry["artifact_name"] for entry in entries}
+    asset_names = {entry["asset_name"] for entry in entries}
+    assert len(artifact_names) == len(entries), "Windows Artifact 名称必须按架构唯一"
+    assert len(asset_names) == len(entries), "Windows 发布文件名必须按架构唯一"
+
+    setup = next(
+        step for step in _workflow()["jobs"]["build-windows"]["steps"]
+        if step.get("uses", "").startswith("actions/setup-python@")
+    )
+    assert setup["with"]["architecture"] == "${{ matrix.python_arch }}", \
+        "setup-python 必须显式使用矩阵架构，避免在 ARM runner 上误装 x64 Python"
+
+
+def test_release_contains_windows_arm64_artifact() -> None:
+    """ARM64 构建产物必须进入 GitHub Release，而不是只留在 Actions Artifacts。"""
+    deploy_steps = _workflow()["jobs"]["deploy"]["steps"]
+    download_names = {
+        step["with"]["name"]
+        for step in deploy_steps
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    }
+    assert "windows-arm64" in download_names, "发布作业未下载 Windows ARM64 产物"
+
+    release_script = next(
+        step["run"] for step in deploy_steps
+        if step.get("run", "").startswith("gh release create")
+    )
+    assert "artifacts/windows-arm64/" in release_script, "Release 未附带 Windows ARM64 产物"
+    assert "${{ env.APP_NAME }}-windows-arm64.exe" in release_script, \
+        "Release 中的 Windows ARM64 文件缺少清晰架构标识"
 
 
 @pytest.mark.parametrize("job,name,script", _bash_steps(),
