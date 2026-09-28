@@ -48,6 +48,23 @@ def make_courses(members: list[Member], per_member: int = 30, weeks: int = 18,
     return courses
 
 
+def test_member_can_be_excluded_from_scheduling() -> None:
+    """成员设为不参与后，自动排班、统计和手动微调候选均不再使用该成员。"""
+    members = make_members(3)
+    members[0].participates_in_scheduling = False
+    config = ScheduleConfig(weeks=range(1, 3), weekdays=[1, 2], blocks=[1],
+                            per_slot=1, max_per_week=3, max_per_day=1, seed=7)
+
+    result = generate_schedule(members, [], config)
+    assert result.assignments
+    assert all(a.member_id != members[0].id for a in result.assignments)
+    assert members[0].id not in result.member_stats
+
+    candidates = replacement_candidates(
+        members, {}, set(), result.assignments, 1, 1, 2, 3, 1)
+    assert members[0].id not in {member.id for member, _reason in candidates}
+
+
 def test_reason_single_source_of_truth() -> None:
     """自动排班与手动微调必须给出完全一致的约束结论"""
     members = make_members(12)

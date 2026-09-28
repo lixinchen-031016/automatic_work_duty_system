@@ -130,6 +130,50 @@ def test_indexes_wal_and_migration(tmp_path: Path) -> None:
     assert calendar_table is not None, "老库迁移后应创建学期日历表"
 
 
+def test_member_participation_persists_and_survives_reupload(tmp_path: Path) -> None:
+    """“不参与排班”是成员级设置，重传课表时不能被重置。"""
+    db = new_db(tmp_path)
+    schedule = ParsedSchedule(name="甲", student_id="1", file_name="a.xls")
+    member_id = db.upsert_member(schedule)
+    assert db.get_member(member_id).participates_in_scheduling is True
+
+    db.set_member_participation(member_id, False)
+    assert db.list_members()[0].participates_in_scheduling is False
+
+    db.upsert_member(ParsedSchedule(
+        name="甲", student_id="1", file_name="updated.xls"))
+    member = db.get_member(member_id)
+    assert member is not None and member.participates_in_scheduling is False
+    assert member.file_name == "updated.xls"
+
+
+def test_participation_column_migrates_legacy_database(tmp_path: Path) -> None:
+    """旧库没有参与排班字段时，打开数据库应自动补列且默认参与。"""
+    legacy = tmp_path / "legacy_participation.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            term TEXT NOT NULL DEFAULT '',
+            class_name TEXT NOT NULL DEFAULT '',
+            major TEXT NOT NULL DEFAULT '',
+            department TEXT NOT NULL DEFAULT '',
+            file_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            UNIQUE(student_id, name)
+        );
+        INSERT INTO members (student_id, name) VALUES ('1', '甲');
+        PRAGMA user_version = 3;
+    """)
+    conn.close()
+
+    db = Database(legacy)
+    member = db.list_members()[0]
+    assert member.participates_in_scheduling is True
+
+
 def test_term_calendar_crud_and_validation(tmp_path: Path) -> None:
     """日历覆盖可增改查删，严格校验缺对/错对，纯假日可显式放行。"""
     db = new_db(tmp_path)

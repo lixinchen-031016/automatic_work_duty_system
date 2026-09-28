@@ -1,6 +1,7 @@
 """值班排班算法
 
 硬约束：
+  - 只安排设置为“参与排班”的成员；
   - 值班时刻内（时段块的每一节）不能有任何课程；
   - 每人每天最多值一次（max_per_day，默认 1）；
   - 每人每周值班不超过 max_per_week 次；
@@ -195,6 +196,11 @@ def build_special_busy_map(
     return busy
 
 
+def _participating_members(members: list[Member]) -> list[Member]:
+    """仅保留设置为参与排班的成员；课表等其他数据不受影响。"""
+    return [m for m in members if m.participates_in_scheduling]
+
+
 def compute_gaps(
     assignments: list[Assignment],
     config: ScheduleConfig,
@@ -380,6 +386,7 @@ def diagnose_gaps(
     与排班共用 ScheduleContext.reason()，因此「诊断说可排」与「算法认为可排」
     永远一致，不会出现界面解释与算法行为不符。
     """
+    members = _participating_members(members)
     leave_set = {(l.member_id, l.week, l.weekday) for l in (leaves or [])}
     if is_off is not None:
         assignments = [
@@ -523,6 +530,8 @@ def generate_schedule(
     is_off：逻辑日放假谓词，命中的日期不进入任务网格或均衡基数。
     is_class：周末补课日谓词，命中的逻辑日即使未勾选也会自动加入任务网格。
     repair=False 可关闭缺口修复（用于对比/测试）。"""
+    all_names = {m.id: m.name for m in members}
+    members = _participating_members(members)
     busy = build_busy_map(members, courses)
     special_busy = build_special_busy_map(members, special_arrangements)
     special_set = {
@@ -596,7 +605,7 @@ def generate_schedule(
     if repaired:
         # 输出统一按 (周, 星期, 时段, 成员) 排序，与数据库读取顺序一致，
         # 保证「生成 -> 落库 -> 恢复」三处明细顺序稳定可对比
-        names = {m.id: m.name for m in members}
+        names = all_names
         result.assignments = [
             Assignment(week=w, weekday=d, block=b, member_id=mid,
                        member_name=names.get(mid, ""))
@@ -614,6 +623,7 @@ def rebuild_member_stats(
 ) -> dict[int, dict]:
     """按 assignments 重算各成员统计（手动微调后复用）。
     一次遍历完成，复杂度 O(排班数) 而非 O(成员数 x 排班数)。"""
+    members = _participating_members(members)
     total = Counter(a.member_id for a in assignments)
     weeks: dict[int, set[int]] = defaultdict(set)
     for a in assignments:
@@ -638,6 +648,7 @@ def replacement_candidates(
 ) -> list[tuple[Member, str]]:
     """手动微调候选：返回 (成员, 不可用原因)，原因为空串表示可值班。
     排除该时段已在岗的成员；与自动排班共用 ScheduleContext.reason() 判定。"""
+    members = _participating_members(members)
     config = ScheduleConfig(
         weeks=range(week, week + 1), weekdays=[weekday], blocks=[block],
         max_per_week=max_per_week, max_per_day=max_per_day,

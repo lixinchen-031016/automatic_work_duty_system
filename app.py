@@ -270,6 +270,10 @@ class MainWindow(QMainWindow):
             self._members_cache = self.db.list_members()
         return self._members_cache
 
+    def scheduling_members(self) -> list:
+        """当前参与排班的成员；未勾选成员仍保留课表和历史数据。"""
+        return [m for m in self.members() if m.participates_in_scheduling]
+
     def courses(self) -> list:
         if self._courses_cache is None:
             self._courses_cache = self.db.get_courses()
@@ -418,6 +422,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action_quit)
 
         schedule_menu = self.menuBar().addMenu("排班")
+        self.action_participation = QAction("设置参与排班…", self)
+        self.action_participation.setToolTip("选择哪些成员参与自动排班和手动微调")
+        self.action_participation.triggered.connect(self.open_participation_dialog)
+        schedule_menu.addAction(self.action_participation)
+        schedule_menu.addSeparator()
         self.action_generate = QAction("生成排班表", self)
         self.action_generate.setShortcut(QKeySequence("Ctrl+G"))
         self.action_generate.triggered.connect(self.generate)
@@ -597,7 +606,9 @@ class MainWindow(QMainWindow):
         self.member_list = QListWidget()
         self.member_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.member_list.setMinimumHeight(120)
-        self.member_list.setToolTip("双击成员可在「成员课表」页查看其课表详情")
+        self.member_list.setToolTip(
+            "双击成员可在「成员课表」页查看其课表详情。\n"
+            "是否参与排班请在菜单栏「排班 → 设置参与排班…」中设置。")
         self.member_list.itemDoubleClicked.connect(self.open_member_courses)
         self.member_search.textChanged.connect(self._apply_member_filter)
         self.member_class_filter.currentIndexChanged.connect(self._apply_member_filter)
@@ -1079,6 +1090,8 @@ class MainWindow(QMainWindow):
 
     def refresh_members(self) -> None:
         members = self.members()
+        selected_item = self.member_list.currentItem()
+        selected_id = selected_item.data(Qt.UserRole) if selected_item else None
         selected_class = self.member_class_filter.currentData()
         self.member_list.clear()
         self.member_class_filter.blockSignals(True)
@@ -1093,13 +1106,28 @@ class MainWindow(QMainWindow):
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         for m in members:
-            self.member_list.addItem(f"{m.name}（{m.course_count} 门课）")
-            item = self.member_list.item(self.member_list.count() - 1)
+            suffix = "" if m.participates_in_scheduling else " · 不参与排班"
+            item = QListWidgetItem(f"{m.name}（{m.course_count} 门课）{suffix}")
             item.setData(Qt.UserRole, m.id)
             item.setData(Qt.UserRole + 1, (
                 m.name, m.student_id, m.class_name))
-            self.member_combo.addItem(f"{m.name}（{m.class_name or '未知班级'}）", m.id)
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+            if not m.participates_in_scheduling:
+                item.setForeground(QBrush(QColor("#8e8e93")))
+                item.setToolTip("不参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
+            else:
+                item.setToolTip("参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
+            self.member_list.addItem(item)
+            combo_status = "" if m.participates_in_scheduling else " · 不参与排班"
+            self.member_combo.addItem(
+                f"{m.name}（{m.class_name or '未知班级'}{combo_status}）", m.id)
         self.member_combo.blockSignals(False)
+        self.action_participation.setEnabled(bool(members))
+        if selected_id is not None:
+            for row in range(self.member_list.count()):
+                if self.member_list.item(row).data(Qt.UserRole) == selected_id:
+                    self.member_list.setCurrentRow(row)
+                    break
         self._apply_member_filter()
         self._clear_undo_redo()
         if self.member_combo.count():
@@ -1139,6 +1167,7 @@ class MainWindow(QMainWindow):
         if self.result is not None:
             return
         member_count = self.member_list.count()
+        scheduling_count = len(self.scheduling_members())
         if member_count == 0:
             self.empty_title.setText("三步完成第一次排班")
             self.empty_text.setText("先导入课表，再确认排班参数，最后生成结果。")
@@ -1149,13 +1178,32 @@ class MainWindow(QMainWindow):
             self.empty_step_cards[0].setProperty("state", "active")
             self.empty_step_cards[1].setProperty("state", "")
             self.empty_step_cards[2].setProperty("state", "")
+        elif scheduling_count == 0:
+            self.empty_title.setText("没有可参与排班的成员")
+            self.empty_text.setText(
+                f"已导入 {member_count} 名成员，但当前全部设为“不参与排班”。\n"
+                "请通过菜单「排班 → 设置参与排班…」重新勾选需要参与排班的成员。")
+            self.empty_action.setText("生成排班表")
+            self.summary_label.setText(
+                "当前没有参与排班的成员，请先通过菜单设置参与范围，再点击「生成排班表」。")
+            self.empty_step_cards[0].setProperty("state", "done")
+            self.empty_step_cards[1].setProperty("state", "active")
+            self.empty_step_cards[2].setProperty("state", "")
         else:
             self.empty_title.setText("已准备就绪，可以生成排班")
             self.empty_text.setText(
-                f"已导入 {member_count} 名成员。确认左侧规则后，点击下方按钮生成排班表。")
+                f"已导入 {member_count} 名成员，其中 {scheduling_count} 名参与排班。"
+                "确认左侧规则后，点击下方按钮生成排班表。")
             self.empty_action.setText("生成排班表")
-            self.summary_label.setText(
-                f"已就绪 {member_count} 名成员，点击「生成排班表」开始排班。")
+            if scheduling_count == member_count:
+                summary = (
+                    f"已就绪 {member_count} 名成员（均参与排班），"
+                    "点击「生成排班表」开始排班。")
+            else:
+                summary = (
+                    f"已就绪 {member_count} 名成员，其中 {scheduling_count} 名参与排班，"
+                    "点击「生成排班表」开始排班。")
+            self.summary_label.setText(summary)
             self.empty_step_cards[0].setProperty("state", "done")
             self.empty_step_cards[1].setProperty("state", "active")
             self.empty_step_cards[2].setProperty("state", "")
@@ -1177,7 +1225,7 @@ class MainWindow(QMainWindow):
     def _restore_result(self) -> None:
         """启动时从数据库恢复上次的排班结果（关闭程序不会丢失）"""
         assignments = self.db.load_assignments()
-        members = self.members()
+        members = self.scheduling_members()
         if not assignments or not members:
             return
         # 优先用「生成时保存的参数」判定缺口；没有记录（老版本数据）才退回当前界面参数
@@ -1992,7 +2040,7 @@ class MainWindow(QMainWindow):
             return cached[1]
         cfg = self._last_config or self._load_last_config() or self._current_config()
         diagnoses = diagnose_gaps(
-            self.members(), self.busy_map(), self.leaves(), result.assignments,
+            self.scheduling_members(), self.busy_map(), self.leaves(), result.assignments,
             cfg, special_arrangements=self.specials(), is_off=self.is_off_day,
             is_class=self.is_class_day)
         self._gap_cache = (result, diagnoses)
@@ -2032,9 +2080,10 @@ class MainWindow(QMainWindow):
         m = self.db.get_member(member_id)
         if m is None:
             return
+        participation = "参与排班" if m.participates_in_scheduling else "不参与排班"
         self.member_info.setText(
             f"学号 {m.student_id or '—'} | {m.term or '—'} | {m.major or '—'} | "
-            f"{m.department or '—'} | 来源：{m.file_name or '—'}")
+            f"{m.department or '—'} | {participation} | 来源：{m.file_name or '—'}")
         # 整周集中安排（军训/思政实践）没有星期与节次，排序键与展示都要单独处理
         courses = sorted(self.db.get_courses(member_id),
                          key=lambda c: (c.weekday or 99, min(c.session_list or [0]),
@@ -2083,7 +2132,8 @@ class MainWindow(QMainWindow):
         self.gantt_week.setValue(week)
 
     def refresh_gantt(self) -> None:
-        members = self.members()
+        members = self.scheduling_members()
+        all_member_count = len(self.members())
         checked_weekdays = [
             d for d, cb in self.weekday_checks.items() if cb.isChecked()]
         blocks = [b for b, cb in self.block_checks.items() if cb.isChecked()]
@@ -2094,7 +2144,14 @@ class MainWindow(QMainWindow):
             self.gantt_table.clearContents()
             self.gantt_table.setRowCount(0)
             self.gantt_table.setColumnCount(0)
-            self.gantt_hint.setText("请先上传成员课表，并至少勾选一个值班星期和值班时段（空闲时段总览跟随左侧筛选）。")
+            if all_member_count and not members:
+                self.gantt_hint.setText(
+                    "当前没有参与排班的成员；请通过菜单「排班 → 设置参与排班…」"
+                    "选择成员后查看空闲时段总览。")
+            else:
+                self.gantt_hint.setText(
+                    "请先上传成员课表，并至少勾选一个值班星期和值班时段"
+                    "（空闲时段总览跟随左侧筛选）。")
             self.btn_export_gantt.setEnabled(False)
             return
 
@@ -2275,18 +2332,22 @@ class MainWindow(QMainWindow):
 
     def refresh_charts(self) -> None:
         """刷新三张统计图：成员值班次数 / 每周值班人次 / 成员请假天数"""
-        members = self.members()
+        members = self.scheduling_members()
+        member_ids = {m.id for m in members}
         if self.result is not None:
-            stats = rebuild_member_stats(members, self.result.assignments)
+            assignments = [
+                a for a in self.result.assignments if a.member_id in member_ids]
+            stats = rebuild_member_stats(members, assignments)
             self.chart_duty.set_data([(s["name"], s["total"]) for s in stats.values()])
-            week_cnt = Counter(a.week for a in self.result.assignments)
+            week_cnt = Counter(a.week for a in assignments)
             self.chart_weekly.set_data(
                 [(str(w), week_cnt[w])
-                 for w in sorted({a.week for a in self.result.assignments})])
+                 for w in sorted({a.week for a in assignments})])
         else:
             self.chart_duty.set_data([])
             self.chart_weekly.set_data([])
-        leave_cnt = Counter(l.member_id for l in self.leaves())
+        leave_cnt = Counter(
+            l.member_id for l in self.leaves() if l.member_id in member_ids)
         name_of = {m.id: m.name for m in members}
         self.chart_leave.set_data(sorted(
             ((name_of.get(mid, "已删除成员"), n) for mid, n in leave_cnt.items()),
@@ -2577,7 +2638,7 @@ class MainWindow(QMainWindow):
         slot_assignments = [a for a in self.result.assignments
                             if a.week == week and a.weekday == weekday and a.block == block]
         current = {a.member_id: a for a in slot_assignments}
-        members = self.members()
+        members = self.scheduling_members()
         busy = self.busy_map()
         leave_set = {(l.member_id, l.week, l.weekday) for l in self.leaves()}
         cands = replacement_candidates(
@@ -2751,14 +2812,15 @@ class MainWindow(QMainWindow):
         """执行微调：out_id 换出（None=纯新增），in_id 换入（None=纯移除）"""
         if self.result is None or self._last_config is None:
             return
-        members = {m.id: m for m in self.members()}
+        all_members = {m.id: m for m in self.members()}
+        members = self.scheduling_members()
         cfg = self._last_config
         if in_id is not None:
             busy = self.busy_map()
             leave_set = {(l.member_id, l.week, l.weekday) for l in self.leaves()}
             # 硬约束（课程/特殊安排/请假/每天一次）必须满足；周上限允许手动越限
             eligible = {m.id for m, reason in replacement_candidates(
-                list(members.values()), busy, leave_set, self.result.assignments,
+                members, busy, leave_set, self.result.assignments,
                 week, weekday, block, cfg.max_per_week, cfg.max_per_day,
                 special_set=self.special_set())
                 if reason in ("", "本周已达上限")}
@@ -2775,7 +2837,7 @@ class MainWindow(QMainWindow):
         if in_id is not None:
             kept.append(Assignment(
                 week=week, weekday=weekday, block=block,
-                member_id=in_id, member_name=members[in_id].name))
+                member_id=in_id, member_name=all_members[in_id].name))
         new_ids = tuple(sorted(
             a.member_id for a in kept
             if a.week == week and a.weekday == weekday and a.block == block
@@ -2785,7 +2847,7 @@ class MainWindow(QMainWindow):
             self._redo_stack.clear()
             self._update_undo_redo_actions()
         self.result.assignments = kept
-        self.result.member_stats = rebuild_member_stats(list(members.values()), kept)
+        self.result.member_stats = rebuild_member_stats(members, kept)
         self.result.gaps = compute_gaps(
             kept, cfg, is_off=self.is_off_day, is_class=self.is_class_day)
         self._gap_cache = None
@@ -2795,8 +2857,8 @@ class MainWindow(QMainWindow):
                               if (a.week, a.weekday, a.block) == (week, weekday, block)])
         self._stale = False
         self._refresh_after_schedule_change()
-        out_name = members[out_id].name if out_id is not None else None
-        in_name = members[in_id].name if in_id is not None else None
+        out_name = all_members[out_id].name if out_id is not None else None
+        in_name = all_members[in_id].name if in_id is not None else None
         slot = f"第{week}周{WEEKDAY_LABELS[weekday]}{BLOCK_LABELS[block].split(' ')[0]}"
         if out_name and in_name:
             change = f"{out_name} → {in_name}"
@@ -2807,6 +2869,80 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已手动调整 {slot}：{change}。")
 
     # ---------- 动作 ----------
+
+    def open_participation_dialog(self) -> None:
+        """从菜单批量设置哪些课表成员参与排班。"""
+        if self.busy:
+            self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
+            return
+        members = self.members()
+        if not members:
+            QMessageBox.information(self, "提示", "请先上传成员课表。")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("设置参与排班")
+        dlg.setMinimumWidth(460)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "设置参与排班",
+            "勾选的成员会参与自动排班和手动微调；取消勾选只保留课表，不参与排班。"))
+
+        select_row = QHBoxLayout()
+        btn_select_all = QPushButton("全选")
+        btn_select_none = QPushButton("全不选")
+        select_row.addWidget(btn_select_all)
+        select_row.addWidget(btn_select_none)
+        select_row.addStretch(1)
+        layout.addLayout(select_row)
+
+        member_list = QListWidget()
+        member_list.setMinimumHeight(280)
+        for m in members:
+            item = QListWidgetItem(
+                f"{m.name}（学号 {m.student_id or '—'} · "
+                f"{m.class_name or '未知班级'}）")
+            item.setData(Qt.UserRole, m.id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if m.participates_in_scheduling else Qt.Unchecked)
+            member_list.addItem(item)
+        layout.addWidget(member_list, stretch=1)
+
+        def set_all(checked: bool) -> None:
+            state = Qt.Checked if checked else Qt.Unchecked
+            for row in range(member_list.count()):
+                member_list.item(row).setCheckState(state)
+
+        btn_select_all.clicked.connect(lambda: set_all(True))
+        btn_select_none.clicked.connect(lambda: set_all(False))
+        buttons = dialog_buttons("保存")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        old_state = {m.id: m.participates_in_scheduling for m in members}
+        updates: dict[int, bool] = {}
+        for row in range(member_list.count()):
+            item = member_list.item(row)
+            member_id = item.data(Qt.UserRole)
+            participates = item.checkState() == Qt.Checked
+            if old_state[member_id] != participates:
+                updates[member_id] = participates
+        if not updates:
+            self.statusBar().showMessage("参与排班设置未变化。")
+            return
+        self.db.set_members_participation(updates)
+        self.invalidate_cache()
+        self.refresh_members()
+        participating = len(self.scheduling_members())
+        self.statusBar().showMessage(
+            f"已更新参与排班设置（{len(updates)} 名成员变化）；"
+            f"当前 {participating} 名成员参与，重新生成排班后生效。")
 
     def upload_files(self) -> None:
         if self.busy:
@@ -2898,9 +3034,15 @@ class MainWindow(QMainWindow):
         )
 
     def generate(self) -> None:
-        members = self.members()
-        if not members:
+        all_members = self.members()
+        if not all_members:
             QMessageBox.information(self, "提示", "请先上传成员课表。")
+            return
+        members = self.scheduling_members()
+        if not members:
+            QMessageBox.information(
+                self, "提示",
+                "当前没有参与排班的成员，请先通过菜单「排班 → 设置参与排班…」设置。")
             return
         weekdays = [d for d, cb in self.weekday_checks.items() if cb.isChecked()]
         blocks = [b for b, cb in self.block_checks.items() if cb.isChecked()]

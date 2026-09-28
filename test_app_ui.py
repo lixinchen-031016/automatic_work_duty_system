@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QInputDialog,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QSpinBox,
     QTableWidget,
@@ -205,6 +206,51 @@ def test_member_search_filters_view_without_changing_data(window, qt_app) -> Non
         not window.member_list.item(i).isHidden()
         for i in range(window.member_list.count())
     )
+
+
+def test_member_participation_dialog_excludes_from_generation(
+    window, qt_app, monkeypatch,
+) -> None:
+    """菜单弹窗取消成员后，该成员不进入自动生成和统计结果。"""
+    for name, student_id in (("参与甲", "1001"), ("排除乙", "1002")):
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, courses=[]))
+    window.invalidate_cache()
+    window.refresh_members()
+
+    assert window.action_participation.text() == "设置参与排班…"
+    assert not (window.member_list.item(1).flags() & Qt.ItemIsUserCheckable)
+
+    target_state = {"value": Qt.Unchecked}
+    original_exec = QDialog.exec
+
+    def fake_exec(dialog) -> int:
+        if dialog.windowTitle() != "设置参与排班":
+            return original_exec(dialog)
+        lists = dialog.findChildren(QListWidget)
+        assert len(lists) == 1
+        lists[0].item(1).setCheckState(target_state["value"])
+        return QDialog.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    window.open_participation_dialog()
+    excluded_id = window.db.list_members()[1].id
+
+    member = window.db.get_member(excluded_id)
+    assert member is not None and member.participates_in_scheduling is False
+    assert "不参与排班" in window.member_list.item(1).text()
+    assert excluded_id not in {m.id for m in window.scheduling_members()}
+
+    run_generate(window, qt_app, week_from=1, week_to=1)
+    assert window.result is not None
+    assert window.result.assignments, "仍有一名参与成员，应能生成值班安排"
+    assert all(a.member_id != excluded_id for a in window.result.assignments)
+    assert excluded_id not in window.result.member_stats
+
+    target_state["value"] = Qt.Checked
+    window.open_participation_dialog()
+    member = window.db.get_member(excluded_id)
+    assert member is not None and member.participates_in_scheduling is True
 
 
 def test_national_holiday_import_dialog_previews_builtin_data(

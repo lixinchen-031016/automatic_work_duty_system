@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS members (
     major TEXT NOT NULL DEFAULT '',
     department TEXT NOT NULL DEFAULT '',
     file_name TEXT NOT NULL DEFAULT '',
+    participates_in_scheduling INTEGER NOT NULL DEFAULT 1
+        CHECK (participates_in_scheduling IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(student_id, name)
 );
@@ -137,6 +139,11 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )
         )""",
     ]),
+    (4, [
+        """ALTER TABLE members ADD COLUMN participates_in_scheduling
+           INTEGER NOT NULL DEFAULT 1
+           CHECK (participates_in_scheduling IN (0, 1))""",
+    ]),
 ]
 
 
@@ -151,6 +158,7 @@ class Member:
     department: str
     file_name: str
     course_count: int = 0
+    participates_in_scheduling: bool = True
 
 
 @dataclass
@@ -219,6 +227,14 @@ class Database:
             if version >= target:
                 continue
             for sql in statements:
+                # 新建数据库的 SCHEMA 已包含该列；老库才需要执行 ALTER TABLE。
+                if "ADD COLUMN participates_in_scheduling" in sql:
+                    columns = {
+                        row["name"]
+                        for row in conn.execute("PRAGMA table_info(members)")
+                    }
+                    if "participates_in_scheduling" in columns:
+                        continue
                 conn.execute(sql)
             conn.execute(f"PRAGMA user_version = {target}")
 
@@ -320,7 +336,23 @@ class Database:
                 term=r["term"], class_name=r["class_name"], major=r["major"],
                 department=r["department"], file_name=r["file_name"],
                 course_count=r["course_count"],
+                participates_in_scheduling=bool(r["participates_in_scheduling"]),
             ) for r in rows]
+
+    def set_members_participation(self, settings: dict[int, bool]) -> None:
+        """批量设置成员是否参与排班；课表和历史排班记录均保留。"""
+        if not settings:
+            return
+        with self._connection() as conn:
+            conn.executemany(
+                "UPDATE members SET participates_in_scheduling = ? WHERE id = ?",
+                [(1 if participates else 0, member_id)
+                 for member_id, participates in settings.items()],
+            )
+
+    def set_member_participation(self, member_id: int, participates: bool) -> None:
+        """设置单个成员是否参与排班，供单点调用复用批量接口。"""
+        self.set_members_participation({member_id: participates})
 
     def delete_member(self, member_id: int) -> None:
         with self._connection() as conn:
@@ -333,6 +365,7 @@ class Database:
                 id=r["id"], name=r["name"], student_id=r["student_id"], term=r["term"],
                 class_name=r["class_name"], major=r["major"], department=r["department"],
                 file_name=r["file_name"],
+                participates_in_scheduling=bool(r["participates_in_scheduling"]),
             ) if r else None
 
     # ---------- 课程 ----------
