@@ -32,6 +32,7 @@ import app as appmod
 from duty_system.calendar import CalendarEntry
 from duty_system.database import Member
 from duty_system.parser import BLOCK_SESSIONS, Course, ParsedSchedule
+from duty_system.roster import RosterEntry
 from duty_system.scheduler import (
     build_busy_map,
     compute_gaps,
@@ -1022,3 +1023,27 @@ def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
     item = window.gantt_table.item(col, row)
     assert item.text() == "特" and "其他安排" in item.toolTip()
     assert item.background().color().name() == "#e5d8ff"
+
+
+def test_gantt_filter_keeps_only_short_video_and_image_studios(window, qt_app) -> None:
+    """导入花名册后，空闲总览只显示短视频和图片工作室，排班名单不变。"""
+    for name, student_id, studio in (
+        ("短视频成员", "1001", "短视频工作室"),
+        ("图片成员", "1002", "图片工作室"),
+        ("运营成员", "1003", "运营工作室"),
+    ):
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, courses=[]))
+    window.db.replace_roster([
+        RosterEntry(studio="短视频工作室", name="短视频成员", student_id="1001"),
+        RosterEntry(studio="图片工作室", name="图片成员", student_id="1002"),
+        RosterEntry(studio="运营工作室", name="运营成员", student_id="1003"),
+    ])
+    window.invalidate_cache()
+    window.refresh_members()
+
+    assert {m.name for m in window.scheduling_members()} == {
+        "短视频成员", "图片成员", "运营成员"}
+    assert {m.name for m in window.gantt_members()} == {"短视频成员", "图片成员"}
+    assert window.gantt_matrix is not None
+    assert set(window.gantt_matrix.member_names) == {"短视频成员", "图片成员"}

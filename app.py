@@ -85,6 +85,7 @@ from duty_system.exporter import (
     export_csv,
     export_excel,
     export_leaves_excel,
+    export_roster_excel,
 )
 from duty_system.gantt import (
     CalendarAvailabilityMatrix,
@@ -104,6 +105,11 @@ from duty_system.parser import (
     parse_schedule_files,
 )
 from duty_system.rendering import BarChart, render_charts_png, render_table_png
+from duty_system.roster import (
+    TARGET_AVAILABILITY_STUDIOS,
+    UNKNOWN_STUDIO,
+    parse_roster_file,
+)
 from duty_system.scheduler import (
     ScheduleConfig,
     ScheduleResult,
@@ -220,6 +226,7 @@ class MainWindow(QMainWindow):
         self._courses_cache = None
         self._leaves_cache = None
         self._specials_cache = None
+        self._roster_cache = None
         self._calendar_cache = None
         self._term_calendar_cache: TermCalendar | None = None
         self._calendar_error: str | None = None
@@ -258,6 +265,7 @@ class MainWindow(QMainWindow):
         self._courses_cache = None
         self._leaves_cache = None
         self._specials_cache = None
+        self._roster_cache = None
         self._calendar_cache = None
         self._term_calendar_cache = None
         self._calendar_error = None
@@ -273,6 +281,20 @@ class MainWindow(QMainWindow):
     def scheduling_members(self) -> list:
         """当前参与排班的成员；未勾选成员仍保留课表和历史数据。"""
         return [m for m in self.members() if m.participates_in_scheduling]
+
+    def gantt_members(self) -> list:
+        """空闲总览目标成员；导入花名册后仅显示短视频和图片工作室。"""
+        members = self.scheduling_members()
+        if not self.roster_entries():
+            # 老数据未导入花名册时保持原有全量展示，避免升级后页面突然为空。
+            return members
+        targets = set(TARGET_AVAILABILITY_STUDIOS)
+        return [m for m in members if (m.studio or UNKNOWN_STUDIO) in targets]
+
+    def roster_entries(self) -> list:
+        if self._roster_cache is None:
+            self._roster_cache = self.db.list_roster_entries()
+        return self._roster_cache
 
     def courses(self) -> list:
         if self._courses_cache is None:
@@ -399,7 +421,21 @@ class MainWindow(QMainWindow):
         self.action_upload.triggered.connect(self.upload_files)
         file_menu.addAction(self.action_upload)
 
-        export_menu = file_menu.addMenu("导出当前结果")
+        self.action_import_roster = QAction("导入花名册…", self)
+        self.action_import_roster.setToolTip(
+            "导入全媒体中心花名册，自动补充上传课表成员的工作室归属")
+        self.action_import_roster.triggered.connect(self.import_roster)
+        file_menu.addAction(self.action_import_roster)
+
+        self.action_export_roster = QAction("导出完整花名册…", self)
+        self.action_export_roster.setToolTip(
+            "按花名册、已上传课表和工作室分配导出完整 Excel")
+        self.action_export_roster.triggered.connect(self.export_roster)
+        self.action_export_roster.setEnabled(False)
+        file_menu.addAction(self.action_export_roster)
+        file_menu.addSeparator()
+
+        export_menu = file_menu.addMenu("导出当前排班")
         self.action_export_excel = QAction("导出 Excel…", self)
         self.action_export_excel.setShortcut(QKeySequence("Ctrl+Shift+E"))
         self.action_export_excel.triggered.connect(self.export_xlsx)
@@ -533,10 +569,14 @@ class MainWindow(QMainWindow):
     def _configure_accessibility(self) -> None:
         """设置可访问名称、说明和明确的键盘 Tab 顺序。"""
         self.btn_upload.setAccessibleName("上传成员课表")
+        self.btn_import_roster.setAccessibleName("导入花名册")
         self.member_search.setAccessibleName("搜索成员")
-        self.member_search.setAccessibleDescription("按姓名、学号或班级筛选成员")
+        self.member_search.setAccessibleDescription(
+            "按姓名、学号、班级或工作室筛选成员")
         self.member_class_filter.setAccessibleName("班级筛选")
+        self.member_studio_filter.setAccessibleName("工作室筛选")
         self.member_list.setAccessibleName("成员列表")
+        self.btn_edit_studio.setAccessibleName("修改选中成员工作室")
         self.btn_remove.setAccessibleName("删除选中成员")
         self.week_from.setAccessibleName("起始周")
         self.week_to.setAccessibleName("结束周")
@@ -555,9 +595,12 @@ class MainWindow(QMainWindow):
 
         order = [
             self.btn_upload,
+            self.btn_import_roster,
             self.member_search,
             self.member_class_filter,
+            self.member_studio_filter,
             self.member_list,
+            self.btn_edit_studio,
             self.btn_remove,
             self.week_from,
             self.week_to,
@@ -592,17 +635,26 @@ class MainWindow(QMainWindow):
         self.btn_upload.clicked.connect(self.upload_files)
         layout.addWidget(self.btn_upload)
 
+        self.btn_import_roster = QPushButton("导入花名册")
+        self.btn_import_roster.setToolTip(
+            "支持 .xlsx/.xls；按学号优先、姓名兜底自动归类工作室")
+        self.btn_import_roster.clicked.connect(self.import_roster)
+        layout.addWidget(self.btn_import_roster)
+
         grp_members = QGroupBox("成员课表")
         members_layout = QVBoxLayout(grp_members)
         members_layout.setContentsMargins(8, 4, 8, 8)
         members_layout.setSpacing(8)
         self.member_search = QLineEdit()
-        self.member_search.setPlaceholderText("搜索姓名 / 学号 / 班级")
+        self.member_search.setPlaceholderText("搜索姓名 / 学号 / 班级 / 工作室")
         self.member_search.setClearButtonEnabled(True)
         members_layout.addWidget(self.member_search)
         self.member_class_filter = QComboBox()
         self.member_class_filter.setToolTip("按班级筛选成员")
         members_layout.addWidget(self.member_class_filter)
+        self.member_studio_filter = QComboBox()
+        self.member_studio_filter.setToolTip("按工作室筛选成员")
+        members_layout.addWidget(self.member_studio_filter)
         self.member_list = QListWidget()
         self.member_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.member_list.setMinimumHeight(120)
@@ -612,11 +664,19 @@ class MainWindow(QMainWindow):
         self.member_list.itemDoubleClicked.connect(self.open_member_courses)
         self.member_search.textChanged.connect(self._apply_member_filter)
         self.member_class_filter.currentIndexChanged.connect(self._apply_member_filter)
+        self.member_studio_filter.currentIndexChanged.connect(self._apply_member_filter)
         members_layout.addWidget(self.member_list)
+        member_actions = QHBoxLayout()
+        self.btn_edit_studio = QPushButton("修改工作室…")
+        self.btn_edit_studio.setToolTip(
+            "用于成员转工作室或纠正自动归类；手工修改后重导花名册不会覆盖")
+        self.btn_edit_studio.clicked.connect(self.edit_selected_member_studio)
+        member_actions.addWidget(self.btn_edit_studio)
         self.btn_remove = QPushButton("删除选中成员")
         self.btn_remove.setObjectName("danger")
         self.btn_remove.clicked.connect(self.remove_selected_member)
-        members_layout.addWidget(self.btn_remove)
+        member_actions.addWidget(self.btn_remove)
+        members_layout.addLayout(member_actions)
         layout.addWidget(grp_members, stretch=1)
 
         grp_cfg = QGroupBox("排班参数")
@@ -1093,6 +1153,7 @@ class MainWindow(QMainWindow):
         selected_item = self.member_list.currentItem()
         selected_id = selected_item.data(Qt.UserRole) if selected_item else None
         selected_class = self.member_class_filter.currentData()
+        selected_studio = self.member_studio_filter.currentData()
         self.member_list.clear()
         self.member_class_filter.blockSignals(True)
         self.member_class_filter.clear()
@@ -1103,26 +1164,43 @@ class MainWindow(QMainWindow):
         class_index = self.member_class_filter.findData(selected_class)
         self.member_class_filter.setCurrentIndex(max(class_index, 0))
         self.member_class_filter.blockSignals(False)
+        self.member_studio_filter.blockSignals(True)
+        self.member_studio_filter.clear()
+        self.member_studio_filter.addItem("全部", "")
+        for studio in sorted({
+                (m.studio or UNKNOWN_STUDIO).strip()
+                for m in members if (m.studio or UNKNOWN_STUDIO).strip()}):
+            self.member_studio_filter.addItem(studio, studio)
+        studio_index = self.member_studio_filter.findData(selected_studio)
+        self.member_studio_filter.setCurrentIndex(max(studio_index, 0))
+        self.member_studio_filter.blockSignals(False)
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         for m in members:
             suffix = "" if m.participates_in_scheduling else " · 不参与排班"
-            item = QListWidgetItem(f"{m.name}（{m.course_count} 门课）{suffix}")
+            studio = m.studio or UNKNOWN_STUDIO
+            item = QListWidgetItem(
+                f"{m.name}（{m.course_count} 门课 · {studio}）{suffix}")
             item.setData(Qt.UserRole, m.id)
             item.setData(Qt.UserRole + 1, (
-                m.name, m.student_id, m.class_name))
+                m.name, m.student_id, m.class_name, studio))
             item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
             if not m.participates_in_scheduling:
                 item.setForeground(QBrush(QColor("#8e8e93")))
                 item.setToolTip("不参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
             else:
                 item.setToolTip("参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
+            item.setToolTip(
+                item.toolTip() + f"\n工作室：{studio}"
+                + ("（已手工锁定）" if m.studio_locked else ""))
             self.member_list.addItem(item)
             combo_status = "" if m.participates_in_scheduling else " · 不参与排班"
             self.member_combo.addItem(
-                f"{m.name}（{m.class_name or '未知班级'}{combo_status}）", m.id)
+                f"{m.name} · {studio}（{m.class_name or '未知班级'}{combo_status}）",
+                m.id)
         self.member_combo.blockSignals(False)
         self.action_participation.setEnabled(bool(members))
+        self.action_export_roster.setEnabled(bool(members or self.roster_entries()))
         if selected_id is not None:
             for row in range(self.member_list.count()):
                 if self.member_list.item(row).data(Qt.UserRole) == selected_id:
@@ -1144,17 +1222,20 @@ class MainWindow(QMainWindow):
         """按姓名/学号/班级即时过滤成员列表，不修改底层数据。"""
         query = self.member_search.text().strip().casefold()
         selected_class = self.member_class_filter.currentData() or ""
+        selected_studio = self.member_studio_filter.currentData() or ""
         for row in range(self.member_list.count()):
             item = self.member_list.item(row)
-            name, student_id, class_name = item.data(Qt.UserRole + 1)
+            name, student_id, class_name, studio = item.data(Qt.UserRole + 1)
             matches_query = (
                 not query
                 or query in str(name).casefold()
                 or query in str(student_id).casefold()
                 or query in str(class_name).casefold()
+                or query in str(studio).casefold()
             )
             matches_class = not selected_class or class_name == selected_class
-            item.setHidden(not (matches_query and matches_class))
+            matches_studio = not selected_studio or studio == selected_studio
+            item.setHidden(not (matches_query and matches_class and matches_studio))
 
     def _on_empty_action(self) -> None:
         if self.members():
@@ -2082,7 +2163,8 @@ class MainWindow(QMainWindow):
             return
         participation = "参与排班" if m.participates_in_scheduling else "不参与排班"
         self.member_info.setText(
-            f"学号 {m.student_id or '—'} | {m.term or '—'} | {m.major or '—'} | "
+            f"学号 {m.student_id or '—'} | 工作室 {m.studio or UNKNOWN_STUDIO} | "
+            f"{m.term or '—'} | {m.major or '—'} | "
             f"{m.department or '—'} | {participation} | 来源：{m.file_name or '—'}")
         # 整周集中安排（军训/思政实践）没有星期与节次，排序键与展示都要单独处理
         courses = sorted(self.db.get_courses(member_id),
@@ -2132,7 +2214,7 @@ class MainWindow(QMainWindow):
         self.gantt_week.setValue(week)
 
     def refresh_gantt(self) -> None:
-        members = self.scheduling_members()
+        members = self.gantt_members()
         all_member_count = len(self.members())
         checked_weekdays = [
             d for d, cb in self.weekday_checks.items() if cb.isChecked()]
@@ -2144,7 +2226,12 @@ class MainWindow(QMainWindow):
             self.gantt_table.clearContents()
             self.gantt_table.setRowCount(0)
             self.gantt_table.setColumnCount(0)
-            if all_member_count and not members:
+            if all_member_count and not members and self.roster_entries():
+                self.gantt_hint.setText(
+                    "空闲时段总览仅显示短视频工作室和图片工作室成员。"
+                    "当前没有这两个工作室的参与成员；如归属有误，请在成员列表使用"
+                    "「修改工作室…」调整。")
+            elif all_member_count and not members:
                 self.gantt_hint.setText(
                     "当前没有参与排班的成员；请通过菜单「排班 → 设置参与排班…」"
                     "选择成员后查看空闲时段总览。")
@@ -2990,6 +3077,95 @@ class MainWindow(QMainWindow):
             lambda: parse_schedule_files(files),
             apply_import,
         )
+
+    def import_roster(self) -> None:
+        if self.busy:
+            self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
+            return
+        default_dir = Path.home() / "Downloads"
+        preferred = default_dir / "2025届全媒体中心花名册.xlsx"
+        start = preferred if preferred.exists() else default_dir
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择全媒体中心花名册", str(start),
+            "花名册文件 (*.xlsx *.xls);;所有文件 (*)")
+        if not path:
+            return
+
+        def apply_import(result) -> None:
+            count, changed = self.db.replace_roster(
+                result.entries, result.source_file)
+            self.invalidate_cache()
+            self.refresh_members()
+            matched = sum(
+                1 for member in self.members()
+                if (member.studio or UNKNOWN_STUDIO) != UNKNOWN_STUDIO)
+            message = (
+                f"已导入花名册 {count} 条；自动更新 {changed} 名已上传成员，"
+                f"当前 {matched} 人已匹配工作室。")
+            self.statusBar().showMessage(message)
+            if result.warnings:
+                QMessageBox.information(
+                    self, "花名册导入完成",
+                    message + "\n" + "\n".join(result.warnings))
+
+        self.run_async(
+            "正在解析花名册",
+            lambda: parse_roster_file(path),
+            apply_import,
+        )
+
+    def edit_selected_member_studio(self) -> None:
+        item = self.member_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "提示", "请先在成员列表中选择成员。")
+            return
+        member_id = item.data(Qt.UserRole)
+        member = self.db.get_member(member_id)
+        if member is None:
+            return
+        studios = set(self.db.roster_studios())
+        studios.update(TARGET_AVAILABILITY_STUDIOS)
+        studios.add(UNKNOWN_STUDIO)
+        if member.studio:
+            studios.add(member.studio)
+        options = sorted(studios)
+        current = member.studio or UNKNOWN_STUDIO
+        studio, accepted = QInputDialog.getItem(
+            self, "修改工作室",
+            f"设置「{member.name}」的工作室归属：\n"
+            "可直接输入新工作室名称，保存后不会被后续花名册重导覆盖。",
+            options, options.index(current) if current in options else 0, True)
+        if not accepted:
+            return
+        studio = studio.strip()
+        if not studio:
+            QMessageBox.information(self, "提示", "工作室名称不能为空。")
+            return
+        self.db.set_member_studio(member_id, studio)
+        self.invalidate_cache()
+        self.refresh_members()
+        self.statusBar().showMessage(
+            f"已将 {member.name} 的工作室修改为“{studio}”，并锁定该归属。")
+
+    def export_roster(self) -> None:
+        members = self.members()
+        entries = self.roster_entries()
+        if not members and not entries:
+            QMessageBox.information(self, "提示", "请先导入花名册或上传成员课表。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出完整花名册", "全媒体中心完整花名册.xlsx",
+            "Excel 文件 (*.xlsx)")
+        if not path:
+            return
+        courses = self.courses()
+        target = Path(path)
+        self.run_async(
+            "正在导出完整花名册",
+            lambda: target.write_bytes(
+                export_roster_excel(entries, members, courses)),
+            lambda _result: self.statusBar().showMessage(
+                f"已导出完整花名册：{target}"))
 
     def remove_selected_member(self) -> None:
         item = self.member_list.currentItem()

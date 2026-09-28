@@ -12,6 +12,12 @@ from pathlib import Path
 
 from .calendar import CalendarEntry, validate_calendar_entries
 from .parser import ParsedSchedule
+from .roster import (
+    UNKNOWN_STUDIO,
+    RosterEntry,
+    normalize_name,
+    normalize_student_id,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -23,10 +29,26 @@ CREATE TABLE IF NOT EXISTS members (
     major TEXT NOT NULL DEFAULT '',
     department TEXT NOT NULL DEFAULT '',
     file_name TEXT NOT NULL DEFAULT '',
+    studio TEXT NOT NULL DEFAULT '未指定工作室',
+    studio_locked INTEGER NOT NULL DEFAULT 0
+        CHECK (studio_locked IN (0, 1)),
     participates_in_scheduling INTEGER NOT NULL DEFAULT 1
         CHECK (participates_in_scheduling IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(student_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS roster_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    studio TEXT NOT NULL DEFAULT '未指定工作室',
+    position TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    student_id TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    college_major TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    row_number INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 CREATE TABLE IF NOT EXISTS courses (
@@ -89,6 +111,9 @@ CREATE TABLE IF NOT EXISTS term_calendar (
     )
 );
 
+CREATE INDEX IF NOT EXISTS idx_roster_entries_student ON roster_entries(student_id);
+CREATE INDEX IF NOT EXISTS idx_roster_entries_name ON roster_entries(name);
+CREATE INDEX IF NOT EXISTS idx_roster_entries_studio ON roster_entries(studio);
 CREATE INDEX IF NOT EXISTS idx_courses_member ON courses(member_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_week ON duty_assignments(week);
 CREATE INDEX IF NOT EXISTS idx_assignments_member ON duty_assignments(member_id);
@@ -144,6 +169,30 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
            INTEGER NOT NULL DEFAULT 1
            CHECK (participates_in_scheduling IN (0, 1))""",
     ]),
+    (5, [
+        """ALTER TABLE members ADD COLUMN studio
+           TEXT NOT NULL DEFAULT '未指定工作室'""",
+        """ALTER TABLE members ADD COLUMN studio_locked
+           INTEGER NOT NULL DEFAULT 0 CHECK (studio_locked IN (0, 1))""",
+        """CREATE TABLE IF NOT EXISTS roster_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            studio TEXT NOT NULL DEFAULT '未指定工作室',
+            position TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            student_id TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            college_major TEXT NOT NULL DEFAULT '',
+            source_file TEXT NOT NULL DEFAULT '',
+            row_number INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_roster_entries_student
+            ON roster_entries(student_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_roster_entries_name
+            ON roster_entries(name)""",
+        """CREATE INDEX IF NOT EXISTS idx_roster_entries_studio
+            ON roster_entries(studio)""",
+    ]),
 ]
 
 
@@ -159,6 +208,8 @@ class Member:
     file_name: str
     course_count: int = 0
     participates_in_scheduling: bool = True
+    studio: str = UNKNOWN_STUDIO
+    studio_locked: bool = False
 
 
 @dataclass
@@ -227,13 +278,15 @@ class Database:
             if version >= target:
                 continue
             for sql in statements:
-                # 新建数据库的 SCHEMA 已包含该列；老库才需要执行 ALTER TABLE。
-                if "ADD COLUMN participates_in_scheduling" in sql:
+                # 新建数据库的 SCHEMA 已包含新列；老库才需要执行 ALTER TABLE。
+                marker = "ALTER TABLE members ADD COLUMN "
+                if marker in sql:
+                    column = sql.split(marker, 1)[1].split()[0]
                     columns = {
                         row["name"]
                         for row in conn.execute("PRAGMA table_info(members)")
                     }
-                    if "participates_in_scheduling" in columns:
+                    if column in columns:
                         continue
                 conn.execute(sql)
             conn.execute(f"PRAGMA user_version = {target}")
@@ -283,30 +336,96 @@ class Database:
 
     # ---------- 成员 ----------
 
+    @staticmethod
+    def _roster_studio_lookup(conn: sqlite3.Connection) -> tuple[dict, dict]:
+        """构建学号/姓名到工作室的匹配索引。"""
+        by_student: dict[str, list[str]] = {}
+        by_name: dict[str, list[str]] = {}
+        rows = conn.execute(
+            "SELECT studio, name, student_id FROM roster_entries "
+            "ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            studio = (row["studio"] or UNKNOWN_STUDIO).strip() or UNKNOWN_STUDIO
+            student_id = normalize_student_id(row["student_id"])
+            name = normalize_name(row["name"])
+            if student_id:
+                by_student.setdefault(student_id, [])
+                if studio not in by_student[student_id]:
+                    by_student[student_id].append(studio)
+            if name:
+                by_name.setdefault(name, [])
+                if studio not in by_name[name]:
+                    by_name[name].append(studio)
+        return by_student, by_name
+
+    @staticmethod
+    def _resolve_studio(
+        lookup: tuple[dict, dict],
+        student_id: str,
+        name: str,
+    ) -> str:
+        """学号优先、姓名兜底；同一人多个工作室时取花名册首项。"""
+        by_student, by_name = lookup
+        normalized_id = normalize_student_id(student_id)
+        if normalized_id and by_student.get(normalized_id):
+            return by_student[normalized_id][0]
+        options = by_name.get(normalize_name(name), [])
+        return options[0] if options else UNKNOWN_STUDIO
+
+    @classmethod
+    def _sync_member_studios(cls, conn: sqlite3.Connection) -> int:
+        """把未手工锁定的成员重新按当前花名册归类，返回变更人数。"""
+        lookup = cls._roster_studio_lookup(conn)
+        changed = 0
+        rows = conn.execute(
+            "SELECT id, name, student_id, studio FROM members "
+            "WHERE studio_locked = 0"
+        ).fetchall()
+        for row in rows:
+            studio = cls._resolve_studio(
+                lookup, row["student_id"], row["name"])
+            if studio != (row["studio"] or UNKNOWN_STUDIO):
+                conn.execute(
+                    "UPDATE members SET studio = ? WHERE id = ?",
+                    (studio, row["id"]),
+                )
+                changed += 1
+        return changed
+
     def upsert_member(self, schedule: ParsedSchedule) -> int:
-        """新增或更新成员（按 学号+姓名 唯一），并整体替换其课程，返回成员 id"""
+        """新增或更新成员（按 学号+姓名 唯一），并整体替换其课程。"""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT id FROM members WHERE student_id = ? AND name = ?",
+                "SELECT id, studio, studio_locked FROM members "
+                "WHERE student_id = ? AND name = ?",
                 (schedule.student_id, schedule.name),
             ).fetchone()
+            lookup = self._roster_studio_lookup(conn)
+            resolved_studio = self._resolve_studio(
+                lookup, schedule.student_id, schedule.name)
             if row:
                 member_id = row["id"]
+                if row["studio_locked"]:
+                    studio = row["studio"] or UNKNOWN_STUDIO
+                else:
+                    studio = resolved_studio
                 conn.execute(
                     """UPDATE members SET term = ?, class_name = ?, major = ?,
-                       department = ?, file_name = ? WHERE id = ?""",
+                       department = ?, file_name = ?, studio = ? WHERE id = ?""",
                     (schedule.term, schedule.class_name, schedule.major,
-                     schedule.department, schedule.file_name, member_id),
+                     schedule.department, schedule.file_name, studio, member_id),
                 )
                 conn.execute("DELETE FROM courses WHERE member_id = ?", (member_id,))
             else:
                 cur = conn.execute(
                     """INSERT INTO members
-                       (student_id, name, term, class_name, major, department, file_name)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (student_id, name, term, class_name, major, department,
+                        file_name, studio)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (schedule.student_id, schedule.name, schedule.term,
                      schedule.class_name, schedule.major, schedule.department,
-                     schedule.file_name),
+                     schedule.file_name, resolved_studio),
                 )
                 member_id = cur.lastrowid
 
@@ -324,6 +443,67 @@ class Database:
             )
             return member_id
 
+    def replace_roster(
+        self,
+        entries: Iterable[RosterEntry],
+        source_file: str = "",
+    ) -> tuple[int, int]:
+        """整体替换花名册，并自动刷新未手工锁定的成员工作室。"""
+        rows = list(entries)
+        with self._connection() as conn:
+            conn.execute("DELETE FROM roster_entries")
+            conn.executemany(
+                """INSERT INTO roster_entries
+                   (studio, position, name, student_id, phone, college_major,
+                    source_file, row_number)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(
+                    entry.studio or UNKNOWN_STUDIO,
+                    entry.position,
+                    entry.name,
+                    normalize_student_id(entry.student_id),
+                    entry.phone,
+                    entry.college_major,
+                    entry.source_file or source_file,
+                    entry.row_number,
+                ) for entry in rows],
+            )
+            changed = self._sync_member_studios(conn)
+        return len(rows), changed
+
+    def list_roster_entries(self) -> list[RosterEntry]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM roster_entries ORDER BY id"
+            ).fetchall()
+            return [RosterEntry(
+                studio=r["studio"],
+                position=r["position"],
+                name=r["name"],
+                student_id=r["student_id"],
+                phone=r["phone"],
+                college_major=r["college_major"],
+                source_file=r["source_file"],
+                row_number=r["row_number"],
+            ) for r in rows]
+
+    def roster_studios(self) -> list[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT studio FROM roster_entries "
+                "WHERE TRIM(studio) != '' ORDER BY studio"
+            ).fetchall()
+            return [row["studio"] for row in rows]
+
+    def set_member_studio(self, member_id: int, studio: str) -> None:
+        """手工修改工作室后锁定，后续重导花名册不会覆盖。"""
+        normalized = (studio or "").strip() or UNKNOWN_STUDIO
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE members SET studio = ?, studio_locked = 1 WHERE id = ?",
+                (normalized, member_id),
+            )
+
     def list_members(self) -> list[Member]:
         with self._connection() as conn:
             rows = conn.execute(
@@ -337,6 +517,8 @@ class Database:
                 department=r["department"], file_name=r["file_name"],
                 course_count=r["course_count"],
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
+                studio=r["studio"],
+                studio_locked=bool(r["studio_locked"]),
             ) for r in rows]
 
     def set_members_participation(self, settings: dict[int, bool]) -> None:
@@ -366,6 +548,8 @@ class Database:
                 class_name=r["class_name"], major=r["major"], department=r["department"],
                 file_name=r["file_name"],
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
+                studio=r["studio"],
+                studio_locked=bool(r["studio_locked"]),
             ) if r else None
 
     # ---------- 课程 ----------

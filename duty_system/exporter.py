@@ -10,9 +10,15 @@ from datetime import date, timedelta
 import pandas as pd
 
 from .calendar import TermCalendar
-from .database import Assignment, Leave, Member
+from .database import Assignment, CourseRecord, Leave, Member
 from .excel_layout import fit_excel_layout
 from .parser import BLOCK_LABELS, WEEKDAY_LABELS
+from .roster import (
+    UNKNOWN_STUDIO,
+    RosterEntry,
+    normalize_name,
+    normalize_student_id,
+)
 
 
 def week_date(
@@ -130,6 +136,156 @@ def build_gap_df(diagnoses: list) -> pd.DataFrame:
     } for d in diagnoses]
     return pd.DataFrame(rows, columns=["周次", "星期", "时段", "主要原因", "无课人数"])
 
+
+
+def _member_match_index(
+    members: list[Member],
+) -> tuple[dict[tuple[str, str], Member], dict[str, list[Member]], dict[str, list[Member]]]:
+    by_pair: dict[tuple[str, str], Member] = {}
+    by_student: dict[str, list[Member]] = defaultdict(list)
+    by_name: dict[str, list[Member]] = defaultdict(list)
+    for member in members:
+        student_id = (member.student_id or "").strip()
+        name = member.name.strip()
+        by_pair[(student_id, name)] = member
+        if student_id:
+            by_student[student_id].append(member)
+        if name:
+            by_name[name].append(member)
+    return by_pair, by_student, by_name
+
+
+def _match_member(
+    entry: RosterEntry,
+    indexes: tuple[dict[tuple[str, str], Member], dict[str, list[Member]], dict[str, list[Member]]],
+) -> Member | None:
+    by_pair, by_student, by_name = indexes
+    student_id = (entry.student_id or "").strip()
+    name = entry.name.strip()
+    member = by_pair.get((student_id, name))
+    if member is not None:
+        return member
+    if student_id:
+        options = by_student.get(student_id, [])
+        if len(options) == 1:
+            return options[0]
+    options = by_name.get(name, [])
+    return options[0] if len(options) == 1 else None
+
+
+def build_roster_df(
+    entries: list[RosterEntry],
+    members: list[Member],
+) -> pd.DataFrame:
+    """合并花名册原始字段与课表上传/工作室分配状态。
+
+    已上传成员优先使用数据库中的工作室；这样手工修改会体现在导出中。
+    花名册中一行都未匹配到的上传成员会追加到末尾，避免遗漏“未指定工作室”。
+    """
+    indexes = _member_match_index(members)
+    rows: list[dict] = []
+    matched_member_ids: set[int] = set()
+    seen_identities: set[tuple[str, str]] = set()
+    for entry in entries:
+        identity = (
+            "id", normalize_student_id(entry.student_id)
+        ) if normalize_student_id(entry.student_id) else (
+            "name", normalize_name(entry.name)
+        )
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        member = _match_member(entry, indexes)
+        if member is not None:
+            matched_member_ids.add(member.id)
+        studio = (
+            member.studio if member is not None and member.studio
+            else entry.studio or UNKNOWN_STUDIO
+        )
+        rows.append({
+            "工作室": studio,
+            "职位": entry.position,
+            "姓名": member.name if member is not None else entry.name,
+            "学号": member.student_id if member is not None else entry.student_id,
+            "电话": entry.phone,
+            "学院+专业": (
+                entry.college_major
+                or (f"{member.department}{member.major}" if member is not None else "")
+            ),
+            "是否已上传课表": "是" if member is not None and member.course_count else "否",
+            "课程数": member.course_count if member is not None else 0,
+            "是否参与排班": (
+                "是" if member is not None and member.participates_in_scheduling
+                else "否" if member is not None else ""
+            ),
+            "课表文件": member.file_name if member is not None else "",
+        })
+
+    for member in members:
+        if member.id in matched_member_ids:
+            continue
+        rows.append({
+            "工作室": member.studio or UNKNOWN_STUDIO,
+            "职位": "",
+            "姓名": member.name,
+            "学号": member.student_id,
+            "电话": "",
+            "学院+专业": f"{member.department}{member.major}".strip(),
+            "是否已上传课表": "是" if member.course_count else "否",
+            "课程数": member.course_count,
+            "是否参与排班": "是" if member.participates_in_scheduling else "否",
+            "课表文件": member.file_name,
+        })
+    columns = [
+        "工作室", "职位", "姓名", "学号", "电话", "学院+专业",
+        "是否已上传课表", "课程数", "是否参与排班", "课表文件",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_roster_course_df(
+    members: list[Member],
+    courses: list[CourseRecord],
+) -> pd.DataFrame:
+    """完整课表明细表：按成员展开课程名、周次、节次与地点。"""
+    info = {member.id: member for member in members}
+    rows: list[dict] = []
+    for course in courses:
+        member = info.get(course.member_id)
+        if member is None:
+            continue
+        rows.append({
+            "工作室": member.studio or UNKNOWN_STUDIO,
+            "学号": member.student_id,
+            "姓名": member.name,
+            "课程名称": course.course_name,
+            "教师": course.teacher,
+            "星期": WEEKDAY_LABELS.get(course.weekday, "整周"),
+            "周次": course.weeks_text,
+            "节次": course.sessions_text,
+            "地点": course.location,
+        })
+    columns = [
+        "工作室", "学号", "姓名", "课程名称", "教师", "星期",
+        "周次", "节次", "地点",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def export_roster_excel(
+    entries: list[RosterEntry],
+    members: list[Member],
+    courses: list[CourseRecord],
+) -> bytes:
+    """导出完整花名册与课表明细。"""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        build_roster_df(entries, members).to_excel(
+            writer, sheet_name="完整花名册", index=False)
+        build_roster_course_df(members, courses).to_excel(
+            writer, sheet_name="课表明细", index=False)
+        _beautify(writer)
+    return buf.getvalue()
 
 def build_stats_df(member_stats: dict[int, dict]) -> pd.DataFrame:
     """值班统计表：每人总次数与值班周分布"""
