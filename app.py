@@ -3509,6 +3509,7 @@ class MainWindow(QMainWindow):
             "term": ("学期", member.term),
             "major": ("专业", member.major),
             "department": ("院系", member.department),
+            "phone": ("手机号", member.phone),
         }
         edits: dict[str, QLineEdit] = {}
         for key, (label_text, value) in fields.items():
@@ -3538,6 +3539,7 @@ class MainWindow(QMainWindow):
                     term=edits["term"].text(),
                     major=edits["major"].text(),
                     department=edits["department"].text(),
+                    phone=edits["phone"].text(),
                 )
             except ValueError as exc:
                 QMessageBox.warning(dlg, "无法保存", str(exc))

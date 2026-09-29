@@ -43,7 +43,7 @@
 - **工作室与职位管理**：成员列表可按工作室筛选；「修改工作室…」和「批量修改工作室…」均支持多选，
   可为每个工作室指定“部长 / 副部长 / 成员 / 高级顾问”或暂不指定，并处理主岗、兼岗、转组。
   同一工作室最多只能指定一名部长；运营工作室支持高级顾问。手工修改后会锁定，重导花名册不会覆盖。
-- **个人信息编辑**：在「成员课表」页点击「修改个人信息…」，可更正姓名、学号、班级、学期、专业、院系以及各工作室对应职位；
+- **个人信息编辑**：在「成员课表」页点击「修改个人信息…」，可更正姓名、学号、手机号、班级、学期、专业、院系以及各工作室对应职位；
   课程、值班、请假与特殊安排按内部成员 ID 保留，不会因改资料而丢失。
 - **参与排班设置**：通过菜单栏「排班 → 设置参与排班…」打开设置窗口，可批量勾选参与排班的成员。
   取消勾选后成员仍保留课表并可随时查看，但不再进入自动排班、手动微调候选、缺口诊断、
@@ -285,7 +285,7 @@ certifi>=2024.2  # 在线更新国家调休数据的 TLS 根证书
 
 | 表 | 字段 | 说明 |
 | --- | --- | --- |
-| `members` | id, student_id, name, class_name, term, file_name, studio, studio_locked, course_count, participates_in_scheduling | 成员课表与主显示工作室（手工修改后锁定） |
+| `members` | id, student_id, name, phone, class_name, term, file_name, studio, studio_locked, course_count, participates_in_scheduling | 成员课表、手机号与主显示工作室（手工修改后锁定） |
 | `member_studios` | member_id, studio, position；主键(member_id, studio) | 成员全部工作室归属及每个工作室对应职位 |
 | `roster_entries` | studio, position, name, student_id, phone, college_major, source_file, row_number | 花名册原始记录，独立于排班名单 |
 | `courses` | id, member_id, course_name, teacher, location, weeks, weekday, sessions | 成员课表课程记录 |

@@ -1122,13 +1122,14 @@ def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
         dialog = qt_app.activeModalWidget()
         assert isinstance(dialog, QDialog)
         edits = dialog.findChildren(QLineEdit)
-        assert len(edits) >= 7
+        assert len(edits) >= 8
         edits[0].setText("新姓名")
         edits[1].setText("9001")
         edits[2].setText("新班级")
         edits[3].setText("2027-2028-1")
         edits[4].setText("新专业")
         edits[5].setText("新学院")
+        edits[6].setText("13800138000")
         studio_selector = dialog.findChild(QTableWidget)
         assert studio_selector is not None
         for row in range(studio_selector.rowCount()):
@@ -1154,6 +1155,7 @@ def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
         "新姓名", "9001", "新班级")
     assert (updated.term, updated.major, updated.department) == (
         "2027-2028-1", "新专业", "新学院")
+    assert updated.phone == "13800138000"
     assert set(updated.studios) == {"短视频工作室", "图片工作室"}
     assert updated.studio_positions == {
         "短视频工作室": "部长", "图片工作室": "成员"}

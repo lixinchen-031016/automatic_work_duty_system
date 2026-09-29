@@ -233,7 +233,10 @@ def build_roster_df(
             ),
             "姓名": member.name if member is not None else entry.name,
             "学号": member.student_id if member is not None else entry.student_id,
-            "电话": entry.phone,
+            "电话": (
+                member.phone or entry.phone if member is not None
+                else entry.phone
+            ),
             "学院+专业": (
                 entry.college_major
                 or (f"{member.department}{member.major}" if member is not None else "")
@@ -255,7 +258,7 @@ def build_roster_df(
             "职位": "",
             "姓名": member.name,
             "学号": member.student_id,
-            "电话": "",
+            "电话": member.phone,
             "学院+专业": f"{member.department}{member.major}".strip(),
             "是否已上传课表": "是" if member.course_count else "否",
             "课程数": member.course_count,
@@ -357,7 +360,7 @@ def _roster_format_groups(
             "position": positions.get(current_studio, ""),
             "name": member.name,
             "student_id": member.student_id,
-            "phone": entry.phone,
+            "phone": member.phone or entry.phone,
             "college_major": (
                 entry.college_major
                 or f"{member.department}{member.major}".strip()
@@ -379,7 +382,9 @@ def _roster_format_groups(
                 "position": positions.get(studio, ""),
                 "name": member.name,
                 "student_id": member.student_id,
-                "phone": roster_entry.phone if roster_entry else "",
+                "phone": (
+                    member.phone or (roster_entry.phone if roster_entry else "")
+                ),
                 "college_major": (
                     roster_entry.college_major if roster_entry
                     else f"{member.department}{member.major}".strip()

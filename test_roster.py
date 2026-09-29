@@ -48,7 +48,8 @@ def test_roster_classification_and_manual_transfer_are_persistent(
 
     count, changed = db.replace_roster([
         RosterEntry(studio="短视频工作室", position="部长",
-                    name="甲同学", student_id="20250001"),
+                    name="甲同学", student_id="20250001",
+                    phone="13800000000"),
         RosterEntry(studio="图片工作室", position="副部长",
                     name="甲同学", student_id="20250001"),
         RosterEntry(studio="未在课表名单中", name="乙同学", student_id="20250002"),
@@ -59,6 +60,7 @@ def test_roster_classification_and_manual_transfer_are_persistent(
     ]
     assert db.get_member(member_id).studio_positions == {
         "短视频工作室": "部长", "图片工作室": "副部长"}
+    assert db.get_member(member_id).phone == "13800000000"
 
     db.set_member_studios(
         member_id, ["设计工作室", "微信工作室"],
@@ -102,6 +104,10 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
             week_list=list(range(1, 17)), sessions_text="01-02",
             session_list=[1, 2])],
     ))
+    db.update_member_profile(
+        member_id, name="已在名单", student_id="20250001",
+        term="2026-2027-1", class_name="软件1班", major="软件工程",
+        department="计算机学院", phone="13900139000")
     db.upsert_member(ParsedSchedule(
         name="未录入同学", student_id="20250002", term="2026-2027-1",
         class_name="设计1班", major="视觉传达", department="设计学院",
@@ -119,6 +125,7 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     uploaded = frame[frame["姓名"] == "已在名单"].iloc[0]
     assert uploaded["是否已上传课表"] == "是"
     assert uploaded["课程数"] == 1
+    assert uploaded["电话"] == "13900139000"
     assert uploaded["工作室"] == "短视频工作室（部长）、图片工作室（成员）"
     unknown = frame[frame["姓名"] == "未录入同学"].iloc[0]
     assert uploaded["职位"] == "短视频工作室：部长；图片工作室：成员"
@@ -136,6 +143,7 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     assert ws["A3"].value == "短视频工作室"
     assert ws["B3"].value == "部长"
     assert ws["C3"].value == "已在名单"
+    assert ws["E3"].value == "13900139000"
     assert ws["A4"].value == "图片工作室"
     assert ws["B4"].value == "成员"
     assert ws.freeze_panes == "A3"

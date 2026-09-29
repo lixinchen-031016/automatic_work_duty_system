@@ -333,7 +333,8 @@ def test_profile_update_preserves_related_records_and_checks_duplicate(
 
     db.update_member_profile(
         member_id, name="甲同学", student_id="1001", term="2026-2027-1",
-        class_name="新班", major="新专业", department="新学院")
+        class_name="新班", major="新专业", department="新学院",
+        phone="13800138000")
 
     member = db.get_member(member_id)
     assert member is not None
@@ -341,6 +342,7 @@ def test_profile_update_preserves_related_records_and_checks_duplicate(
         "甲同学", "1001", "2026-2027-1")
     assert (member.class_name, member.major, member.department) == (
         "新班", "新专业", "新学院")
+    assert member.phone == "13800138000"
     assignments = db.load_assignments()
     assert [(a.week, a.weekday, a.block, a.member_id)
             for a in assignments] == [(1, 1, 1, member_id)]

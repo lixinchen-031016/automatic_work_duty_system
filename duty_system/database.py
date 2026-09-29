@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS members (
     major TEXT NOT NULL DEFAULT '',
     department TEXT NOT NULL DEFAULT '',
     file_name TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
     studio TEXT NOT NULL DEFAULT '未指定工作室',
     studio_locked INTEGER NOT NULL DEFAULT 0
         CHECK (studio_locked IN (0, 1)),
@@ -232,6 +233,23 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                LIMIT 1
            ), '')""",
     ]),
+    (8, [
+        """ALTER TABLE members ADD COLUMN phone TEXT NOT NULL DEFAULT ''""",
+        """UPDATE members
+           SET phone = COALESCE((
+               SELECT r.phone FROM roster_entries r
+               WHERE members.student_id <> ''
+                 AND r.student_id = members.student_id
+               ORDER BY r.id LIMIT 1
+           ), '')""",
+        """UPDATE members
+           SET phone = COALESCE((
+               SELECT r.phone FROM roster_entries r
+               WHERE r.name = members.name
+               ORDER BY r.id LIMIT 1
+           ), phone)
+           WHERE phone = ''""",
+    ]),
 ]
 
 
@@ -251,6 +269,7 @@ class Member:
     studio_locked: bool = False
     studios: list[str] = field(default_factory=list)
     studio_positions: dict[str, str] = field(default_factory=dict)
+    phone: str = ""
 
 
 @dataclass
@@ -410,6 +429,37 @@ class Database:
         return by_student, by_name
 
     @staticmethod
+    def _roster_phone_lookup(conn: sqlite3.Connection) -> tuple[dict, dict]:
+        by_student: dict[str, str] = {}
+        by_name: dict[str, str] = {}
+        rows = conn.execute(
+            "SELECT name, student_id, phone FROM roster_entries ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            phone = (row["phone"] or "").strip()
+            if not phone:
+                continue
+            student_id = normalize_student_id(row["student_id"])
+            name = normalize_name(row["name"])
+            if student_id:
+                by_student.setdefault(student_id, phone)
+            if name:
+                by_name.setdefault(name, phone)
+        return by_student, by_name
+
+    @staticmethod
+    def _resolve_roster_phone(
+        lookup: tuple[dict, dict],
+        student_id: str,
+        name: str,
+    ) -> str:
+        by_student, by_name = lookup
+        normalized_id = normalize_student_id(student_id)
+        if normalized_id and by_student.get(normalized_id):
+            return by_student[normalized_id]
+        return by_name.get(normalize_name(name), "")
+
+    @staticmethod
     def _normalize_studios(studios: Iterable[str]) -> list[str]:
         """去重并保持顺序；空集合按未指定工作室处理。"""
         normalized: list[str] = []
@@ -535,19 +585,24 @@ class Database:
     def _sync_member_studios(cls, conn: sqlite3.Connection) -> int:
         """把未手工锁定的成员按当前花名册重建为工作室-职位归属。"""
         lookup = cls._roster_studio_lookup(conn)
+        phone_lookup = cls._roster_phone_lookup(conn)
         existing = cls._member_memberships_map(conn)
         changed = 0
         rows = conn.execute(
-            "SELECT id, name, student_id FROM members WHERE studio_locked = 0"
+            "SELECT id, name, student_id, phone FROM members "
+            "WHERE studio_locked = 0"
         ).fetchall()
         for row in rows:
             memberships = cls._resolve_memberships(
                 lookup, row["student_id"], row["name"])
-            if memberships != existing.get(row["id"], []):
+            phone = row["phone"] or cls._resolve_roster_phone(
+                phone_lookup, row["student_id"], row["name"])
+            membership_changed = memberships != existing.get(row["id"], [])
+            if membership_changed or phone != (row["phone"] or ""):
                 cls._replace_member_memberships(conn, row["id"], memberships)
                 conn.execute(
-                    "UPDATE members SET studio = ? WHERE id = ?",
-                    (memberships[0][0], row["id"]),
+                    "UPDATE members SET studio = ?, phone = ? WHERE id = ?",
+                    (memberships[0][0], phone, row["id"]),
                 )
                 changed += 1
         return changed
@@ -561,6 +616,8 @@ class Database:
                 (schedule.student_id, schedule.name),
             ).fetchone()
             lookup = self._roster_studio_lookup(conn)
+            roster_phone = self._resolve_roster_phone(
+                self._roster_phone_lookup(conn), schedule.student_id, schedule.name)
             resolved_memberships = self._resolve_memberships(
                 lookup, schedule.student_id, schedule.name)
             existing_memberships = self._member_memberships_map(conn)
@@ -576,21 +633,23 @@ class Database:
                 primary_studio = memberships[0][0]
                 conn.execute(
                     """UPDATE members SET term = ?, class_name = ?, major = ?,
-                       department = ?, file_name = ?, studio = ? WHERE id = ?""",
+                       department = ?, file_name = ?, studio = ?,
+                       phone = CASE WHEN phone = '' THEN ? ELSE phone END
+                       WHERE id = ?""",
                     (schedule.term, schedule.class_name, schedule.major,
                      schedule.department, schedule.file_name, primary_studio,
-                     member_id),
+                     roster_phone, member_id),
                 )
                 conn.execute("DELETE FROM courses WHERE member_id = ?", (member_id,))
             else:
                 cur = conn.execute(
                     """INSERT INTO members
                        (student_id, name, term, class_name, major, department,
-                        file_name, studio)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        file_name, studio, phone)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (schedule.student_id, schedule.name, schedule.term,
                      schedule.class_name, schedule.major, schedule.department,
-                     schedule.file_name, resolved_memberships[0][0]),
+                     schedule.file_name, resolved_memberships[0][0], roster_phone),
                 )
                 member_id = cur.lastrowid
                 self._replace_member_memberships(
@@ -762,6 +821,7 @@ class Database:
         class_name: str = "",
         major: str = "",
         department: str = "",
+        phone: str = "",
     ) -> None:
         """修改成员个人信息；课程与历史排班仍按内部 id 保留。"""
         normalized_name = (name or "").strip()
@@ -773,11 +833,12 @@ class Database:
                 cursor = conn.execute(
                     """UPDATE members
                        SET name = ?, student_id = ?, term = ?, class_name = ?,
-                           major = ?, department = ?
+                           major = ?, department = ?, phone = ?
                        WHERE id = ?""",
                     (normalized_name, normalized_id, (term or "").strip(),
                      (class_name or "").strip(), (major or "").strip(),
-                     (department or "").strip(), member_id),
+                     (department or "").strip(), (phone or "").strip(),
+                     member_id),
                 )
                 if cursor.rowcount == 0:
                     raise ValueError("成员不存在或已被删除")
@@ -796,6 +857,7 @@ class Database:
                 id=r["id"], name=r["name"], student_id=r["student_id"],
                 term=r["term"], class_name=r["class_name"], major=r["major"],
                 department=r["department"], file_name=r["file_name"],
+                phone=r["phone"],
                 course_count=r["course_count"],
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
                 studio=r["studio"],
@@ -836,7 +898,7 @@ class Database:
             return Member(
                 id=r["id"], name=r["name"], student_id=r["student_id"], term=r["term"],
                 class_name=r["class_name"], major=r["major"], department=r["department"],
-                file_name=r["file_name"],
+                file_name=r["file_name"], phone=r["phone"],
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
                 studio=r["studio"],
                 studio_locked=bool(r["studio_locked"]),
