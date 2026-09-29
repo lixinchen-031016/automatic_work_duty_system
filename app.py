@@ -3367,9 +3367,9 @@ class MainWindow(QMainWindow):
             return
         self.invalidate_cache()
         self.refresh_members()
+        display = self.member_studio_text(self.db.get_member(member_id))
         self.statusBar().showMessage(
-            f"已将 {member.name} 的工作室与职位设置为“{self.member_studio_text(
-                self.db.get_member(member_id))}”，并锁定归属。")
+            f"已将 {member.name} 的工作室与职位设置为“{display}”，并锁定归属。")
 
     def batch_edit_members_studio(self) -> None:
         visible_members = [
