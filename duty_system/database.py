@@ -6,13 +6,14 @@ import json
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 from .calendar import CalendarEntry, validate_calendar_entries
 from .parser import ParsedSchedule
 from .roster import (
+    POSITION_LEADER,
     UNKNOWN_STUDIO,
     RosterEntry,
     normalize_name,
@@ -36,6 +37,13 @@ CREATE TABLE IF NOT EXISTS members (
         CHECK (participates_in_scheduling IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(student_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS member_studios (
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    studio TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (member_id, studio)
 );
 
 CREATE TABLE IF NOT EXISTS roster_entries (
@@ -111,6 +119,7 @@ CREATE TABLE IF NOT EXISTS term_calendar (
     )
 );
 
+CREATE INDEX IF NOT EXISTS idx_member_studios_studio ON member_studios(studio);
 CREATE INDEX IF NOT EXISTS idx_roster_entries_student ON roster_entries(student_id);
 CREATE INDEX IF NOT EXISTS idx_roster_entries_name ON roster_entries(name);
 CREATE INDEX IF NOT EXISTS idx_roster_entries_studio ON roster_entries(studio);
@@ -193,6 +202,36 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         """CREATE INDEX IF NOT EXISTS idx_roster_entries_studio
             ON roster_entries(studio)""",
     ]),
+    (6, [
+        """CREATE TABLE IF NOT EXISTS member_studios (
+            member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+            studio TEXT NOT NULL,
+            PRIMARY KEY (member_id, studio)
+        )""",
+        """INSERT OR IGNORE INTO member_studios (member_id, studio)
+           SELECT id, CASE WHEN TRIM(studio) = '' THEN '未指定工作室'
+                           ELSE studio END
+           FROM members""",
+        """CREATE INDEX IF NOT EXISTS idx_member_studios_studio
+            ON member_studios(studio)""",
+    ]),
+    (7, [
+        """ALTER TABLE member_studios ADD COLUMN position
+           TEXT NOT NULL DEFAULT ''""",
+        """UPDATE member_studios
+           SET position = COALESCE((
+               SELECT r.position FROM roster_entries r
+               JOIN members m ON m.id = member_studios.member_id
+               WHERE r.studio = member_studios.studio
+                 AND (
+                     (m.student_id <> '' AND r.student_id = m.student_id)
+                     OR r.name = m.name
+                 )
+               ORDER BY CASE WHEN r.student_id = m.student_id THEN 0 ELSE 1 END,
+                        r.id
+               LIMIT 1
+           ), '')""",
+    ]),
 ]
 
 
@@ -210,6 +249,8 @@ class Member:
     participates_in_scheduling: bool = True
     studio: str = UNKNOWN_STUDIO
     studio_locked: bool = False
+    studios: list[str] = field(default_factory=list)
+    studio_positions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -269,6 +310,8 @@ class Database:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            # v6 迁移后按花名册重建多工作室归属；已手工锁定的成员保持原样。
+            self._sync_member_studios(conn)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -279,12 +322,12 @@ class Database:
                 continue
             for sql in statements:
                 # 新建数据库的 SCHEMA 已包含新列；老库才需要执行 ALTER TABLE。
-                marker = "ALTER TABLE members ADD COLUMN "
-                if marker in sql:
-                    column = sql.split(marker, 1)[1].split()[0]
+                if "ALTER TABLE " in sql and " ADD COLUMN " in sql:
+                    table = sql.split("ALTER TABLE ", 1)[1].split()[0]
+                    column = sql.split(" ADD COLUMN ", 1)[1].split()[0]
                     columns = {
                         row["name"]
-                        for row in conn.execute("PRAGMA table_info(members)")
+                        for row in conn.execute(f"PRAGMA table_info({table})")
                     }
                     if column in columns:
                         continue
@@ -338,57 +381,173 @@ class Database:
 
     @staticmethod
     def _roster_studio_lookup(conn: sqlite3.Connection) -> tuple[dict, dict]:
-        """构建学号/姓名到工作室的匹配索引。"""
-        by_student: dict[str, list[str]] = {}
-        by_name: dict[str, list[str]] = {}
+        """构建学号/姓名到 (工作室, 职位) 的匹配索引。"""
+        by_student: dict[str, list[tuple[str, str]]] = {}
+        by_name: dict[str, list[tuple[str, str]]] = {}
         rows = conn.execute(
-            "SELECT studio, name, student_id FROM roster_entries "
+            "SELECT studio, position, name, student_id FROM roster_entries "
             "ORDER BY id"
         ).fetchall()
         for row in rows:
             studio = (row["studio"] or UNKNOWN_STUDIO).strip() or UNKNOWN_STUDIO
+            position = (row["position"] or "").strip()
             student_id = normalize_student_id(row["student_id"])
             name = normalize_name(row["name"])
-            if student_id:
-                by_student.setdefault(student_id, [])
-                if studio not in by_student[student_id]:
-                    by_student[student_id].append(studio)
-            if name:
-                by_name.setdefault(name, [])
-                if studio not in by_name[name]:
-                    by_name[name].append(studio)
+            membership = (studio, position)
+            for index, source in ((student_id, by_student), (name, by_name)):
+                if not index:
+                    continue
+                options = source.setdefault(index, [])
+                existing = next(
+                    (i for i, item in enumerate(options)
+                     if item[0].casefold() == studio.casefold()),
+                    None,
+                )
+                if existing is None:
+                    options.append(membership)
+                elif not options[existing][1] and position:
+                    options[existing] = membership
         return by_student, by_name
 
     @staticmethod
-    def _resolve_studio(
+    def _normalize_studios(studios: Iterable[str]) -> list[str]:
+        """去重并保持顺序；空集合按未指定工作室处理。"""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in studios:
+            studio = (raw or "").strip()
+            key = studio.casefold()
+            if not studio or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(studio)
+        return normalized or [UNKNOWN_STUDIO]
+
+    @staticmethod
+    def _normalize_memberships(
+        memberships: Iterable[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """规范化工作室-职位组合，重复工作室保留首个非空职位。"""
+        normalized: list[tuple[str, str]] = []
+        indexes: dict[str, int] = {}
+        for raw_studio, raw_position in memberships:
+            studio = (raw_studio or "").strip()
+            position = (raw_position or "").strip()
+            if not studio:
+                continue
+            key = studio.casefold()
+            if key in indexes:
+                index = indexes[key]
+                if not normalized[index][1] and position:
+                    normalized[index] = (normalized[index][0], position)
+                continue
+            indexes[key] = len(normalized)
+            normalized.append((studio, position))
+        return normalized or [(UNKNOWN_STUDIO, "")]
+
+    @staticmethod
+    def _member_memberships_map(
+        conn: sqlite3.Connection,
+    ) -> dict[int, list[tuple[str, str]]]:
+        result: dict[int, list[tuple[str, str]]] = {}
+        rows = conn.execute(
+            "SELECT member_id, studio, position FROM member_studios "
+            "ORDER BY member_id, rowid"
+        ).fetchall()
+        for row in rows:
+            result.setdefault(row["member_id"], []).append(
+                (row["studio"], row["position"] or ""))
+        return result
+
+    @classmethod
+    def _member_studios_map(cls, conn: sqlite3.Connection) -> dict[int, list[str]]:
+        return {
+            member_id: [studio for studio, _position in memberships]
+            for member_id, memberships in cls._member_memberships_map(conn).items()
+        }
+
+    @classmethod
+    def _member_positions_map(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> dict[int, dict[str, str]]:
+        return {
+            member_id: {studio: position for studio, position in memberships}
+            for member_id, memberships in cls._member_memberships_map(conn).items()
+        }
+
+    @staticmethod
+    def _replace_member_memberships(
+        conn: sqlite3.Connection,
+        member_id: int,
+        memberships: Iterable[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        normalized = Database._normalize_memberships(memberships)
+        conn.execute("DELETE FROM member_studios WHERE member_id = ?", (member_id,))
+        conn.executemany(
+            """INSERT INTO member_studios (member_id, studio, position)
+               VALUES (?, ?, ?)""",
+            [(member_id, studio, position) for studio, position in normalized],
+        )
+        return normalized
+
+    @staticmethod
+    def _replace_member_studios(
+        conn: sqlite3.Connection,
+        member_id: int,
+        studios: Iterable[str],
+        positions: dict[str, str] | None = None,
+    ) -> list[str]:
+        positions = {key.casefold(): value for key, value in (positions or {}).items()}
+        memberships = [
+            (studio, positions.get(studio.casefold(), ""))
+            for studio in Database._normalize_studios(studios)
+        ]
+        Database._replace_member_memberships(conn, member_id, memberships)
+        return [studio for studio, _position in memberships]
+
+    @staticmethod
+    def _resolve_memberships(
         lookup: tuple[dict, dict],
         student_id: str,
         name: str,
-    ) -> str:
-        """学号优先、姓名兜底；同一人多个工作室时取花名册首项。"""
+    ) -> list[tuple[str, str]]:
+        """学号优先、姓名兜底，返回花名册中全部工作室及职位。"""
         by_student, by_name = lookup
         normalized_id = normalize_student_id(student_id)
         if normalized_id and by_student.get(normalized_id):
-            return by_student[normalized_id][0]
+            return Database._normalize_memberships(by_student[normalized_id])
         options = by_name.get(normalize_name(name), [])
-        return options[0] if options else UNKNOWN_STUDIO
+        return Database._normalize_memberships(options)
+
+    @staticmethod
+    def _resolve_studios(
+        lookup: tuple[dict, dict],
+        student_id: str,
+        name: str,
+    ) -> list[str]:
+        return [
+            studio for studio, _position in Database._resolve_memberships(
+                lookup, student_id, name)
+        ]
 
     @classmethod
     def _sync_member_studios(cls, conn: sqlite3.Connection) -> int:
-        """把未手工锁定的成员重新按当前花名册归类，返回变更人数。"""
+        """把未手工锁定的成员按当前花名册重建为工作室-职位归属。"""
         lookup = cls._roster_studio_lookup(conn)
+        existing = cls._member_memberships_map(conn)
         changed = 0
         rows = conn.execute(
-            "SELECT id, name, student_id, studio FROM members "
-            "WHERE studio_locked = 0"
+            "SELECT id, name, student_id FROM members WHERE studio_locked = 0"
         ).fetchall()
         for row in rows:
-            studio = cls._resolve_studio(
+            memberships = cls._resolve_memberships(
                 lookup, row["student_id"], row["name"])
-            if studio != (row["studio"] or UNKNOWN_STUDIO):
+            if memberships != existing.get(row["id"], []):
+                cls._replace_member_memberships(conn, row["id"], memberships)
                 conn.execute(
                     "UPDATE members SET studio = ? WHERE id = ?",
-                    (studio, row["id"]),
+                    (memberships[0][0], row["id"]),
                 )
                 changed += 1
         return changed
@@ -402,19 +561,25 @@ class Database:
                 (schedule.student_id, schedule.name),
             ).fetchone()
             lookup = self._roster_studio_lookup(conn)
-            resolved_studio = self._resolve_studio(
+            resolved_memberships = self._resolve_memberships(
                 lookup, schedule.student_id, schedule.name)
+            existing_memberships = self._member_memberships_map(conn)
             if row:
                 member_id = row["id"]
                 if row["studio_locked"]:
-                    studio = row["studio"] or UNKNOWN_STUDIO
+                    memberships = existing_memberships.get(member_id) or [
+                        (row["studio"] or UNKNOWN_STUDIO, "")]
                 else:
-                    studio = resolved_studio
+                    memberships = resolved_memberships
+                    self._replace_member_memberships(
+                        conn, member_id, memberships)
+                primary_studio = memberships[0][0]
                 conn.execute(
                     """UPDATE members SET term = ?, class_name = ?, major = ?,
                        department = ?, file_name = ?, studio = ? WHERE id = ?""",
                     (schedule.term, schedule.class_name, schedule.major,
-                     schedule.department, schedule.file_name, studio, member_id),
+                     schedule.department, schedule.file_name, primary_studio,
+                     member_id),
                 )
                 conn.execute("DELETE FROM courses WHERE member_id = ?", (member_id,))
             else:
@@ -425,9 +590,11 @@ class Database:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (schedule.student_id, schedule.name, schedule.term,
                      schedule.class_name, schedule.major, schedule.department,
-                     schedule.file_name, resolved_studio),
+                     schedule.file_name, resolved_memberships[0][0]),
                 )
                 member_id = cur.lastrowid
+                self._replace_member_memberships(
+                    conn, member_id, resolved_memberships)
 
             conn.executemany(
                 """INSERT OR IGNORE INTO courses
@@ -495,22 +662,95 @@ class Database:
             ).fetchall()
             return [row["studio"] for row in rows]
 
-    def set_members_studio(self, member_ids: Iterable[int], studio: str) -> int:
-        """批量修改工作室并锁定，返回实际处理的成员数。"""
+    def set_members_studios(
+        self,
+        member_ids: Iterable[int],
+        studios: Iterable[str],
+        positions: dict[str, str] | None = None,
+    ) -> int:
+        """批量替换成员的工作室-职位集合并锁定，返回处理人数。"""
         ids = list(dict.fromkeys(int(member_id) for member_id in member_ids))
         if not ids:
             return 0
-        normalized = (studio or "").strip() or UNKNOWN_STUDIO
+        normalized_studios = self._normalize_studios(studios)
+        requested_positions = {
+            studio.casefold(): (position or "").strip()
+            for studio, position in (positions or {}).items()
+        }
         with self._connection() as conn:
-            conn.executemany(
-                "UPDATE members SET studio = ?, studio_locked = 1 WHERE id = ?",
-                [(normalized, member_id) for member_id in ids],
-            )
+            existing_map = self._member_memberships_map(conn)
+            assignments: dict[int, list[tuple[str, str]]] = {}
+            for member_id in ids:
+                existing_positions = {
+                    studio.casefold(): position
+                    for studio, position in existing_map.get(member_id, [])
+                }
+                memberships = [
+                    (
+                        studio,
+                        requested_positions.get(
+                            studio.casefold(),
+                            existing_positions.get(studio.casefold(), ""),
+                        ),
+                    )
+                    for studio in normalized_studios
+                ]
+                assignments[member_id] = self._normalize_memberships(memberships)
+
+            self._validate_leader_assignments(conn, ids, assignments)
+            for member_id, memberships in assignments.items():
+                conn.execute(
+                    "UPDATE members SET studio = ?, studio_locked = 1 WHERE id = ?",
+                    (memberships[0][0], member_id),
+                )
+                self._replace_member_memberships(conn, member_id, memberships)
         return len(ids)
 
+    @staticmethod
+    def _validate_leader_assignments(
+        conn: sqlite3.Connection,
+        member_ids: list[int],
+        assignments: dict[int, list[tuple[str, str]]],
+    ) -> None:
+        """同一工作室最多只能指定一名部长。"""
+        requested: dict[str, int] = {}
+        for memberships in assignments.values():
+            for studio, position in memberships:
+                if position != POSITION_LEADER:
+                    continue
+                key = studio.casefold()
+                requested[key] = requested.get(key, 0) + 1
+                if requested[key] > 1:
+                    raise ValueError(f"{studio} 只能指定一名部长")
+        if not requested:
+            return
+        placeholders = ",".join("?" * len(member_ids))
+        for studio in requested:
+            existing = conn.execute(
+                f"""SELECT COUNT(*) AS n FROM member_studios
+                    WHERE LOWER(studio) = ? AND position = ?
+                      AND member_id NOT IN ({placeholders})""",
+                [studio, POSITION_LEADER, *member_ids],
+            ).fetchone()["n"]
+            if existing:
+                raise ValueError(f"{studio} 已有部长，不能重复指定")
+
+    def set_members_studio(self, member_ids: Iterable[int], studio: str) -> int:
+        """兼容单工作室调用：批量替换为一个工作室并锁定。"""
+        return self.set_members_studios(member_ids, [studio])
+
+    def set_member_studios(
+        self,
+        member_id: int,
+        studios: Iterable[str],
+        positions: dict[str, str] | None = None,
+    ) -> None:
+        """手工设置成员的全部工作室和职位并锁定，重导花名册不会覆盖。"""
+        self.set_members_studios([member_id], studios, positions)
+
     def set_member_studio(self, member_id: int, studio: str) -> None:
-        """手工修改工作室后锁定，后续重导花名册不会覆盖。"""
-        self.set_members_studio([member_id], studio)
+        """兼容单工作室调用。"""
+        self.set_member_studios(member_id, [studio])
 
     def update_member_profile(
         self,
@@ -551,6 +791,7 @@ class Database:
                    LEFT JOIN courses c ON c.member_id = m.id
                    GROUP BY m.id ORDER BY m.id"""
             ).fetchall()
+            membership_map = self._member_memberships_map(conn)
             return [Member(
                 id=r["id"], name=r["name"], student_id=r["student_id"],
                 term=r["term"], class_name=r["class_name"], major=r["major"],
@@ -559,6 +800,13 @@ class Database:
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
                 studio=r["studio"],
                 studio_locked=bool(r["studio_locked"]),
+                studios=[studio for studio, _position in membership_map.get(
+                    r["id"], [(r["studio"] or UNKNOWN_STUDIO, "")])],
+                studio_positions={
+                    studio: position
+                    for studio, position in membership_map.get(
+                        r["id"], [(r["studio"] or UNKNOWN_STUDIO, "")])
+                },
             ) for r in rows]
 
     def set_members_participation(self, settings: dict[int, bool]) -> None:
@@ -583,6 +831,8 @@ class Database:
     def get_member(self, member_id: int) -> Member | None:
         with self._connection() as conn:
             r = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
+            memberships = self._member_memberships_map(conn).get(
+                r["id"], [(r["studio"] or UNKNOWN_STUDIO, "")]) if r else []
             return Member(
                 id=r["id"], name=r["name"], student_id=r["student_id"], term=r["term"],
                 class_name=r["class_name"], major=r["major"], department=r["department"],
@@ -590,6 +840,10 @@ class Database:
                 participates_in_scheduling=bool(r["participates_in_scheduling"]),
                 studio=r["studio"],
                 studio_locked=bool(r["studio_locked"]),
+                studios=[studio for studio, _position in memberships],
+                studio_positions={
+                    studio: position for studio, position in memberships
+                },
             ) if r else None
 
     # ---------- 课程 ----------

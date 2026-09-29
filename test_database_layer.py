@@ -309,11 +309,13 @@ def test_batch_studio_update_locks_each_member(tmp_path: Path) -> None:
     db = new_db(tmp_path)
     member_ids = add_members(db, ["甲", "乙", "丙"])
 
-    assert db.set_members_studio(member_ids[:2], "图片工作室") == 2
+    assert db.set_members_studios(
+        member_ids[:2], ["图片工作室", "设计工作室"]) == 2
 
     members = {member.name: member for member in db.list_members()}
     assert members["甲"].studio == "图片工作室"
-    assert members["乙"].studio == "图片工作室"
+    assert members["甲"].studios == ["图片工作室", "设计工作室"]
+    assert members["乙"].studios == ["图片工作室", "设计工作室"]
     assert members["甲"].studio_locked is True
     assert members["丙"].studio == "未指定工作室"
 
@@ -346,3 +348,17 @@ def test_profile_update_preserves_related_records_and_checks_duplicate(
 
     with pytest.raises(ValueError, match="已存在"):
         db.update_member_profile(other_id, name="甲同学", student_id="1001")
+
+
+def test_single_department_leader_is_enforced(tmp_path: Path) -> None:
+    db = new_db(tmp_path)
+    first, second = add_members(db, ["甲", "乙"])
+    db.set_member_studios(first, ["短视频工作室"], {"短视频工作室": "部长"})
+
+    with pytest.raises(ValueError, match="已有部长"):
+        db.set_member_studios(
+            second, ["短视频工作室"], {"短视频工作室": "部长"})
+
+    db.set_member_studios(
+        second, ["短视频工作室"], {"短视频工作室": "副部长"})
+    assert db.get_member(second).studio_positions == {"短视频工作室": "副部长"}

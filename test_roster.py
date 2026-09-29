@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -46,19 +47,31 @@ def test_roster_classification_and_manual_transfer_are_persistent(
     assert db.get_member(member_id).studio == UNKNOWN_STUDIO
 
     count, changed = db.replace_roster([
-        RosterEntry(studio="短视频工作室", name="甲同学", student_id="20250001"),
+        RosterEntry(studio="短视频工作室", position="部长",
+                    name="甲同学", student_id="20250001"),
+        RosterEntry(studio="图片工作室", position="副部长",
+                    name="甲同学", student_id="20250001"),
         RosterEntry(studio="未在课表名单中", name="乙同学", student_id="20250002"),
     ])
-    assert (count, changed) == (2, 1)
-    assert db.get_member(member_id).studio == "短视频工作室"
+    assert (count, changed) == (3, 1)
+    assert db.get_member(member_id).studios == [
+        "短视频工作室", "图片工作室"
+    ]
+    assert db.get_member(member_id).studio_positions == {
+        "短视频工作室": "部长", "图片工作室": "副部长"}
 
-    db.set_member_studio(member_id, "图片工作室")
+    db.set_member_studios(
+        member_id, ["设计工作室", "微信工作室"],
+        {"设计工作室": "副部长", "微信工作室": "成员"})
     db.replace_roster([
         RosterEntry(studio="短视频工作室", name="甲同学", student_id="20250001"),
     ])
     member = db.get_member(member_id)
     assert member is not None
-    assert member.studio == "图片工作室"
+    assert member.studio == "设计工作室"
+    assert member.studios == ["设计工作室", "微信工作室"]
+    assert member.studio_positions == {
+        "设计工作室": "副部长", "微信工作室": "成员"}
     assert member.studio_locked is True
 
     unknown_id = db.upsert_member(ParsedSchedule(
@@ -72,10 +85,10 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     db = Database(tmp_path / "test.db")
     db.replace_roster([
         RosterEntry(
-            studio="短视频工作室", position="成员", name="已在名单",
+            studio="短视频工作室", position="部长", name="已在名单",
             student_id="20250001", phone="13800000000",
             college_major="计算机学院软件工程"),
-        # 同一学号在花名册中第二次出现可表示转组；完整导出只保留一条当前归属。
+        # 同一学号在花名册中第二次出现表示兼任；完整导出合并全部工作室。
         RosterEntry(
             studio="图片工作室", position="成员", name="已在名单",
             student_id="20250001"),
@@ -106,8 +119,9 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     uploaded = frame[frame["姓名"] == "已在名单"].iloc[0]
     assert uploaded["是否已上传课表"] == "是"
     assert uploaded["课程数"] == 1
-    assert uploaded["工作室"] == "短视频工作室"
+    assert uploaded["工作室"] == "短视频工作室（部长）、图片工作室（成员）"
     unknown = frame[frame["姓名"] == "未录入同学"].iloc[0]
+    assert uploaded["职位"] == "短视频工作室：部长；图片工作室：成员"
     assert unknown["工作室"] == UNKNOWN_STUDIO
 
     output = export_roster_excel(entries, members, db.get_courses())
@@ -116,3 +130,29 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     assert wb["课表明细"].max_row == 2
     assert wb["课表明细"].cell(2, 4).value == "数据库"
     assert db.get_member(member_id) is not None
+
+
+def test_existing_single_studio_database_migrates_to_multi_studio(tmp_path: Path) -> None:
+    """老库升级后，应根据花名册恢复同一成员的全部工作室归属。"""
+    path = tmp_path / "legacy.db"
+    db = Database(path)
+    member_id = db.upsert_member(ParsedSchedule(
+        name="兼岗同学", student_id="20250001", courses=[]))
+    db.replace_roster([
+        RosterEntry(studio="短视频工作室", position="部长",
+                    name="兼岗同学", student_id="20250001"),
+        RosterEntry(studio="设计工作室", position="副部长",
+                    name="兼岗同学", student_id="20250001"),
+    ])
+
+    conn = sqlite3.connect(path)
+    conn.execute("DELETE FROM member_studios")
+    conn.execute("PRAGMA user_version = 5")
+    conn.commit()
+    conn.close()
+
+    upgraded = Database(path).get_member(member_id)
+    assert upgraded is not None
+    assert upgraded.studios == ["短视频工作室", "设计工作室"]
+    assert upgraded.studio_positions == {
+        "短视频工作室": "部长", "设计工作室": "副部长"}

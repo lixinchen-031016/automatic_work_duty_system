@@ -9,6 +9,24 @@ from pathlib import Path
 from typing import Any
 
 UNKNOWN_STUDIO = "未指定工作室"
+POSITION_LEADER = "部长"
+POSITION_DEPUTY = "副部长"
+POSITION_MEMBER = "成员"
+POSITION_SENIOR_ADVISOR = "高级顾问"
+POSITION_OPTIONS = (
+    "", POSITION_LEADER, POSITION_DEPUTY, POSITION_MEMBER,
+    POSITION_SENIOR_ADVISOR,
+)
+
+
+def position_options_for_studio(studio: str) -> tuple[str, ...]:
+    """运营工作室支持高级顾问；其他工作室使用标准职位集合。"""
+    if (studio or "").strip() == "运营工作室":
+        return POSITION_OPTIONS
+    return tuple(
+        position for position in POSITION_OPTIONS
+        if position != POSITION_SENIOR_ADVISOR
+    )
 # 空闲时段总览的业务分组顺序与界面下拉框保持一致。
 AVAILABILITY_BUSINESS_GROUPS = (
     ("微信", ("微信工作室",)),

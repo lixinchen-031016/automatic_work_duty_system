@@ -138,6 +138,29 @@ def build_gap_df(diagnoses: list) -> pd.DataFrame:
 
 
 
+def _member_studio_text(member: Member) -> str:
+    studios = getattr(member, "studios", None) or []
+    positions = getattr(member, "studio_positions", {}) or {}
+    labels = [
+        f"{studio}（{positions[studio]}）" if positions.get(studio) else studio
+        for studio in studios
+    ]
+    return "、".join(labels) or member.studio or UNKNOWN_STUDIO
+
+
+def _member_position_text(member: Member) -> str:
+    studios = getattr(member, "studios", None) or []
+    positions = getattr(member, "studio_positions", {}) or {}
+    values = [
+        (studio, positions.get(studio, "")) for studio in studios
+    ]
+    if len(values) == 1:
+        return values[0][1]
+    return "；".join(
+        f"{studio}：{position or '未指定'}" for studio, position in values
+    )
+
+
 def _member_match_index(
     members: list[Member],
 ) -> tuple[dict[tuple[str, str], Member], dict[str, list[Member]], dict[str, list[Member]]]:
@@ -199,12 +222,15 @@ def build_roster_df(
         if member is not None:
             matched_member_ids.add(member.id)
         studio = (
-            member.studio if member is not None and member.studio
+            _member_studio_text(member) if member is not None
             else entry.studio or UNKNOWN_STUDIO
         )
         rows.append({
             "工作室": studio,
-            "职位": entry.position,
+            "职位": (
+                _member_position_text(member) if member is not None
+                else entry.position
+            ),
             "姓名": member.name if member is not None else entry.name,
             "学号": member.student_id if member is not None else entry.student_id,
             "电话": entry.phone,
@@ -225,7 +251,7 @@ def build_roster_df(
         if member.id in matched_member_ids:
             continue
         rows.append({
-            "工作室": member.studio or UNKNOWN_STUDIO,
+            "工作室": _member_studio_text(member),
             "职位": "",
             "姓名": member.name,
             "学号": member.student_id,
@@ -255,7 +281,7 @@ def build_roster_course_df(
         if member is None:
             continue
         rows.append({
-            "工作室": member.studio or UNKNOWN_STUDIO,
+            "工作室": _member_studio_text(member),
             "学号": member.student_id,
             "姓名": member.name,
             "课程名称": course.course_name,

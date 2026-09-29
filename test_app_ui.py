@@ -1035,6 +1035,7 @@ def test_gantt_business_group_selector_filters_members(window, qt_app) -> None:
         ("短视频成员", "1004", "短视频工作室"),
         ("图片成员", "1005", "图片工作室"),
         ("运营成员", "1006", "运营工作室"),
+        ("兼岗成员", "1007", "短视频工作室"),
     ):
         window.db.upsert_member(ParsedSchedule(
             name=name, student_id=student_id, courses=[]))
@@ -1047,6 +1048,8 @@ def test_gantt_business_group_selector_filters_members(window, qt_app) -> None:
             ("短视频成员", "1004", "短视频工作室"),
             ("图片成员", "1005", "图片工作室"),
             ("运营成员", "1006", "运营工作室"),
+            ("兼岗成员", "1007", "短视频工作室"),
+            ("兼岗成员", "1007", "设计工作室"),
         )
     ])
     window.invalidate_cache()
@@ -1059,14 +1062,15 @@ def test_gantt_business_group_selector_filters_members(window, qt_app) -> None:
     assert window.gantt_group.currentText() == "图片/短视频"
     assert {m.name for m in window.scheduling_members()} == {
         "微信成员", "博q成员", "设计成员",
-        "短视频成员", "图片成员", "运营成员"}
-    assert set(window.gantt_matrix.member_names) == {"短视频成员", "图片成员"}
+        "短视频成员", "图片成员", "运营成员", "兼岗成员"}
+    assert set(window.gantt_matrix.member_names) == {
+        "短视频成员", "图片成员", "兼岗成员"}
 
     expected = {
         "微信": {"微信成员"},
         "博q": {"博q成员"},
-        "设计": {"设计成员"},
-        "图片/短视频": {"短视频成员", "图片成员"},
+        "设计": {"设计成员", "兼岗成员"},
+        "图片/短视频": {"短视频成员", "图片成员", "兼岗成员"},
     }
     for group_name, names in expected.items():
         window.gantt_group.setCurrentIndex(window.gantt_group.findText(group_name))
@@ -1083,12 +1087,15 @@ def test_batch_edit_studio_dialog_updates_checked_members(window, qt_app) -> Non
         dialog = qt_app.activeModalWidget()
         assert isinstance(dialog, QDialog)
         member_list = dialog.findChild(QListWidget)
-        assert member_list is not None
+        studio_selector = dialog.findChild(QTableWidget)
+        assert member_list is not None and studio_selector is not None
         member_list.item(0).setCheckState(Qt.Checked)
         member_list.item(2).setCheckState(Qt.Checked)
-        studio_combo = dialog.findChild(QComboBox)
-        assert studio_combo is not None
-        studio_combo.setCurrentText("图片工作室")
+        studio_row = next(
+            row for row in range(studio_selector.rowCount())
+            if studio_selector.item(row, 1).text() == "图片工作室")
+        studio_selector.item(studio_row, 0).setCheckState(Qt.Checked)
+        studio_selector.cellWidget(studio_row, 2).setCurrentText("副部长")
         save_button = next(
             button for button in dialog.findChildren(QPushButton)
             if button.text() == "保存")
@@ -1099,6 +1106,7 @@ def test_batch_edit_studio_dialog_updates_checked_members(window, qt_app) -> Non
 
     members = {member.id: member for member in window.members()}
     assert members[member_ids[0]].studio == "图片工作室"
+    assert members[member_ids[0]].studio_positions["图片工作室"] == "副部长"
     assert members[member_ids[1]].studio == "未指定工作室"
     assert members[member_ids[2]].studio == "图片工作室"
     assert members[member_ids[0]].studio_locked is True
@@ -1114,17 +1122,24 @@ def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
         dialog = qt_app.activeModalWidget()
         assert isinstance(dialog, QDialog)
         edits = dialog.findChildren(QLineEdit)
-        # 可编辑工作室下拉框内部也包含一个 QLineEdit。
-        assert len(edits) >= 6
+        assert len(edits) >= 7
         edits[0].setText("新姓名")
         edits[1].setText("9001")
         edits[2].setText("新班级")
         edits[3].setText("2027-2028-1")
         edits[4].setText("新专业")
         edits[5].setText("新学院")
-        studio_combo = dialog.findChild(QComboBox)
-        assert studio_combo is not None
-        studio_combo.setCurrentText("短视频工作室")
+        studio_selector = dialog.findChild(QTableWidget)
+        assert studio_selector is not None
+        for row in range(studio_selector.rowCount()):
+            studio_selector.item(row, 0).setCheckState(Qt.Unchecked)
+        positions = {"短视频工作室": "部长", "图片工作室": "成员"}
+        for studio, position in positions.items():
+            row = next(
+                row for row in range(studio_selector.rowCount())
+                if studio_selector.item(row, 1).text() == studio)
+            studio_selector.item(row, 0).setCheckState(Qt.Checked)
+            studio_selector.cellWidget(row, 2).setCurrentText(position)
         save_button = next(
             button for button in dialog.findChildren(QPushButton)
             if button.text() == "保存")
@@ -1139,5 +1154,7 @@ def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
         "新姓名", "9001", "新班级")
     assert (updated.term, updated.major, updated.department) == (
         "2027-2028-1", "新专业", "新学院")
-    assert updated.studio == "短视频工作室"
+    assert set(updated.studios) == {"短视频工作室", "图片工作室"}
+    assert updated.studio_positions == {
+        "短视频工作室": "部长", "图片工作室": "成员"}
     assert len(window.db.get_courses(member.id)) == original_course_count
