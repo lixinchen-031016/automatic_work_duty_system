@@ -1026,29 +1026,54 @@ def test_gantt_renders_long_term_special_arrangement(window, qt_app) -> None:
     assert item.background().color().name() == "#e5d8ff"
 
 
-def test_gantt_filter_keeps_only_short_video_and_image_studios(window, qt_app) -> None:
-    """导入花名册后，空闲总览只显示短视频和图片工作室，排班名单不变。"""
+def test_gantt_business_group_selector_filters_members(window, qt_app) -> None:
+    """空闲总览按业务分组切换，默认图片/短视频且不影响排班名单。"""
     for name, student_id, studio in (
-        ("短视频成员", "1001", "短视频工作室"),
-        ("图片成员", "1002", "图片工作室"),
-        ("运营成员", "1003", "运营工作室"),
+        ("微信成员", "1001", "微信工作室"),
+        ("博q成员", "1002", "博Q工作室"),
+        ("设计成员", "1003", "设计工作室"),
+        ("短视频成员", "1004", "短视频工作室"),
+        ("图片成员", "1005", "图片工作室"),
+        ("运营成员", "1006", "运营工作室"),
     ):
         window.db.upsert_member(ParsedSchedule(
             name=name, student_id=student_id, courses=[]))
     window.db.replace_roster([
-        RosterEntry(studio="短视频工作室", name="短视频成员", student_id="1001"),
-        RosterEntry(studio="图片工作室", name="图片成员", student_id="1002"),
-        RosterEntry(studio="运营工作室", name="运营成员", student_id="1003"),
+        RosterEntry(studio=studio, name=name, student_id=student_id)
+        for name, student_id, studio in (
+            ("微信成员", "1001", "微信工作室"),
+            ("博q成员", "1002", "博Q工作室"),
+            ("设计成员", "1003", "设计工作室"),
+            ("短视频成员", "1004", "短视频工作室"),
+            ("图片成员", "1005", "图片工作室"),
+            ("运营成员", "1006", "运营工作室"),
+        )
     ])
     window.invalidate_cache()
     window.refresh_members()
+    window.tabs.setCurrentIndex(4)
 
+    assert [window.gantt_group.itemText(i)
+            for i in range(window.gantt_group.count())] == [
+        "微信", "博q", "设计", "图片/短视频"]
+    assert window.gantt_group.currentText() == "图片/短视频"
     assert {m.name for m in window.scheduling_members()} == {
+        "微信成员", "博q成员", "设计成员",
         "短视频成员", "图片成员", "运营成员"}
-    assert {m.name for m in window.gantt_members()} == {"短视频成员", "图片成员"}
-    assert window.gantt_matrix is not None
     assert set(window.gantt_matrix.member_names) == {"短视频成员", "图片成员"}
 
+    expected = {
+        "微信": {"微信成员"},
+        "博q": {"博q成员"},
+        "设计": {"设计成员"},
+        "图片/短视频": {"短视频成员", "图片成员"},
+    }
+    for group_name, names in expected.items():
+        window.gantt_group.setCurrentIndex(window.gantt_group.findText(group_name))
+        qt_app.processEvents()
+        assert {m.name for m in window.gantt_members()} == names
+        assert window.gantt_matrix is not None
+        assert set(window.gantt_matrix.member_names) == names
 
 def test_batch_edit_studio_dialog_updates_checked_members(window, qt_app) -> None:
     seed_members(window, 3)

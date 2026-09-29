@@ -106,6 +106,7 @@ from duty_system.parser import (
 )
 from duty_system.rendering import BarChart, render_charts_png, render_table_png
 from duty_system.roster import (
+    AVAILABILITY_BUSINESS_GROUPS,
     TARGET_AVAILABILITY_STUDIOS,
     UNKNOWN_STUDIO,
     parse_roster_file,
@@ -283,13 +284,25 @@ class MainWindow(QMainWindow):
         return [m for m in self.members() if m.participates_in_scheduling]
 
     def gantt_members(self) -> list:
-        """空闲总览目标成员；导入花名册后仅显示短视频和图片工作室。"""
+        """空闲总览目标成员；导入花名册后按当前业务分组筛选。"""
         members = self.scheduling_members()
         if not self.roster_entries():
             # 老数据未导入花名册时保持原有全量展示，避免升级后页面突然为空。
             return members
-        targets = set(TARGET_AVAILABILITY_STUDIOS)
-        return [m for m in members if (m.studio or UNKNOWN_STUDIO) in targets]
+        studios = self.gantt_group.currentData()
+        targets = {
+            str(studio).casefold()
+            for studio in (studios or TARGET_AVAILABILITY_STUDIOS)
+        }
+        return [
+            m for m in members
+            if (m.studio or UNKNOWN_STUDIO).casefold() in targets
+        ]
+
+    def gantt_group_label(self) -> str:
+        if hasattr(self, "gantt_group"):
+            return self.gantt_group.currentText()
+        return AVAILABILITY_BUSINESS_GROUPS[-1][0]
 
     def roster_entries(self) -> list:
         if self._roster_cache is None:
@@ -590,6 +603,7 @@ class MainWindow(QMainWindow):
         self.btn_calendar.setAccessibleName("管理学期日历")
         self.btn_generate.setAccessibleName("生成排班表")
         self.btn_clear_schedule.setAccessibleName("清空排班")
+        self.gantt_group.setAccessibleName("空闲时段业务分组")
         self.tabs.setAccessibleName("排班功能页签")
         self.app_status_label.setAccessibleName("当前状态")
         self.brand_logo.setAccessibleName("成都工业学院校徽")
@@ -1080,6 +1094,15 @@ class MainWindow(QMainWindow):
         gantt_title.setObjectName("pageTitle")
         v5.addWidget(gantt_title)
         ctl = QHBoxLayout()
+        ctl.addWidget(QLabel("业务分组"))
+        self.gantt_group = QComboBox()
+        for group_name, studios in AVAILABILITY_BUSINESS_GROUPS:
+            self.gantt_group.addItem(group_name, studios)
+        self.gantt_group.setCurrentIndex(len(AVAILABILITY_BUSINESS_GROUPS) - 1)
+        self.gantt_group.setToolTip("按业务线筛选并查看对应成员的空闲时段")
+        self.gantt_group.currentIndexChanged.connect(self._on_gantt_filter_changed)
+        ctl.addWidget(self.gantt_group)
+        ctl.addSpacing(8)
         ctl.addWidget(QLabel("查看周次"))
         self.gantt_week = QSpinBox()
         self.gantt_week.setRange(1, 25)
@@ -2245,9 +2268,8 @@ class MainWindow(QMainWindow):
             self.gantt_table.setColumnCount(0)
             if all_member_count and not members and self.roster_entries():
                 self.gantt_hint.setText(
-                    "空闲时段总览仅显示短视频工作室和图片工作室成员。"
-                    "当前没有这两个工作室的参与成员；如归属有误，请在成员列表使用"
-                    "「修改工作室…」调整。")
+                    f"当前业务分组“{self.gantt_group_label()}”没有参与成员。"
+                    "请切换业务分组，或到成员列表使用「修改工作室…」检查归属。")
             elif all_member_count and not members:
                 self.gantt_hint.setText(
                     "当前没有参与排班的成员；请通过菜单「排班 → 设置参与排班…」"
@@ -2278,12 +2300,13 @@ class MainWindow(QMainWindow):
                 f" {BLOCK_LABELS[column.block].split(' ')[0]}"
                 for column in all_free)
             self.gantt_hint.setText(
-                f"第{matrix.week}周全员空闲时段共 {len(all_free)} 个（橙色高亮行）：{text}。"
+                f"当前分组“{self.gantt_group_label()}”：第{matrix.week}周全员空闲时段"
+                f"共 {len(all_free)} 个（橙色高亮行）：{text}。"
                 "适合安排需要全员参加的任务。")
         else:
             self.gantt_hint.setText(
-                f"第{matrix.week}周没有全员空闲的时段；汇总列为各时段空闲人数，"
-                "选择空闲人数最多的时段最容易凑齐人。")
+                f"当前分组“{self.gantt_group_label()}”：第{matrix.week}周没有全员空闲的时段；"
+                "汇总列为各时段空闲人数，选择空闲人数最多的时段最容易凑齐人。")
         self.btn_export_gantt.setEnabled(True)
 
     @staticmethod
@@ -2422,8 +2445,11 @@ class MainWindow(QMainWindow):
         m = self.gantt_matrix
         if m is None:
             return
+        group = self.gantt_group_label().replace("/", "-")
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出空闲时段总览 Excel", f"空闲时段总览_第{m.week}周.xlsx", "Excel 文件 (*.xlsx)")
+            self, "导出空闲时段总览 Excel",
+            f"空闲时段总览_{group}_第{m.week}周.xlsx",
+            "Excel 文件 (*.xlsx)")
         if not path:
             return
         target = Path(path)

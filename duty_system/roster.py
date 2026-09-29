@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 UNKNOWN_STUDIO = "未指定工作室"
-TARGET_AVAILABILITY_STUDIOS = ("短视频工作室", "图片工作室")
+# 空闲时段总览的业务分组顺序与界面下拉框保持一致。
+AVAILABILITY_BUSINESS_GROUPS = (
+    ("微信", ("微信工作室",)),
+    ("博q", ("博Q工作室",)),
+    ("设计", ("设计工作室",)),
+    ("图片/短视频", ("图片工作室", "短视频工作室")),
+)
+TARGET_AVAILABILITY_STUDIOS = AVAILABILITY_BUSINESS_GROUPS[-1][1]
 
 _STUDIO_ALIASES = {"工作室", "部门", "所属工作室", "所属部门"}
 _POSITION_ALIASES = {"职位", "职务", "岗位"}
