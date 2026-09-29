@@ -126,7 +126,19 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
 
     output = export_roster_excel(entries, members, db.get_courses())
     wb = pytest.importorskip("openpyxl").load_workbook(io.BytesIO(output))
-    assert wb.sheetnames == ["完整花名册", "课表明细"]
+    assert wb.sheetnames == ["完整花名册", "课表状态", "课表明细"]
+    ws = wb["完整花名册"]
+    assert ws["A1"].value == "全媒体中心花名册"
+    assert "A1:F1" in {str(cell_range) for cell_range in ws.merged_cells.ranges}
+    assert [ws.cell(2, column).value for column in range(1, 7)] == [
+        "工作室", "职位", "姓名", "学号", "电话", "学院+专业"]
+    assert ws.max_column == 6
+    assert ws["A3"].value == "短视频工作室"
+    assert ws["B3"].value == "部长"
+    assert ws["C3"].value == "已在名单"
+    assert ws["A4"].value == "图片工作室"
+    assert ws["B4"].value == "成员"
+    assert ws.freeze_panes == "A3"
     assert wb["课表明细"].max_row == 2
     assert wb["课表明细"].cell(2, 4).value == "数据库"
     assert db.get_member(member_id) is not None

@@ -298,19 +298,211 @@ def build_roster_course_df(
     return pd.DataFrame(rows, columns=columns)
 
 
+def _roster_format_groups(
+    entries: list[RosterEntry],
+    members: list[Member],
+) -> list[tuple[str, list[dict]]]:
+    """按上传花名册顺序与工作室分组构建六列导出行。"""
+    indexes = _member_match_index(members)
+    groups: dict[str, list[dict]] = {}
+    studio_order: list[str] = []
+    seen: set[tuple] = set()
+    metadata: dict[tuple[int, str], RosterEntry] = {}
+
+    def ensure_studio(studio: str) -> None:
+        if studio not in groups:
+            groups[studio] = []
+            studio_order.append(studio)
+
+    for entry in entries:
+        studio = entry.studio or UNKNOWN_STUDIO
+        ensure_studio(studio)
+        member = _match_member(entry, indexes)
+        if member is None:
+            identity = (
+                "id", normalize_student_id(entry.student_id)
+            ) if normalize_student_id(entry.student_id) else (
+                "name", normalize_name(entry.name)
+            )
+            key = (studio.casefold(), identity)
+            if key in seen:
+                continue
+            seen.add(key)
+            groups[studio].append({
+                "studio": studio,
+                "position": entry.position,
+                "name": entry.name,
+                "student_id": entry.student_id,
+                "phone": entry.phone,
+                "college_major": entry.college_major,
+            })
+            continue
+
+        member_studios = getattr(member, "studios", None) or []
+        current_studio = next(
+            (value for value in member_studios
+             if value.casefold() == studio.casefold()),
+            None,
+        )
+        if current_studio is None:
+            continue
+        key = (member.id, studio.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        metadata[(member.id, studio.casefold())] = entry
+        positions = getattr(member, "studio_positions", {}) or {}
+        groups[studio].append({
+            "studio": current_studio,
+            "position": positions.get(current_studio, ""),
+            "name": member.name,
+            "student_id": member.student_id,
+            "phone": entry.phone,
+            "college_major": (
+                entry.college_major
+                or f"{member.department}{member.major}".strip()
+            ),
+        })
+
+    # 名单外上传成员或后续手工新增的工作室归属追加到对应分组末尾。
+    for member in members:
+        positions = getattr(member, "studio_positions", {}) or {}
+        for studio in getattr(member, "studios", None) or []:
+            key = (member.id, studio.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            ensure_studio(studio)
+            roster_entry = metadata.get(key)
+            groups[studio].append({
+                "studio": studio,
+                "position": positions.get(studio, ""),
+                "name": member.name,
+                "student_id": member.student_id,
+                "phone": roster_entry.phone if roster_entry else "",
+                "college_major": (
+                    roster_entry.college_major if roster_entry
+                    else f"{member.department}{member.major}".strip()
+                ),
+            })
+
+    return [
+        (studio, groups[studio])
+        for studio in studio_order
+        if groups.get(studio)
+    ]
+
+def _write_uploaded_roster_sheet(
+    ws,
+    entries: list[RosterEntry],
+    members: list[Member],
+) -> None:
+    """把主表写成与上传花名册一致的结构与视觉版式。"""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    title = "全媒体中心花名册"
+    headers = ["工作室", "职位", "姓名", "学号", "电话", "学院+专业"]
+    ws.merge_cells("A1:F1")
+    ws["A1"] = title
+    ws["A1"].font = Font(bold=True, size=16)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for column, header in enumerate(headers, 1):
+        cell = ws.cell(2, column, header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    row_index = 3
+    for studio, rows in _roster_format_groups(entries, members):
+        studio_start = row_index
+        position_start = row_index
+        previous_position = None
+        for item in rows:
+            values = [
+                item["studio"], item["position"], item["name"],
+                item["student_id"], item["phone"], item["college_major"],
+            ]
+            for column, value in enumerate(values, 1):
+                cell = ws.cell(row_index, column, value)
+                cell.border = border
+                cell.alignment = Alignment(
+                    horizontal="center" if column in (1, 2, 4) else "left",
+                    vertical="center",
+                    wrap_text=column == 6,
+                )
+            position = item["position"]
+            if previous_position is not None and position != previous_position:
+                if row_index - 1 > position_start:
+                    ws.merge_cells(
+                        start_row=position_start, start_column=2,
+                        end_row=row_index - 1, end_column=2)
+                position_start = row_index
+            previous_position = position
+            row_index += 1
+
+        if row_index - 1 > studio_start:
+            ws.merge_cells(
+                start_row=studio_start, start_column=1,
+                end_row=row_index - 1, end_column=1)
+        if row_index - 1 > position_start:
+            ws.merge_cells(
+                start_row=position_start, start_column=2,
+                end_row=row_index - 1, end_column=2)
+
+    for column, width in enumerate([18, 12, 12, 16, 16, 34], 1):
+        ws.column_dimensions[get_column_letter(column)].width = width
+    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[2].height = 24
+    ws.freeze_panes = "A3"
+
+
+def _write_dataframe_sheet(ws, frame: pd.DataFrame, title: str) -> None:
+    """把 DataFrame 写入工作表并应用统一表头与自适应布局。"""
+    from openpyxl.styles import Font, PatternFill
+
+    ws.title = title
+    ws.append([str(column) for column in frame.columns])
+    for row in frame.itertuples(index=False, name=None):
+        ws.append(list(row))
+    fit_excel_layout(ws, header_rows=1, min_row_height=24.0)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="4472C4")
+    ws.freeze_panes = "A2"
+
+
 def export_roster_excel(
     entries: list[RosterEntry],
     members: list[Member],
     courses: list[CourseRecord],
 ) -> bytes:
-    """导出完整花名册与课表明细。"""
+    """导出上传花名册同版式主表、课表状态和课程明细。"""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    roster_sheet = workbook.active
+    roster_sheet.title = "完整花名册"
+    _write_uploaded_roster_sheet(roster_sheet, entries, members)
+
+    _write_dataframe_sheet(
+        workbook.create_sheet(),
+        build_roster_df(entries, members),
+        "课表状态",
+    )
+    _write_dataframe_sheet(
+        workbook.create_sheet(),
+        build_roster_course_df(members, courses),
+        "课表明细",
+    )
+
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        build_roster_df(entries, members).to_excel(
-            writer, sheet_name="完整花名册", index=False)
-        build_roster_course_df(members, courses).to_excel(
-            writer, sheet_name="课表明细", index=False)
-        _beautify(writer)
+    workbook.save(buf)
     return buf.getvalue()
 
 def build_stats_df(member_stats: dict[int, dict]) -> pd.DataFrame:
