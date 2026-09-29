@@ -220,3 +220,29 @@ def test_roster_import_preview_supports_per_member_decisions(
         ("短视频工作室", "副部长"), ("图片工作室", "成员")]
     assert updates[0].phone == "13900139000"
     assert updates[0].positions["短视频工作室"] == "副部长"
+
+
+def test_roster_import_ignores_format_only_differences(tmp_path: Path) -> None:
+    """空格、大小写、电话分隔符等格式差异不算冲突。"""
+    db = Database(tmp_path / "same.db")
+    db.replace_roster([
+        RosterEntry(
+            studio="博Q工作室", position="成员", name="甲同学",
+            student_id="20250001", phone="13800000000",
+            college_major="计算机学院 软件工程"),
+    ])
+    db.upsert_member(ParsedSchedule(
+        name="甲同学", student_id="20250001", class_name="软件1班",
+        major="软件工程", department="计算机学院", courses=[]))
+    incoming = [
+        RosterEntry(
+            studio="博q工作室", position=" 成员 ", name=" 甲同学 ",
+            student_id=" 20250001 ", phone="138-0000-0000",
+            college_major="计算机学院软件工程"),
+    ]
+
+    records = build_roster_import_preview(
+        db.list_roster_entries(), incoming, db.list_members())
+
+    assert len(records) == 1
+    assert records[0].changed is False

@@ -336,6 +336,27 @@ def _profile_fields(
     }
 
 
+def _canonical_fields(fields: dict[str, str]) -> tuple[str, str, str, str]:
+    """用于判断资料是否真正变化，忽略空格、大小写与电话格式差异。"""
+    phone_digits = re.sub(r"\D", "", normalize_text(fields.get("phone", "")))
+    return (
+        normalize_name(fields.get("name", "")),
+        normalize_student_id(fields.get("student_id", "")).casefold(),
+        phone_digits,
+        re.sub(r"\s+", "", normalize_text(fields.get("college_major", ""))),
+    )
+
+
+def _canonical_studios(studios: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(
+        (
+            normalize_name(studio).casefold(),
+            normalize_name(position).casefold(),
+        )
+        for studio, position in studios.items()
+    ))
+
+
 def _profile_text(fields: dict[str, str], studios: dict[str, str]) -> str:
     lines = [
         f"姓名：{fields.get('name') or '（空）'}",
@@ -410,8 +431,8 @@ def build_roster_import_preview(
         changed = (
             not has_current
             or not has_incoming
-            or current_fields != incoming_fields
-            or current_studios != incoming_studios
+            or _canonical_fields(current_fields) != _canonical_fields(incoming_fields)
+            or _canonical_studios(current_studios) != _canonical_studios(incoming_studios)
         )
         if not has_current:
             kind = "新增"
