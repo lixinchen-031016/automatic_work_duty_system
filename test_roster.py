@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import io
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from duty_system.database import Database
-from duty_system.exporter import build_roster_df, export_roster_excel
+from duty_system.exporter import (
+    build_roster_course_df,
+    build_roster_df,
+    export_roster_excel,
+)
 from duty_system.parser import Course, ParsedSchedule
 from duty_system.roster import (
     UNKNOWN_STUDIO,
@@ -132,7 +137,7 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     assert uploaded["是否已上传课表"] == "是"
     assert uploaded["课程数"] == 1
     assert uploaded["电话"] == "13900139000"
-    assert uploaded["工作室"] == "短视频工作室（部长）、图片工作室（成员）"
+    assert uploaded["工作室"] == "短视频工作室、图片工作室"
     unknown = frame[frame["姓名"] == "未录入同学"].iloc[0]
     assert uploaded["职位"] == "短视频工作室：部长；图片工作室：成员"
     assert unknown["工作室"] == UNKNOWN_STUDIO
@@ -156,6 +161,127 @@ def test_complete_roster_export_merges_roster_and_uploaded_members(
     assert wb["课表明细"].max_row == 2
     assert wb["课表明细"].cell(2, 4).value == "数据库"
     assert db.get_member(member_id) is not None
+
+
+def test_complete_roster_export_repairs_missing_id_duplicates_and_filename(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "test.db")
+    db.replace_roster([
+        RosterEntry(
+            studio="微信工作室", position="成员", name="兼名同学",
+            student_id="20250009", phone="13800000009",
+            college_major="计算机学院软件工程"),
+        # 同一工作室的同一条记录重复导入时，导出结果只能出现一次。
+        RosterEntry(
+            studio="微信工作室", position="成员", name="兼名同学",
+            student_id="20250009", phone="13800000009",
+            college_major="计算机学院软件工程"),
+    ])
+    member_id = db.upsert_member(ParsedSchedule(
+        name="兼名同学", student_id="", term="2026-2027-1",
+        class_name="软件1班", major="软件工程", department="计算机学院",
+        file_name="ѧ�����˿α�_20250009.xls",
+        courses=[Course(
+            course_name="数据库", weekday=1, weeks_text="1-16",
+            week_list=list(range(1, 17)), sessions_text="01-02",
+            session_list=[1, 2])],
+    ))
+
+    entries = db.list_roster_entries()
+    members = db.list_members()
+    frame = build_roster_df(entries, members)
+    assert len(frame) == 1
+    row = frame.iloc[0]
+    assert row["工作室"] == "微信工作室"
+    assert row["学号"] == "20250009"
+    assert row["课表文件"] == "学生个人课表_20250009.xls"
+
+    detail = build_roster_course_df(members, db.get_courses(), entries)
+    assert len(detail) == 1
+    assert detail.iloc[0]["工作室"] == "微信工作室"
+    assert detail.iloc[0]["学号"] == "20250009"
+
+    output = export_roster_excel(entries, members, db.get_courses())
+    wb = pytest.importorskip("openpyxl").load_workbook(io.BytesIO(output))
+    assert wb["完整花名册"].max_row == 3
+    assert wb["完整花名册"]["A3"].value == "微信工作室"
+    assert wb["完整花名册"]["D3"].value == "20250009"
+    assert wb["课表状态"]["D2"].value == "20250009"
+    assert wb["课表状态"]["J2"].value == "学生个人课表_20250009.xls"
+    assert wb["课表明细"]["B2"].value == "20250009"
+    assert db.get_member(member_id) is not None
+
+
+def test_complete_roster_export_merges_duplicate_member_records(
+    tmp_path: Path,
+) -> None:
+    """旧库存在有学号和无学号的同名成员时，三张导出表都不能重复。"""
+    db = Database(tmp_path / "test.db")
+    db.replace_roster([
+        RosterEntry(
+            studio="短视频工作室", position="成员", name="重复同学",
+            student_id="20250010", phone="13800000010"),
+    ])
+    member_id = db.upsert_member(ParsedSchedule(
+        name="重复同学", student_id="20250010", term="2026-2027-1",
+        class_name="广电1班", major="数字媒体技术", department="数智设计学院",
+        file_name="重复同学.xls",
+        courses=[Course(
+            course_name="数据库", weekday=1, weeks_text="1-16",
+            week_list=list(range(1, 17)), sessions_text="01-02",
+            session_list=[1, 2])],
+    ))
+    members = db.list_members()
+    courses = db.get_courses()
+    duplicate = replace(
+        members[0], id=member_id + 100, student_id="", file_name="重复同学课表.xls")
+    duplicate_course = replace(
+        courses[0], id=courses[0].id + 100, member_id=duplicate.id)
+
+    output = export_roster_excel(
+        db.list_roster_entries(), [*members, duplicate], [*courses, duplicate_course])
+    wb = pytest.importorskip("openpyxl").load_workbook(io.BytesIO(output))
+    assert wb["完整花名册"].max_row == 3
+    assert wb["课表状态"].max_row == 2
+    assert wb["课表状态"]["D2"].value == "20250010"
+    assert wb["课表明细"].max_row == 2
+    assert wb["课表明细"]["B2"].value == "20250010"
+
+
+def test_complete_roster_orders_each_studio_by_position(tmp_path: Path) -> None:
+    """主表每个工作室按部长、副部长、成员/高级顾问的顺序展示。"""
+    db = Database(tmp_path / "test.db")
+    db.replace_roster([
+        RosterEntry(
+            studio="短视频工作室", position="成员", name="成员甲",
+            student_id="20250021"),
+        RosterEntry(
+            studio="短视频工作室", position="高级顾问", name="顾问甲",
+            student_id="20250022"),
+        RosterEntry(
+            studio="短视频工作室", position="副部长", name="副部乙",
+            student_id="20250023"),
+        RosterEntry(
+            studio="短视频工作室", position="部长", name="部长甲",
+            student_id="20250024"),
+        RosterEntry(
+            studio="短视频工作室", position="副部长", name="副部甲",
+            student_id="20250025"),
+    ])
+
+    output = export_roster_excel(
+        db.list_roster_entries(), db.list_members(), db.get_courses())
+    wb = pytest.importorskip("openpyxl").load_workbook(io.BytesIO(output))
+    ws = wb["完整花名册"]
+    positions = []
+    for row in range(3, 8):
+        value = ws.cell(row, 2).value
+        positions.append(value if value is not None else positions[-1])
+    assert positions == [
+        "部长", "副部长", "副部长", "成员", "高级顾问"]
+    assert [ws.cell(row, 3).value for row in range(3, 8)] == [
+        "部长甲", "副部乙", "副部甲", "成员甲", "顾问甲"]
 
 
 def test_existing_single_studio_database_migrates_to_multi_studio(tmp_path: Path) -> None:

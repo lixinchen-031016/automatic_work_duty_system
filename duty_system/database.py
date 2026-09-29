@@ -329,6 +329,7 @@ class Database:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            self._coalesce_member_identities(conn)
             # v6 迁移后按花名册重建多工作室归属；已手工锁定的成员保持原样。
             self._sync_member_studios(conn)
 
@@ -458,6 +459,176 @@ class Database:
         if normalized_id and by_student.get(normalized_id):
             return by_student[normalized_id]
         return by_name.get(normalize_name(name), "")
+
+    @staticmethod
+    def _coalesce_member_identities(conn: sqlite3.Connection) -> int:
+        """合并同一成员的“无学号/有学号”历史重复记录。
+
+        旧版本按“学号+姓名”精确匹配。教务文件名没有学号时会先以空学号建成员，
+        之后再上传带学号的文件就会多出一条记录。这里按花名册和现有成员信息补学号，
+        再把重复记录的课程、值班、请假、特殊安排和工作室归属迁移到保留记录。
+        """
+        rows = conn.execute(
+            """SELECT m.*,
+                      (SELECT COUNT(*) FROM courses c
+                       WHERE c.member_id = m.id) AS course_count
+               FROM members m ORDER BY m.id"""
+        ).fetchall()
+        if not rows:
+            return 0
+
+        roster_ids_by_name: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT name, student_id FROM roster_entries"
+        ).fetchall():
+            name = normalize_name(row["name"])
+            student_id = normalize_student_id(row["student_id"])
+            if name and student_id:
+                roster_ids_by_name.setdefault(name, set()).add(student_id)
+
+        member_ids_by_name: dict[str, set[str]] = {}
+        for row in rows:
+            name = normalize_name(row["name"])
+            student_id = normalize_student_id(row["student_id"])
+            if name and student_id:
+                member_ids_by_name.setdefault(name, set()).add(student_id)
+
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            name_key = normalize_name(row["name"])
+            student_id = normalize_student_id(row["student_id"])
+            if not student_id:
+                member_ids = member_ids_by_name.get(name_key, set())
+                if len(member_ids) == 1:
+                    student_id = next(iter(member_ids))
+                elif not member_ids:
+                    roster_ids = roster_ids_by_name.get(name_key, set())
+                    if len(roster_ids) == 1:
+                        student_id = next(iter(roster_ids))
+            key = ("id", student_id) if student_id else ("name", name_key)
+            grouped.setdefault(key, []).append(row)
+
+        merged = 0
+        for group in grouped.values():
+            if len(group) > 1:
+                Database._merge_member_group(conn, group)
+                merged += len(group) - 1
+        return merged
+
+    @staticmethod
+    def _merge_member_group(
+        conn: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+    ) -> None:
+        """把重复成员记录合并到信息最完整的一条，并迁移全部关联数据。"""
+        canonical = max(
+            rows,
+            key=lambda row: (
+                bool(normalize_student_id(row["student_id"])),
+                int(row["course_count"] or 0),
+                -int(row["id"]),
+            ),
+        )
+        duplicates = [row for row in rows if row["id"] != canonical["id"]]
+        if not duplicates:
+            return
+
+        for duplicate in duplicates:
+            for membership in conn.execute(
+                "SELECT studio, position FROM member_studios WHERE member_id = ?",
+                (duplicate["id"],),
+            ).fetchall():
+                existing = conn.execute(
+                    """SELECT position FROM member_studios
+                       WHERE member_id = ? AND studio = ?""",
+                    (canonical["id"], membership["studio"]),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """INSERT INTO member_studios (member_id, studio, position)
+                           VALUES (?, ?, ?)""",
+                        (canonical["id"], membership["studio"],
+                         membership["position"]),
+                    )
+                elif not existing["position"] and membership["position"]:
+                    conn.execute(
+                        """UPDATE member_studios SET position = ?
+                           WHERE member_id = ? AND studio = ?""",
+                        (membership["position"], canonical["id"],
+                         membership["studio"]),
+                    )
+            conn.execute(
+                """INSERT OR IGNORE INTO courses
+                   (member_id, course_name, teacher, weekday, weeks_text,
+                    week_list, sessions_text, session_list, location)
+                   SELECT ?, course_name, teacher, weekday, weeks_text,
+                          week_list, sessions_text, session_list, location
+                   FROM courses WHERE member_id = ?""",
+                (canonical["id"], duplicate["id"]),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO duty_assignments
+                   (week, weekday, block, member_id, created_at)
+                   SELECT week, weekday, block, ?, created_at
+                   FROM duty_assignments WHERE member_id = ?""",
+                (canonical["id"], duplicate["id"]),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO leaves
+                   (member_id, week, weekday, reason, created_at)
+                   SELECT ?, week, weekday, reason, created_at
+                   FROM leaves WHERE member_id = ?""",
+                (canonical["id"], duplicate["id"]),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO special_arrangements
+                   (member_id, week_start, week_end, weekday, session_list,
+                    reason, created_at, updated_at)
+                   SELECT ?, week_start, week_end, weekday, session_list,
+                          reason, created_at, updated_at
+                   FROM special_arrangements WHERE member_id = ?""",
+                (canonical["id"], duplicate["id"]),
+            )
+            for table in (
+                "courses", "duty_assignments", "leaves",
+                "special_arrangements", "member_studios",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE member_id = ?",
+                    (duplicate["id"],),
+                )
+            conn.execute("DELETE FROM members WHERE id = ?", (duplicate["id"],))
+
+        def first_value(key: str) -> str:
+            return next(
+                (str(row[key] or "") for row in [canonical, *duplicates]
+                 if str(row[key] or "").strip()),
+                "",
+            )
+
+        conn.execute(
+            """UPDATE members
+               SET student_id = ?, name = ?, term = ?, class_name = ?, major = ?,
+                   department = ?, file_name = ?, phone = ?, studio = ?,
+                   studio_locked = ?, participates_in_scheduling = ?
+               WHERE id = ?""",
+            (
+                first_value("student_id"),
+                first_value("name"),
+                first_value("term"),
+                first_value("class_name"),
+                first_value("major"),
+                first_value("department"),
+                first_value("file_name"),
+                first_value("phone"),
+                first_value("studio"),
+                1 if any(int(row["studio_locked"] or 0)
+                         for row in [canonical, *duplicates]) else 0,
+                1 if all(int(row["participates_in_scheduling"] or 0)
+                         for row in [canonical, *duplicates]) else 0,
+                canonical["id"],
+            ),
+        )
 
     @staticmethod
     def _normalize_studios(studios: Iterable[str]) -> list[str]:
@@ -608,18 +779,74 @@ class Database:
         return changed
 
     def upsert_member(self, schedule: ParsedSchedule) -> int:
-        """新增或更新成员（按 学号+姓名 唯一），并整体替换其课程。"""
+        """新增或更新成员，并整体替换其课程。
+
+        上传文件名可能没有学号；此时优先使用花名册中的学号，避免同一个成员
+        因一次带学号、一次不带学号而分裂成两条记录。
+        """
         with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, studio, studio_locked FROM members "
-                "WHERE student_id = ? AND name = ?",
-                (schedule.student_id, schedule.name),
-            ).fetchone()
+            self._coalesce_member_identities(conn)
+            effective_student_id = normalize_student_id(schedule.student_id)
+            name_key = normalize_name(schedule.name)
+            candidate_rows = [
+                row for row in conn.execute(
+                    """SELECT id, name, student_id, studio, studio_locked
+                       FROM members ORDER BY id"""
+                ).fetchall()
+                if normalize_name(row["name"]) == name_key
+            ]
+
+            if effective_student_id:
+                row = next(
+                    (candidate for candidate in candidate_rows
+                     if normalize_student_id(candidate["student_id"])
+                     == effective_student_id),
+                    None,
+                )
+                if row is None:
+                    blank_rows = [
+                        candidate for candidate in candidate_rows
+                        if not normalize_student_id(candidate["student_id"])
+                    ]
+                    if len(blank_rows) == 1:
+                        row = blank_rows[0]
+            else:
+                row = next(
+                    (candidate for candidate in candidate_rows
+                     if not normalize_student_id(candidate["student_id"])),
+                    None,
+                )
+                if row is None and len(candidate_rows) == 1:
+                    row = candidate_rows[0]
+                if row is not None:
+                    effective_student_id = normalize_student_id(row["student_id"])
+
+            if not effective_student_id:
+                member_ids = {
+                    normalize_student_id(candidate["student_id"])
+                    for candidate in candidate_rows
+                    if normalize_student_id(candidate["student_id"])
+                }
+                if len(member_ids) == 1:
+                    effective_student_id = next(iter(member_ids))
+                else:
+                    roster_ids = {
+                        normalize_student_id(roster_row["student_id"])
+                        for roster_row in conn.execute(
+                            "SELECT name, student_id FROM roster_entries"
+                        ).fetchall()
+                        if normalize_name(roster_row["name"]) == name_key
+                        and normalize_student_id(roster_row["student_id"])
+                    }
+                    if len(roster_ids) == 1:
+                        effective_student_id = next(iter(roster_ids))
+
             lookup = self._roster_studio_lookup(conn)
             roster_phone = self._resolve_roster_phone(
-                self._roster_phone_lookup(conn), schedule.student_id, schedule.name)
+                self._roster_phone_lookup(conn), effective_student_id,
+                schedule.name)
             resolved_memberships = self._resolve_memberships(
-                lookup, schedule.student_id, schedule.name)
+                lookup, effective_student_id, schedule.name)
             existing_memberships = self._member_memberships_map(conn)
             if row:
                 member_id = row["id"]
@@ -634,11 +861,12 @@ class Database:
                 conn.execute(
                     """UPDATE members SET term = ?, class_name = ?, major = ?,
                        department = ?, file_name = ?, studio = ?,
+                       student_id = ?,
                        phone = CASE WHEN phone = '' THEN ? ELSE phone END
                        WHERE id = ?""",
                     (schedule.term, schedule.class_name, schedule.major,
                      schedule.department, schedule.file_name, primary_studio,
-                     roster_phone, member_id),
+                     effective_student_id, roster_phone, member_id),
                 )
                 conn.execute("DELETE FROM courses WHERE member_id = ?", (member_id,))
             else:
@@ -647,7 +875,7 @@ class Database:
                        (student_id, name, term, class_name, major, department,
                         file_name, studio, phone)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (schedule.student_id, schedule.name, schedule.term,
+                    (effective_student_id, schedule.name, schedule.term,
                      schedule.class_name, schedule.major, schedule.department,
                      schedule.file_name, resolved_memberships[0][0], roster_phone),
                 )
@@ -694,6 +922,7 @@ class Database:
                     entry.row_number,
                 ) for entry in rows],
             )
+            self._coalesce_member_identities(conn)
             changed = self._sync_member_studios(conn)
         return len(rows), changed
 

@@ -261,6 +261,110 @@ def test_upsert_replaces_courses_and_cascades(tmp_path: Path) -> None:
     assert db.list_special_arrangements() == [], "删除成员应级联清理特殊安排"
 
 
+def test_upsert_without_id_reuses_roster_member(tmp_path: Path) -> None:
+    """上传文件名缺学号时，应使用花名册学号更新原成员而不是新增副本。"""
+    from duty_system.parser import Course
+    from duty_system.roster import RosterEntry
+
+    db = new_db(tmp_path)
+    db.replace_roster([
+        RosterEntry(
+            studio="图片工作室", position="成员", name="兼名同学",
+            student_id="20250009", phone="13800000009"),
+    ])
+    first_id = db.upsert_member(ParsedSchedule(
+        name="兼名同学", student_id="20250009", file_name="学生课表.xls",
+        courses=[Course(
+            course_name="数据库", weekday=1, weeks_text="1-16",
+            week_list=list(range(1, 17)), sessions_text="01-02",
+            session_list=[1, 2])],
+    ))
+    second_id = db.upsert_member(ParsedSchedule(
+        name="兼名同学", student_id="", file_name="兼名同学课表.xls",
+        courses=[Course(
+            course_name="数据库", weekday=1, weeks_text="1-16",
+            week_list=list(range(1, 17)), sessions_text="01-02",
+            session_list=[1, 2])],
+    ))
+
+    members = db.list_members()
+    assert second_id == first_id
+    assert len(members) == 1
+    assert members[0].student_id == "20250009"
+    assert members[0].studios == ["图片工作室"]
+    assert len(db.get_courses(first_id)) == 1
+
+
+def test_legacy_duplicate_members_are_merged_and_related_data_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """旧库已有有/无学号两条成员时，重开数据库应合并并保留关联数据。"""
+    from duty_system.roster import RosterEntry
+
+    path = tmp_path / "legacy_duplicate.db"
+    db = Database(path)
+    db.replace_roster([
+        RosterEntry(
+            studio="图片工作室", position="成员", name="合并同学",
+            student_id="20250011", phone="13800000011"),
+    ])
+    conn = sqlite3.connect(path)
+    with_id = conn.execute(
+        """INSERT INTO members
+           (student_id, name, file_name, studio, phone)
+           VALUES ('20250011', '合并同学', '有学号.xls', '图片工作室', '')"""
+    ).lastrowid
+    without_id = conn.execute(
+        """INSERT INTO members
+           (student_id, name, file_name, studio, phone)
+           VALUES ('', '合并同学', '无学号.xls', '图片工作室', '')"""
+    ).lastrowid
+    conn.executemany(
+        """INSERT INTO member_studios (member_id, studio, position)
+           VALUES (?, '图片工作室', ?)""",
+        [(with_id, '成员'), (without_id, '')],
+    )
+    conn.executemany(
+        """INSERT INTO courses
+           (member_id, course_name, weekday, weeks_text, week_list,
+            sessions_text, session_list)
+           VALUES (?, ?, 1, '1', '[1]', '01-02', '[1, 2]')""",
+        [
+            (with_id, "数据库"),
+            (without_id, "数据库"),
+            (without_id, "传播学"),
+        ],
+    )
+    conn.execute(
+        """INSERT INTO duty_assignments (week, weekday, block, member_id)
+           VALUES (1, 1, 1, ?)""",
+        (without_id,),
+    )
+    conn.execute(
+        """INSERT INTO leaves (member_id, week, weekday, reason)
+           VALUES (?, 1, 1, '事假')""",
+        (without_id,),
+    )
+    conn.execute(
+        """INSERT INTO special_arrangements
+           (member_id, week_start, week_end, weekday, session_list, reason)
+           VALUES (?, 2, 4, 1, '[1, 2]', '固定安排')""",
+        (without_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    upgraded = Database(path)
+    members = upgraded.list_members()
+    assert len(members) == 1
+    assert members[0].student_id == "20250011"
+    assert {course.course_name for course in upgraded.get_courses()} == {
+        "数据库", "传播学"}
+    assert len(upgraded.load_assignments()) == 1
+    assert len(upgraded.list_leaves()) == 1
+    assert len(upgraded.list_special_arrangements()) == 1
+
+
 def test_special_arrangement_crud_is_normalized_and_idempotent(tmp_path: Path) -> None:
     """长期特殊安排支持新增、覆盖、编辑、查询和删除，节次会规范化排序。"""
     db = new_db(tmp_path)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 import io
 from collections import defaultdict
+from dataclasses import replace
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -148,6 +150,139 @@ def _member_studio_text(member: Member) -> str:
     return "、".join(labels) or member.studio or UNKNOWN_STUDIO
 
 
+def _member_studio_names(member: Member) -> str:
+    """成员的工作室名称，不附加职位，供结构化导出表使用。"""
+    studios = getattr(member, "studios", None) or []
+    return "、".join(studios) or member.studio or UNKNOWN_STUDIO
+
+
+def _entry_identity(entry: RosterEntry) -> tuple[str, str]:
+    """用于去重的花名册身份：优先学号，缺学号时退回姓名。"""
+    student_id = normalize_student_id(entry.student_id)
+    if student_id:
+        return "id", student_id
+    return "name", normalize_name(entry.name)
+
+
+def _clean_export_file_name(file_name: str, student_id: str = "") -> str:
+    """修复历史导入产生的乱码课表文件名，避免继续导出到用户文件中。"""
+    value = (file_name or "").strip()
+    if not value:
+        return ""
+    if "�" not in value and "ѧ" not in value:
+        return value
+    normalized_id = normalize_student_id(student_id)
+    if not normalized_id:
+        return value
+    suffix = Path(value).suffix or ".xls"
+    return f"学生个人课表_{normalized_id}{suffix}"
+
+
+def _member_export_key(
+    member: Member,
+    roster_ids_by_name: dict[str, set[str]],
+) -> tuple[str, str]:
+    """成员的导出身份：优先使用成员或花名册中的唯一学号。"""
+    student_id = normalize_student_id(member.student_id)
+    if not student_id:
+        roster_ids = roster_ids_by_name.get(normalize_name(member.name), set())
+        if len(roster_ids) == 1:
+            student_id = next(iter(roster_ids))
+    if student_id:
+        return "id", student_id
+    return "name", normalize_name(member.name)
+
+
+def _normalize_roster_export_data(
+    entries: list[RosterEntry],
+    members: list[Member],
+    courses: list[CourseRecord],
+) -> tuple[list[Member], list[CourseRecord]]:
+    """为导出合并历史重复成员，并按逻辑成员去重课程记录。"""
+    roster_ids_by_name: dict[str, set[str]] = defaultdict(set)
+    for entry in entries:
+        student_id = normalize_student_id(entry.student_id)
+        name = normalize_name(entry.name)
+        if student_id and name:
+            roster_ids_by_name[name].add(student_id)
+
+    groups: dict[tuple[str, str], list[Member]] = {}
+    for member in members:
+        key = _member_export_key(member, roster_ids_by_name)
+        groups.setdefault(key, []).append(member)
+
+    member_id_map: dict[int, int] = {}
+    normalized_members: list[Member] = []
+    for key, group in groups.items():
+        canonical = max(
+            group,
+            key=lambda member: (
+                bool(normalize_student_id(member.student_id)),
+                member.course_count,
+                -member.id,
+            ),
+        )
+        merged = replace(canonical)
+        merged.student_id = (
+            normalize_student_id(canonical.student_id)
+            or (key[1] if key[0] == "id" else "")
+        )
+        for field_name in (
+            "name", "term", "class_name", "major", "department",
+            "file_name", "phone", "studio",
+        ):
+            value = next(
+                (str(getattr(member, field_name) or "").strip()
+                 for member in group
+                 if str(getattr(member, field_name) or "").strip()),
+                "",
+            )
+            setattr(merged, field_name, value)
+        merged.studio_locked = any(member.studio_locked for member in group)
+        merged.participates_in_scheduling = all(
+            member.participates_in_scheduling for member in group)
+
+        studios: list[str] = []
+        positions: dict[str, str] = {}
+        for member in group:
+            for studio in member.studios or [member.studio]:
+                if studio and studio.casefold() not in {
+                    value.casefold() for value in studios
+                }:
+                    studios.append(studio)
+            for studio, position in (member.studio_positions or {}).items():
+                if position and not positions.get(studio):
+                    positions[studio] = position
+        merged.studios = studios or [merged.studio or UNKNOWN_STUDIO]
+        merged.studio_positions = positions
+        merged.course_count = 0
+        normalized_members.append(merged)
+
+        for member in group:
+            member_id_map[member.id] = canonical.id
+
+    normalized_courses: list[CourseRecord] = []
+    seen_courses: set[tuple] = set()
+    course_counts: dict[int, int] = defaultdict(int)
+    for course in courses:
+        member_id = member_id_map.get(course.member_id)
+        if member_id is None:
+            continue
+        key = (
+            member_id, course.course_name, course.teacher, course.weekday,
+            course.weeks_text, course.sessions_text, course.location,
+        )
+        if key in seen_courses:
+            continue
+        seen_courses.add(key)
+        normalized_courses.append(replace(course, member_id=member_id))
+        course_counts[member_id] += 1
+
+    for member in normalized_members:
+        member.course_count = course_counts.get(member.id, 0)
+    return normalized_members, normalized_courses
+
+
 def _member_position_text(member: Member) -> str:
     studios = getattr(member, "studios", None) or []
     positions = getattr(member, "studio_positions", {}) or {}
@@ -159,6 +294,18 @@ def _member_position_text(member: Member) -> str:
     return "；".join(
         f"{studio}：{position or '未指定'}" for studio, position in values
     )
+
+
+def _export_position_rank(position: str) -> int:
+    """完整花名册每个工作室内的展示顺序。"""
+    return {
+        "部长": 0,
+        "主任": 0,
+        "副部长": 1,
+        "副主任": 1,
+        "成员": 2,
+        "高级顾问": 2,
+    }.get((position or "").strip(), 3)
 
 
 def _member_match_index(
@@ -208,22 +355,23 @@ def build_roster_df(
     indexes = _member_match_index(members)
     rows: list[dict] = []
     matched_member_ids: set[int] = set()
-    seen_identities: set[tuple[str, str]] = set()
+    seen_identities: set[tuple[str, int | str]] = set()
     for entry in entries:
-        identity = (
-            "id", normalize_student_id(entry.student_id)
-        ) if normalize_student_id(entry.student_id) else (
-            "name", normalize_name(entry.name)
-        )
+        member = _match_member(entry, indexes)
+        identity = ("member", member.id) if member is not None else _entry_identity(entry)
         if identity in seen_identities:
             continue
         seen_identities.add(identity)
-        member = _match_member(entry, indexes)
         if member is not None:
             matched_member_ids.add(member.id)
         studio = (
-            _member_studio_text(member) if member is not None
+            _member_studio_names(member) if member is not None
             else entry.studio or UNKNOWN_STUDIO
+        )
+        student_id = (
+            member.student_id or entry.student_id
+            if member is not None
+            else entry.student_id
         )
         rows.append({
             "工作室": studio,
@@ -231,8 +379,8 @@ def build_roster_df(
                 _member_position_text(member) if member is not None
                 else entry.position
             ),
-            "姓名": member.name if member is not None else entry.name,
-            "学号": member.student_id if member is not None else entry.student_id,
+            "姓名": (member.name or entry.name) if member is not None else entry.name,
+            "学号": student_id,
             "电话": (
                 member.phone or entry.phone if member is not None
                 else entry.phone
@@ -247,7 +395,10 @@ def build_roster_df(
                 "是" if member is not None and member.participates_in_scheduling
                 else "否" if member is not None else ""
             ),
-            "课表文件": member.file_name if member is not None else "",
+            "课表文件": (
+                _clean_export_file_name(member.file_name, student_id)
+                if member is not None else ""
+            ),
         })
 
     for member in members:
@@ -263,7 +414,7 @@ def build_roster_df(
             "是否已上传课表": "是" if member.course_count else "否",
             "课程数": member.course_count,
             "是否参与排班": "是" if member.participates_in_scheduling else "否",
-            "课表文件": member.file_name,
+            "课表文件": _clean_export_file_name(member.file_name, member.student_id),
         })
     columns = [
         "工作室", "职位", "姓名", "学号", "电话", "学院+专业",
@@ -275,17 +426,28 @@ def build_roster_df(
 def build_roster_course_df(
     members: list[Member],
     courses: list[CourseRecord],
+    entries: list[RosterEntry] | None = None,
 ) -> pd.DataFrame:
     """完整课表明细表：按成员展开课程名、周次、节次与地点。"""
     info = {member.id: member for member in members}
+    entry_by_member: dict[int, RosterEntry] = {}
+    if entries:
+        indexes = _member_match_index(members)
+        for entry in entries:
+            member = _match_member(entry, indexes)
+            if member is not None:
+                entry_by_member.setdefault(member.id, entry)
     rows: list[dict] = []
     for course in courses:
         member = info.get(course.member_id)
         if member is None:
             continue
+        roster_entry = entry_by_member.get(member.id)
         rows.append({
-            "工作室": _member_studio_text(member),
-            "学号": member.student_id,
+            "工作室": _member_studio_names(member),
+            "学号": member.student_id or (
+                roster_entry.student_id if roster_entry is not None else ""
+            ),
             "姓名": member.name,
             "课程名称": course.course_name,
             "教师": course.teacher,
@@ -322,11 +484,7 @@ def _roster_format_groups(
         ensure_studio(studio)
         member = _match_member(entry, indexes)
         if member is None:
-            identity = (
-                "id", normalize_student_id(entry.student_id)
-            ) if normalize_student_id(entry.student_id) else (
-                "name", normalize_name(entry.name)
-            )
+            identity = _entry_identity(entry)
             key = (studio.casefold(), identity)
             if key in seen:
                 continue
@@ -359,7 +517,7 @@ def _roster_format_groups(
             "studio": current_studio,
             "position": positions.get(current_studio, ""),
             "name": member.name,
-            "student_id": member.student_id,
+            "student_id": member.student_id or entry.student_id,
             "phone": member.phone or entry.phone,
             "college_major": (
                 entry.college_major
@@ -391,11 +549,20 @@ def _roster_format_groups(
                 ),
             })
 
-    return [
-        (studio, groups[studio])
-        for studio in studio_order
-        if groups.get(studio)
-    ]
+    ordered_groups: list[tuple[str, list[dict]]] = []
+    for studio in studio_order:
+        rows = groups.get(studio, [])
+        if not rows:
+            continue
+        ordered = sorted(
+            enumerate(rows),
+            key=lambda item: (
+                _export_position_rank(item[1]["position"]),
+                item[0],
+            ),
+        )
+        ordered_groups.append((studio, [item[1] for item in ordered]))
+    return ordered_groups
 
 def _write_uploaded_roster_sheet(
     ws,
@@ -404,7 +571,6 @@ def _write_uploaded_roster_sheet(
 ) -> None:
     """把主表写成与上传花名册一致的结构与视觉版式。"""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
 
     title = "全媒体中心花名册"
     headers = ["工作室", "职位", "姓名", "学号", "电话", "学院+专业"]
@@ -460,8 +626,13 @@ def _write_uploaded_roster_sheet(
                 start_row=position_start, start_column=2,
                 end_row=row_index - 1, end_column=2)
 
-    for column, width in enumerate([18, 12, 12, 16, 16, 34], 1):
-        ws.column_dimensions[get_column_letter(column)].width = width
+    fit_excel_layout(
+        ws,
+        min_widths={1: 18, 2: 12, 3: 12, 4: 16, 5: 16, 6: 34},
+        max_column_width=34,
+        min_row_height=22.0,
+        header_rows=2,
+    )
     ws.row_dimensions[1].height = 28
     ws.row_dimensions[2].height = 24
     ws.freeze_panes = "A3"
@@ -490,6 +661,7 @@ def export_roster_excel(
     """导出上传花名册同版式主表、课表状态和课程明细。"""
     from openpyxl import Workbook
 
+    members, courses = _normalize_roster_export_data(entries, members, courses)
     workbook = Workbook()
     roster_sheet = workbook.active
     roster_sheet.title = "完整花名册"
@@ -502,7 +674,7 @@ def export_roster_excel(
     )
     _write_dataframe_sheet(
         workbook.create_sheet(),
-        build_roster_course_df(members, courses),
+        build_roster_course_df(members, courses, entries),
         "课表明细",
     )
 
