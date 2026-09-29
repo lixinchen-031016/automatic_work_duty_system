@@ -213,3 +213,292 @@ def parse_roster_file(path: str | Path) -> RosterImportResult:
         raise ValueError("花名册中没有可导入的成员记录")
     return RosterImportResult(
         entries=entries, source_file=source.name, warnings=warnings)
+
+
+@dataclass
+class RosterImportRecord:
+    """一次导入中某位成员在“当前/导入”版本之间的比较结果。"""
+
+    key: tuple[str, ...]
+    member_id: int | None
+    display_name: str
+    kind: str
+    changed: bool
+    default_incoming: bool
+    current_text: str
+    incoming_text: str
+    current_entries: list[RosterEntry] = field(default_factory=list)
+    incoming_entries: list[RosterEntry] = field(default_factory=list)
+    current_fields: dict[str, str] = field(default_factory=dict)
+    incoming_fields: dict[str, str] = field(default_factory=dict)
+    current_studios: dict[str, str] = field(default_factory=dict)
+    incoming_studios: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RosterMemberUpdate:
+    """冲突确认后需要显式写回成员表的内容。"""
+
+    member_id: int
+    name: str
+    student_id: str
+    phone: str
+    studios: list[str]
+    positions: dict[str, str]
+
+
+def _entry_identity_key(entry: RosterEntry) -> tuple[str, ...]:
+    student_id = normalize_student_id(entry.student_id)
+    if student_id:
+        return ("id", student_id)
+    return ("name", normalize_name(entry.name))
+
+
+def _member_identity_key(member: object) -> tuple[str, ...]:
+    return ("member", str(member.id))
+
+
+def _member_match_indexes(members: list[object]) -> tuple[dict, dict]:
+    by_pair: dict[tuple[str, str], object] = {}
+    by_student: dict[str, list[object]] = {}
+    by_name: dict[str, list[object]] = {}
+    for member in members:
+        name = normalize_name(getattr(member, "name", ""))
+        student_id = normalize_student_id(getattr(member, "student_id", ""))
+        by_pair[(student_id, name)] = member
+        if student_id:
+            by_student.setdefault(student_id, []).append(member)
+        if name:
+            by_name.setdefault(name, []).append(member)
+    return by_pair, by_student, by_name
+
+
+def _entry_member(entry: RosterEntry, indexes: tuple[dict, dict]) -> object | None:
+    by_pair, by_student, by_name = indexes
+    student_id = normalize_student_id(entry.student_id)
+    name = normalize_name(entry.name)
+    member = by_pair.get((student_id, name))
+    if member is not None:
+        return member
+    if student_id:
+        options = by_student.get(student_id, [])
+        if len(options) == 1:
+            return options[0]
+    options = by_name.get(name, [])
+    return options[0] if len(options) == 1 else None
+
+
+def _entry_studios(entries: list[RosterEntry]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for entry in entries:
+        studio = (entry.studio or UNKNOWN_STUDIO).strip() or UNKNOWN_STUDIO
+        result.setdefault(studio, (entry.position or "").strip())
+    return _strip_unknown_studio(result)
+
+
+def _member_studios(member: object) -> dict[str, str]:
+    studios = list(getattr(member, "studios", None) or [])
+    positions = dict(getattr(member, "studio_positions", None) or {})
+    result = {studio: positions.get(studio, "") for studio in studios}
+    return _strip_unknown_studio(result)
+
+
+def _strip_unknown_studio(studios: dict[str, str]) -> dict[str, str]:
+    if len(studios) <= 1:
+        return studios
+    return {
+        studio: position for studio, position in studios.items()
+        if studio != UNKNOWN_STUDIO
+    }
+
+
+def _profile_fields(
+    entries: list[RosterEntry],
+    member: object | None,
+) -> dict[str, str]:
+    first = entries[0] if entries else None
+    if member is not None:
+        college = (
+            f"{getattr(member, 'department', '')}{getattr(member, 'major', '')}".strip()
+            or (first.college_major if first else "")
+        )
+        return {
+            "name": getattr(member, "name", "") or "",
+            "student_id": getattr(member, "student_id", "") or "",
+            "phone": getattr(member, "phone", "") or "",
+            "college_major": college,
+        }
+    return {
+        "name": first.name if first else "",
+        "student_id": first.student_id if first else "",
+        "phone": first.phone if first else "",
+        "college_major": first.college_major if first else "",
+    }
+
+
+def _profile_text(fields: dict[str, str], studios: dict[str, str]) -> str:
+    lines = [
+        f"姓名：{fields.get('name') or '（空）'}",
+        f"学号：{fields.get('student_id') or '（空）'}",
+        f"手机号：{fields.get('phone') or '（空）'}",
+        f"学院+专业：{fields.get('college_major') or '（空）'}",
+        "工作室与职位：",
+    ]
+    if studios:
+        lines.extend(
+            f"  {studio}：{position or '未指定'}"
+            for studio, position in studios.items()
+        )
+    else:
+        lines.append("  （无）")
+    return "\n".join(lines)
+
+
+def build_roster_import_preview(
+    current_entries: list[RosterEntry],
+    incoming_entries: list[RosterEntry],
+    members: list[object],
+) -> list[RosterImportRecord]:
+    """构建花名册导入预览；不修改数据库。"""
+    indexes = _member_match_indexes(members)
+    groups: dict[tuple[str, ...], dict] = {}
+
+    def group_for(
+        key: tuple[str, ...],
+        *,
+        display_name: str,
+        member: object | None,
+    ) -> dict:
+        group = groups.setdefault(key, {
+            "display_name": display_name,
+            "member": member,
+            "current": [],
+            "incoming": [],
+        })
+        if member is not None:
+            group["member"] = member
+            group["display_name"] = getattr(member, "name", "") or display_name
+        return group
+
+    for entry in current_entries:
+        member = _entry_member(entry, indexes)
+        key = _member_identity_key(member) if member is not None else _entry_identity_key(entry)
+        group_for(key, display_name=entry.name, member=member)["current"].append(entry)
+    for entry in incoming_entries:
+        member = _entry_member(entry, indexes)
+        key = _member_identity_key(member) if member is not None else _entry_identity_key(entry)
+        group_for(key, display_name=entry.name, member=member)["incoming"].append(entry)
+
+    records: list[RosterImportRecord] = []
+    for key, group in groups.items():
+        member = group["member"]
+        current_entries = group["current"]
+        incoming_entries = group["incoming"]
+        current_fields = _profile_fields(current_entries, member)
+        incoming_fields = _profile_fields(incoming_entries, member if not incoming_entries else None)
+        current_studios = (
+            _member_studios(member) if member is not None
+            else _entry_studios(current_entries)
+        )
+        incoming_studios = _entry_studios(incoming_entries)
+        has_current = bool(current_entries) or (
+            member is not None
+            and any(studio != UNKNOWN_STUDIO for studio in current_studios)
+        )
+        has_incoming = bool(incoming_entries)
+
+        changed = (
+            not has_current
+            or not has_incoming
+            or current_fields != incoming_fields
+            or current_studios != incoming_studios
+        )
+        if not has_current:
+            kind = "新增"
+            default_incoming = True
+        elif not has_incoming:
+            kind = "仅当前"
+            default_incoming = False
+        else:
+            kind = "冲突"
+            default_incoming = False
+        records.append(RosterImportRecord(
+            key=key,
+            member_id=getattr(member, "id", None) if member is not None else None,
+            display_name=group["display_name"],
+            kind=kind,
+            changed=changed,
+            default_incoming=default_incoming,
+            current_text=(
+                _profile_text(current_fields, current_studios)
+                if has_current else "（当前花名册中不存在）"
+            ),
+            incoming_text=(
+                _profile_text(incoming_fields, incoming_studios)
+                if has_incoming else "（本次导入文件中不存在）"
+            ),
+            current_entries=current_entries,
+            incoming_entries=incoming_entries,
+            current_fields=current_fields,
+            incoming_fields=incoming_fields,
+            current_studios=current_studios,
+            incoming_studios=incoming_studios,
+        ))
+    return records
+
+
+def merge_roster_import(
+    records: list[RosterImportRecord],
+    decisions: dict[tuple[str, ...], bool],
+) -> tuple[list[RosterEntry], list[RosterMemberUpdate]]:
+    """按冲突选择生成新的花名册记录和成员更新。"""
+    merged: list[RosterEntry] = []
+    updates: list[RosterMemberUpdate] = []
+
+    for record in records:
+        use_incoming = decisions.get(record.key, record.default_incoming)
+        if use_incoming:
+            if not record.incoming_entries:
+                continue
+            source_entries = record.incoming_entries
+            fields = record.incoming_fields
+            studios = record.incoming_studios
+        elif record.current_entries or record.current_studios:
+            source_entries = record.current_entries
+            fields = record.current_fields
+            studios = record.current_studios
+        else:
+            continue
+
+        source_by_studio = {
+            (entry.studio or UNKNOWN_STUDIO).casefold(): entry
+            for entry in source_entries
+        }
+        for index, (studio, position) in enumerate(studios.items()):
+            source = source_by_studio.get(studio.casefold())
+            if source is None and source_entries:
+                source = source_entries[min(index, len(source_entries) - 1)]
+            merged.append(RosterEntry(
+                studio=studio,
+                position=position,
+                name=fields.get("name", ""),
+                student_id=fields.get("student_id", ""),
+                phone=fields.get("phone", ""),
+                college_major=(
+                    source.college_major if source is not None
+                    else fields.get("college_major", "")
+                ),
+                source_file=source.source_file if source is not None else "",
+                row_number=source.row_number if source is not None else 0,
+            ))
+
+        if record.member_id is not None and record.changed:
+            updates.append(RosterMemberUpdate(
+                member_id=record.member_id,
+                name=fields.get("name", ""),
+                student_id=fields.get("student_id", ""),
+                phone=fields.get("phone", ""),
+                studios=list(studios),
+                positions=dict(studios),
+            ))
+    return merged, updates

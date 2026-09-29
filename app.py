@@ -109,6 +109,9 @@ from duty_system.roster import (
     AVAILABILITY_BUSINESS_GROUPS,
     TARGET_AVAILABILITY_STUDIOS,
     UNKNOWN_STUDIO,
+    RosterImportRecord,
+    build_roster_import_preview,
+    merge_roster_import,
     parse_roster_file,
     position_options_for_studio,
 )
@@ -206,6 +209,104 @@ class _Task(QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
         else:
             self.signals.done.emit(result)
+
+
+class RosterImportConflictDialog(QDialog):
+    """花名册导入对照窗口；布局参考 Git 冲突编辑器的双栏比对。"""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        records: list[RosterImportRecord],
+    ) -> None:
+        super().__init__(parent)
+        self.records = [record for record in records if record.changed]
+        self.setWindowTitle("花名册导入对照")
+        self.setMinimumSize(1040, 620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        layout.addWidget(dialog_header(
+            "花名册导入对照",
+            "红色为当前版本，绿色为本次导入版本。逐项选择保留哪一版，"
+            "确认后才会写入数据库。"))
+
+        summary = QHBoxLayout()
+        counts = Counter(record.kind for record in self.records)
+        self.summary_label = QLabel(
+            f"共 {len(self.records)} 项需要确认："
+            f"冲突 {counts.get('冲突', 0)}，新增 {counts.get('新增', 0)}，"
+            f"仅当前保留 {counts.get('仅当前', 0)}")
+        self.summary_label.setObjectName("secondary")
+        summary.addWidget(self.summary_label, stretch=1)
+        btn_all_current = QPushButton("全部保留当前")
+        btn_all_incoming = QPushButton("全部使用导入")
+        summary.addWidget(btn_all_current)
+        summary.addWidget(btn_all_incoming)
+        layout.addLayout(summary)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(
+            ["成员 / 类型", "当前版本", "导入版本", "采用"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setWordWrap(True)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table, stretch=1)
+
+        self.choice_boxes: list[QComboBox] = []
+        for row, record in enumerate(self.records):
+            self.table.insertRow(row)
+            name_item = QTableWidgetItem(
+                f"{record.display_name}\n[{record.kind}]")
+            name_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 0, name_item)
+
+            current_item = QTableWidgetItem(record.current_text)
+            current_item.setBackground(QBrush(QColor("#fff0f0")))
+            current_item.setToolTip(record.current_text)
+            self.table.setItem(row, 1, current_item)
+
+            incoming_item = QTableWidgetItem(record.incoming_text)
+            incoming_item.setBackground(QBrush(QColor("#eefbf3")))
+            incoming_item.setToolTip(record.incoming_text)
+            self.table.setItem(row, 2, incoming_item)
+
+            choice = QComboBox()
+            choice.addItem("保留当前", False)
+            choice.addItem("使用导入", True)
+            choice.setCurrentIndex(1 if record.default_incoming else 0)
+            self.choice_boxes.append(choice)
+            self.table.setCellWidget(row, 3, choice)
+
+            lines = max(
+                record.current_text.count("\n"),
+                record.incoming_text.count("\n"),
+            ) + 1
+            self.table.setRowHeight(row, max(66, lines * 18 + 12))
+
+        def set_all(use_incoming: bool) -> None:
+            for choice in self.choice_boxes:
+                choice.setCurrentIndex(1 if use_incoming else 0)
+
+        btn_all_current.clicked.connect(lambda: set_all(False))
+        btn_all_incoming.clicked.connect(lambda: set_all(True))
+
+        buttons = dialog_buttons("确认导入")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def decisions(self) -> dict[tuple[str, ...], bool]:
+        return {
+            record.key: bool(choice.currentData())
+            for record, choice in zip(self.records, self.choice_boxes, strict=True)
+        }
 
 
 class MainWindow(QMainWindow):
@@ -3166,17 +3267,60 @@ class MainWindow(QMainWindow):
             return
 
         def apply_import(result) -> None:
-            count, changed = self.db.replace_roster(
-                result.entries, result.source_file)
+            records = build_roster_import_preview(
+                self.roster_entries(), result.entries, self.members())
+            changed_records = [record for record in records if record.changed]
+            pending_conflicts = [
+                record for record in changed_records
+                if record.kind != "新增"
+            ]
+            decisions: dict[tuple[str, ...], bool] = {}
+            if self.roster_entries() and pending_conflicts:
+                dialog = RosterImportConflictDialog(self, pending_conflicts)
+                if dialog.exec() != QDialog.Accepted:
+                    self.statusBar().showMessage("已取消花名册导入，原数据未修改。")
+                    return
+                decisions = dialog.decisions()
+
+            merged_entries, member_updates = merge_roster_import(
+                records, decisions)
+            try:
+                count, changed = self.db.replace_roster(
+                    merged_entries, result.source_file)
+                for update in member_updates:
+                    member = self.db.get_member(update.member_id)
+                    if member is None:
+                        continue
+                    self.db.update_member_profile(
+                        update.member_id,
+                        name=update.name,
+                        student_id=update.student_id,
+                        term=member.term,
+                        class_name=member.class_name,
+                        major=member.major,
+                        department=member.department,
+                        phone=update.phone,
+                    )
+                    self.db.set_member_studios(
+                        update.member_id, update.studios, update.positions)
+            except ValueError as exc:
+                QMessageBox.warning(self, "无法导入花名册", str(exc))
+                return
+
             self.invalidate_cache()
             self.refresh_members()
             matched = sum(
                 1 for member in self.members()
                 if any(studio != UNKNOWN_STUDIO
                        for studio in self.member_studios(member)))
+            resolved = len([record for record in changed_records
+                            if decisions.get(record.key, record.default_incoming)])
             message = (
                 f"已导入花名册 {count} 条；自动更新 {changed} 名已上传成员，"
+                f"完成 {len(changed_records)} 项对照确认，"
                 f"当前 {matched} 人已匹配工作室。")
+            if resolved:
+                message += f"采用导入版本 {resolved} 项。"
             self.statusBar().showMessage(message)
             if result.warnings:
                 QMessageBox.information(

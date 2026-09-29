@@ -11,7 +11,13 @@ import pytest
 from duty_system.database import Database
 from duty_system.exporter import build_roster_df, export_roster_excel
 from duty_system.parser import Course, ParsedSchedule
-from duty_system.roster import UNKNOWN_STUDIO, RosterEntry, parse_roster_file
+from duty_system.roster import (
+    UNKNOWN_STUDIO,
+    RosterEntry,
+    build_roster_import_preview,
+    merge_roster_import,
+    parse_roster_file,
+)
 
 
 def test_parse_roster_inherits_merged_studio_and_keeps_blank_student_id(
@@ -176,3 +182,41 @@ def test_existing_single_studio_database_migrates_to_multi_studio(tmp_path: Path
     assert upgraded.studios == ["短视频工作室", "设计工作室"]
     assert upgraded.studio_positions == {
         "短视频工作室": "部长", "设计工作室": "副部长"}
+
+
+def test_roster_import_preview_supports_per_member_decisions(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "preview.db")
+    db.replace_roster([
+        RosterEntry(
+            studio="短视频工作室", position="成员",
+            name="甲同学", student_id="20250001", phone="13800000000"),
+    ])
+    member_id = db.upsert_member(ParsedSchedule(
+        name="甲同学", student_id="20250001", courses=[]))
+    incoming = [
+        RosterEntry(
+            studio="短视频工作室", position="副部长",
+            name="甲同学", student_id="20250001", phone="13900139000"),
+        RosterEntry(
+            studio="图片工作室", position="成员",
+            name="甲同学", student_id="20250001", phone="13900139000"),
+    ]
+
+    records = build_roster_import_preview(
+        db.list_roster_entries(), incoming, db.list_members())
+    assert len(records) == 1
+    assert records[0].kind == "冲突"
+    assert records[0].member_id == member_id
+
+    kept, updates = merge_roster_import(records, {records[0].key: False})
+    assert [(item.studio, item.position) for item in kept] == [
+        ("短视频工作室", "成员")]
+    assert updates[0].phone == "13800000000"
+
+    imported, updates = merge_roster_import(records, {records[0].key: True})
+    assert [(item.studio, item.position) for item in imported] == [
+        ("短视频工作室", "副部长"), ("图片工作室", "成员")]
+    assert updates[0].phone == "13900139000"
+    assert updates[0].positions["短视频工作室"] == "副部长"

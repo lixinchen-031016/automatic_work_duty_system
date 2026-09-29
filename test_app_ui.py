@@ -1160,3 +1160,25 @@ def test_edit_member_profile_dialog_preserves_courses(window, qt_app) -> None:
     assert updated.studio_positions == {
         "短视频工作室": "部长", "图片工作室": "成员"}
     assert len(window.db.get_courses(member.id)) == original_course_count
+
+
+def test_roster_import_conflict_dialog_side_by_side_choices(window, qt_app) -> None:
+    records = [appmod.RosterImportRecord(
+        key=("member", "1"),
+        member_id=1,
+        display_name="兼岗同学",
+        kind="冲突",
+        changed=True,
+        default_incoming=False,
+        current_text="手机号：13800000000",
+        incoming_text="手机号：13900139000",
+    )]
+    dialog = appmod.RosterImportConflictDialog(window, records)
+
+    assert dialog.table.columnCount() == 4
+    assert dialog.table.item(0, 1).text() == "手机号：13800000000"
+    assert dialog.table.item(0, 2).text() == "手机号：13900139000"
+    choice = dialog.table.cellWidget(0, 3)
+    choice.setCurrentIndex(1)
+    assert dialog.decisions() == {("member", "1"): True}
+    dialog.close()
