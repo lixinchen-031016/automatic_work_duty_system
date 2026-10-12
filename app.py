@@ -115,6 +115,7 @@ from duty_system.roster import (
     parse_roster_file,
     position_options_for_studio,
 )
+from duty_system.roster_editor import RosterEditorDialog
 from duty_system.scheduler import (
     ScheduleConfig,
     ScheduleResult,
@@ -331,6 +332,9 @@ class MainWindow(QMainWindow):
         self._specials_cache = None
         self._roster_cache = None
         self._calendar_cache = None
+        # 花名册管理页的待刷新状态（模态页面关闭后统一刷新）
+        self._roster_changed = False
+        self._roster_message = ""
         self._term_calendar_cache: TermCalendar | None = None
         self._calendar_error: str | None = None
         # 忙时表由「成员 + 课程」唯一决定，展开成本高（课程数 x 周次 x 节次），
@@ -571,6 +575,12 @@ class MainWindow(QMainWindow):
         self.action_export_roster.triggered.connect(self.export_roster)
         self.action_export_roster.setEnabled(False)
         file_menu.addAction(self.action_export_roster)
+
+        self.action_manage_roster = QAction("花名册管理…", self)
+        self.action_manage_roster.setToolTip(
+            "打开花名册修改页面：增删改查、按字段匹配查找与筛选")
+        self.action_manage_roster.triggered.connect(self.open_roster_editor)
+        file_menu.addAction(self.action_manage_roster)
         file_menu.addSeparator()
 
         export_menu = file_menu.addMenu("导出当前排班")
@@ -3253,7 +3263,14 @@ class MainWindow(QMainWindow):
             apply_import,
         )
 
-    def import_roster(self) -> None:
+    def import_roster(self, on_done: Callable[[], None] | None = None) -> None:
+        """导入花名册；on_done 供「花名册管理」页面在流程结束后刷新表格。
+
+        Qt 的 triggered / clicked 信号会带一个 checked 参数，这里统一过滤，
+        只接受可调用对象，避免把 False 当成导入完成回调。
+        """
+        if not callable(on_done):
+            on_done = None
         if self.busy:
             self.statusBar().showMessage("上一个任务尚未完成，请稍候…")
             return
@@ -3264,9 +3281,15 @@ class MainWindow(QMainWindow):
             self, "选择全媒体中心花名册", str(start),
             "花名册文件 (*.xlsx *.xls);;所有文件 (*)")
         if not path:
+            if on_done is not None:
+                on_done()
             return
 
         def apply_import(result) -> None:
+            def finish() -> None:
+                if on_done is not None:
+                    on_done()
+
             records = build_roster_import_preview(
                 self.roster_entries(), result.entries, self.members())
             changed_records = [record for record in records if record.changed]
@@ -3279,6 +3302,7 @@ class MainWindow(QMainWindow):
                 dialog = RosterImportConflictDialog(self, pending_conflicts)
                 if dialog.exec() != QDialog.Accepted:
                     self.statusBar().showMessage("已取消花名册导入，原数据未修改。")
+                    finish()
                     return
                 decisions = dialog.decisions()
 
@@ -3305,6 +3329,7 @@ class MainWindow(QMainWindow):
                         update.member_id, update.studios, update.positions)
             except ValueError as exc:
                 QMessageBox.warning(self, "无法导入花名册", str(exc))
+                finish()
                 return
 
             self.invalidate_cache()
@@ -3326,12 +3351,44 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self, "花名册导入完成",
                     message + "\n" + "\n".join(result.warnings))
+            finish()
 
         self.run_async(
             "正在解析花名册",
             lambda: parse_roster_file(path),
             apply_import,
         )
+
+    def open_roster_editor(self) -> None:
+        """打开花名册修改页面：增删改查、筛选与匹配查找。"""
+        self._roster_changed = False
+        self._roster_message = ""
+        dialog = RosterEditorDialog(
+            self,
+            db=self.db,
+            on_changed=self._on_roster_editor_changed,
+            import_callback=self.import_roster,
+            export_callback=self.export_roster,
+        )
+        dialog.exec()
+        if not self._roster_changed:
+            self.statusBar().showMessage("花名册管理已关闭，花名册未修改。")
+            return
+        # 关闭页面时统一刷新一次：成员列表、空闲时段总览与花名册保持一致
+        self.invalidate_cache()
+        self.refresh_members()
+        self.statusBar().showMessage(
+            f"{self._roster_message} 当前共 {len(self.roster_entries())} 条花名册记录。")
+
+    def _on_roster_editor_changed(self, message: str) -> None:
+        """花名册管理页写库后的回调。
+
+        只失效缓存并记录待刷新标记：页面是模态的，此时重建整个主界面既看不到
+        也浪费时间；但缓存必须立即失效，否则页面内的「导出花名册」会读到旧数据。
+        """
+        self._roster_changed = True
+        self._roster_message = message
+        self.invalidate_cache()
 
     def _studio_options(self, *current_values: str) -> list[str]:
         options = set(self.db.roster_studios())

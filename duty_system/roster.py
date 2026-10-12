@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import zipfile
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,8 @@ class RosterEntry:
     college_major: str = ""
     source_file: str = ""
     row_number: int = 0
+    # 数据库主键；仅从数据库读出的记录带 id，新导入/手工新增的记录为 0。
+    entry_id: int = 0
 
 
 @dataclass
@@ -523,3 +526,193 @@ def merge_roster_import(
                 positions=dict(studios),
             ))
     return merged, updates
+
+
+# --------------------------------------------------------------------------
+# 花名册编辑页：字段清洗、匹配查找、筛选与校验
+# --------------------------------------------------------------------------
+
+# 匹配查找的可选查找范围（值与 RosterEntry 字段对应，"all" 表示全部字段）
+ROSTER_SEARCH_SCOPES: tuple[tuple[str, str], ...] = (
+    ("all", "全部字段"),
+    ("name", "姓名"),
+    ("student_id", "学号"),
+    ("phone", "手机号"),
+    ("college_major", "学院+专业"),
+    ("studio", "工作室"),
+    ("position", "职位"),
+)
+
+# 匹配方式：包含（模糊）/ 前缀 / 精确
+ROSTER_MATCH_MODES: tuple[tuple[str, str], ...] = (
+    ("contains", "包含匹配"),
+    ("prefix", "前缀匹配"),
+    ("exact", "精确匹配"),
+)
+
+# 数据完整性筛选
+ROSTER_STATUS_FILTERS: tuple[tuple[str, str], ...] = (
+    ("", "全部记录"),
+    ("missing_student_id", "缺学号"),
+    ("missing_phone", "缺手机号"),
+    ("duplicate", "同工作室重名"),
+    ("leader_conflict", "部长重复"),
+)
+
+_ROSTER_SEARCH_FIELDS = (
+    "name", "student_id", "phone", "college_major", "studio", "position",
+)
+
+
+def normalize_roster_entry(entry: RosterEntry) -> RosterEntry:
+    """清洗一条花名册记录，供写库前统一使用。
+
+    只做无歧义处理：去首尾空白、全角数字转半角、工作室为空时归入默认值；
+    姓名与学院专业保留原始写法（只在首尾去空白），避免改动用户在界面上看到的内容。
+    """
+    return replace(
+        entry,
+        studio=normalize_text(entry.studio) or UNKNOWN_STUDIO,
+        name=normalize_text(entry.name),
+        student_id=normalize_student_id(entry.student_id),
+        position=normalize_text(entry.position),
+        phone=normalize_text(entry.phone),
+        college_major=normalize_text(entry.college_major),
+        source_file=normalize_text(entry.source_file),
+        row_number=int(entry.row_number or 0),
+        entry_id=int(entry.entry_id or 0),
+    )
+
+
+def _match_key(value: Any) -> str:
+    """匹配用归一化：全角转半角、去掉全部空白、统一大小写，忽略无意义的写法差异。"""
+    return re.sub(r"\s+", "", normalize_text(value)).casefold()
+
+
+def roster_entry_fields(entry: RosterEntry) -> dict[str, str]:
+    """返回可参与匹配查找的字段名到值的映射。"""
+    return {field: getattr(entry, field, "") or "" for field in _ROSTER_SEARCH_FIELDS}
+
+
+def match_roster_entry(
+    entry: RosterEntry,
+    query: str,
+    *,
+    scope: str = "all",
+    mode: str = "contains",
+) -> bool:
+    """按查找范围与匹配方式判断记录是否命中关键词。
+
+    空关键词视为全部命中；学号/手机号里的全角数字与空格会先归一化，
+    因此「2025 0001」这类带空格的输入也能匹配到学号 20250001。
+    """
+    needle = _match_key(query)
+    if not needle:
+        return True
+    fields = roster_entry_fields(entry)
+    values = fields.values() if scope == "all" else [fields.get(scope, "")]
+    for value in values:
+        haystack = _match_key(value)
+        if not haystack:
+            continue
+        if mode == "exact" and haystack == needle:
+            return True
+        if mode == "prefix" and haystack.startswith(needle):
+            return True
+        if mode == "contains" and needle in haystack:
+            return True
+    return False
+
+
+def roster_duplicate_keys(entries: Iterable[RosterEntry]) -> set[tuple[str, str]]:
+    """同一工作室下重名的记录键（工作室小写, 姓名归一化）。"""
+    counts: dict[tuple[str, str], int] = {}
+    for entry in entries:
+        key = roster_identity_key(entry)
+        if not key[1]:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
+def roster_identity_key(entry: RosterEntry) -> tuple[str, str]:
+    """(工作室, 姓名) 的归一化键，用于判断重名、兼任与同工作室重复登记。"""
+    return (_match_key(entry.studio), _match_key(entry.name))
+
+
+def roster_leader_conflicts(entries: Iterable[RosterEntry]) -> dict[str, int]:
+    """返回指定了多名部长的工作室及其部长人数（按工作室原名统计）。"""
+    counts: dict[str, int] = {}
+    displays: dict[str, str] = {}
+    for entry in entries:
+        if (entry.position or "").strip() != POSITION_LEADER:
+            continue
+        key = _match_key(entry.studio)
+        counts[key] = counts.get(key, 0) + 1
+        displays.setdefault(key, entry.studio or UNKNOWN_STUDIO)
+    return {
+        displays[key]: count for key, count in counts.items() if count > 1
+    }
+
+
+def filter_roster_entries(
+    entries: Iterable[RosterEntry],
+    *,
+    query: str = "",
+    scope: str = "all",
+    mode: str = "contains",
+    studio: str = "",
+    position: str = "",
+    status: str = "",
+) -> list[RosterEntry]:
+    """按关键词、工作室、职位与数据完整性筛选花名册，保持原顺序。"""
+    rows = list(entries)
+    duplicate_keys = roster_duplicate_keys(rows)
+    leader_conflicts = roster_leader_conflicts(rows)
+    studio_key = _match_key(studio)
+    position_key = _match_key(position)
+    filtered: list[RosterEntry] = []
+    for entry in rows:
+        if studio_key and _match_key(entry.studio) != studio_key:
+            continue
+        if position_key and _match_key(entry.position) != position_key:
+            continue
+        if status == "missing_student_id" and (entry.student_id or "").strip():
+            continue
+        if status == "missing_phone" and (entry.phone or "").strip():
+            continue
+        if status == "duplicate":
+            key = (_match_key(entry.studio), _match_key(entry.name))
+            if (not _match_key(entry.name)) or key not in duplicate_keys:
+                continue
+        if status == "leader_conflict" and (
+                entry.studio or UNKNOWN_STUDIO) not in leader_conflicts:
+            continue
+        if not match_roster_entry(entry, query, scope=scope, mode=mode):
+            continue
+        filtered.append(entry)
+    return filtered
+
+
+def validate_roster_entries(entries: Iterable[RosterEntry]) -> list[str]:
+    """校验花名册，返回面向用户的提示清单（空列表表示没有问题）。"""
+    rows = list(entries)
+    problems: list[str] = []
+    empty_names = sum(1 for entry in rows if not _match_key(entry.name))
+    if empty_names:
+        problems.append(f"有 {empty_names} 条记录姓名为空，请补全后再保存。")
+
+    conflicts = roster_leader_conflicts(rows)
+    for studio, count in sorted(conflicts.items()):
+        problems.append(f"{studio} 指定了 {count} 名部长，同一工作室只能有一名部长。")
+
+    duplicate_keys = roster_duplicate_keys(rows)
+    if duplicate_keys:
+        samples = "、".join(
+            f"{studio or UNKNOWN_STUDIO}·{name}"
+            for studio, name in sorted(duplicate_keys)[:3]
+        )
+        problems.append(
+            f"有 {len(duplicate_keys)} 组同工作室重名记录（如 {samples}），"
+            "确认是否为兼任或重复登记。")
+    return problems

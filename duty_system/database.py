@@ -17,6 +17,7 @@ from .roster import (
     UNKNOWN_STUDIO,
     RosterEntry,
     normalize_name,
+    normalize_roster_entry,
     normalize_student_id,
 )
 
@@ -922,8 +923,7 @@ class Database:
                     entry.row_number,
                 ) for entry in rows],
             )
-            self._coalesce_member_identities(conn)
-            changed = self._sync_member_studios(conn)
+            changed = self._sync_after_roster_change(conn)
         return len(rows), changed
 
     def list_roster_entries(self) -> list[RosterEntry]:
@@ -940,6 +940,7 @@ class Database:
                 college_major=r["college_major"],
                 source_file=r["source_file"],
                 row_number=r["row_number"],
+                entry_id=r["id"],
             ) for r in rows]
 
     def roster_studios(self) -> list[str]:
@@ -949,6 +950,89 @@ class Database:
                 "WHERE TRIM(studio) != '' ORDER BY studio"
             ).fetchall()
             return [row["studio"] for row in rows]
+
+    # ---------- 花名册增删改查（花名册管理页使用） ----------
+
+    _ROSTER_COLUMNS = (
+        "studio, position, name, student_id, phone, college_major, "
+        "source_file, row_number"
+    )
+
+    @classmethod
+    def _roster_values(cls, entry: RosterEntry) -> tuple:
+        clean = normalize_roster_entry(entry)
+        return (
+            clean.studio, clean.position, clean.name, clean.student_id,
+            clean.phone, clean.college_major, clean.source_file,
+            clean.row_number,
+        )
+
+    @classmethod
+    def _sync_after_roster_change(cls, conn: sqlite3.Connection) -> int:
+        """花名册变动后合并成员身份，并按花名册重建未锁定成员的工作室。"""
+        cls._coalesce_member_identities(conn)
+        return cls._sync_member_studios(conn)
+
+    def add_roster_entry(self, entry: RosterEntry) -> int:
+        """新增一条花名册记录，返回新记录 id；随后同步成员工作室归属。"""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                f"""INSERT INTO roster_entries ({self._ROSTER_COLUMNS})
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                self._roster_values(entry),
+            )
+            self._sync_after_roster_change(conn)
+            return int(cursor.lastrowid)
+
+    def update_roster_entry(self, entry_id: int, entry: RosterEntry) -> None:
+        """按 id 覆盖一条花名册记录；记录不存在时抛 ValueError。"""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """UPDATE roster_entries
+                   SET studio = ?, position = ?, name = ?, student_id = ?,
+                       phone = ?, college_major = ?, source_file = ?,
+                       row_number = ?
+                   WHERE id = ?""",
+                (*self._roster_values(entry), int(entry_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("花名册记录不存在或已被删除")
+            self._sync_after_roster_change(conn)
+
+    def delete_roster_entries(self, entry_ids: Iterable[int]) -> int:
+        """按 id 批量删除花名册记录，返回删除条数。"""
+        ids = list(dict.fromkeys(int(entry_id) for entry_id in entry_ids))
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        with self._connection() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM roster_entries WHERE id IN ({placeholders})",
+                ids,
+            )
+            self._sync_after_roster_change(conn)
+            return int(cursor.rowcount)
+
+    def restore_roster_entries(self, entries: Iterable[RosterEntry]) -> int:
+        """整体写回花名册并保留记录 id（供批量保存与撤销/重做使用）。
+
+        entry_id 为 0 的记录按新增处理并分配新 id；返回被同步的成员数。
+        """
+        rows = [normalize_roster_entry(entry) for entry in entries]
+        with self._connection() as conn:
+            conn.execute("DELETE FROM roster_entries")
+            conn.executemany(
+                """INSERT INTO roster_entries
+                   (id, studio, position, name, student_id, phone, college_major,
+                    source_file, row_number)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (row.entry_id or None, *self._roster_values(row))
+                    for row in rows
+                ],
+            )
+            changed = self._sync_after_roster_change(conn)
+        return changed
 
     def set_members_studios(
         self,
