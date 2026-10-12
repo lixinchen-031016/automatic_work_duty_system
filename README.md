@@ -334,7 +334,8 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py   # 只看端到
 | `test_optimality.py` | 用最大流求出覆盖最优值作基准，认证启发式覆盖率 ≥97%，并量化「纯最优覆盖会破坏公平性」 |
 | `test_performance.py` | 关键路径耗时上限（300 人排班、密集修复、甘特矩阵、课表查询、批量写入、界面刷新预算），用于拦截数量级退化 |
 
-`conftest.py` 负责：把仓库根加入 `sys.path`、强制 `QT_QPA_PLATFORM=offscreen`（无显示器也能跑界面测试）、把 `QSettings` 重定向到临时目录（不污染用户真实配置）。
+`conftest.py` 负责：把仓库根加入 `sys.path`、强制 `QT_QPA_PLATFORM=offscreen`（无显示器也能跑界面测试）、把 `QSettings` 重定向到临时目录（不污染用户真实配置）；
+并在会话结束时先关闭并销毁所有残留窗口，再回收 `QApplication`——否则遗留的 Qt 对象会在解释器退出阶段（`QApplication` 已销毁）析构，某些平台会直接 `abort`（SIGABRT）让整个测试进程失败。
 
 CI 中 **测试是打包的前置门禁**：`test` 作业不通过则不会构建/发布任何产物。
 

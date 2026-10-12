@@ -85,6 +85,8 @@ jobs:
       - name: 运行测试
         env:
           QT_QPA_PLATFORM: offscreen
+          # 崩溃（SIGABRT/SIGSEGV）时打印 Python 调用栈，便于定位是哪个用例导致
+          PYTHONFAULTHANDLER: "1"
         run: pytest -q
 
   # ---------------------------------------------------------------------------

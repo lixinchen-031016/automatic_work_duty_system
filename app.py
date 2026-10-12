@@ -3371,6 +3371,8 @@ class MainWindow(QMainWindow):
             export_callback=self.export_roster,
         )
         dialog.exec()
+        # 及时销毁模态窗口，避免它（及其表格/快捷键）留到进程退出阶段才析构
+        dialog.deleteLater()
         if not self._roster_changed:
             self.statusBar().showMessage("花名册管理已关闭，花名册未修改。")
             return

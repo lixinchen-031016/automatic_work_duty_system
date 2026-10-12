@@ -34,6 +34,18 @@ def qt_app(tmp_path_factory):
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     yield app
+    # 会话结束前先回收所有残留的顶层窗口，再让 QApplication 被回收：
+    # 若 Qt 对象留到解释器退出阶段才析构（此时 QApplication 已销毁），
+    # 部分平台（如 Linux + offscreen）会直接 abort 导致整个测试进程失败。
+    for widget in app.topLevelWidgets():
+        try:
+            widget.close()
+            widget.setParent(None)
+            widget.deleteLater()
+        except RuntimeError:
+            # 包装器对应的 C++ 对象已被 Qt 删除，跳过即可
+            continue
+    app.processEvents()
 
 
 @pytest.fixture

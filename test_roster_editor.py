@@ -210,16 +210,37 @@ def no_modal_dialogs(monkeypatch):
                         staticmethod(lambda *a, **k: QMessageBox.Yes))
 
 
-def make_editor(tmp_path: Path, **kwargs):
+@pytest.fixture
+def editor_factory(qt_app):
+    """创建花名册管理页，并在用例结束后显式关闭/销毁。
+
+    Qt 的顶层窗口与快捷键必须由 Python 侧持有并主动销毁：留到解释器退出阶段
+    才析构，QApplication 已经被销毁，某些平台会直接 abort（SIGABRT）。
+    """
     from duty_system.roster_editor import RosterEditorDialog
 
-    db = make_db(tmp_path)
-    seed_roster(db)
-    return db, RosterEditorDialog(db=db, **kwargs)
+    created: list = []
+
+    def make(tmp_path: Path, **kwargs):
+        db = make_db(tmp_path)
+        seed_roster(db)
+        dialog = RosterEditorDialog(db=db, **kwargs)
+        created.append(dialog)
+        return db, dialog
+
+    yield make
+
+    for dialog in created:
+        dialog.close()
+        dialog.setParent(None)
+        dialog.deleteLater()
+    qt_app.processEvents()
 
 
-def test_editor_lists_roster_with_problem_marks(qt_app, tmp_path: Path) -> None:
-    _db, dialog = make_editor(tmp_path)
+def test_editor_lists_roster_with_problem_marks(
+    qt_app, editor_factory, tmp_path: Path,
+) -> None:
+    _db, dialog = editor_factory(tmp_path)
     assert dialog.table.rowCount() == 3
     assert dialog.table.columnCount() == 7
     assert dialog.table.item(1, 0).text().startswith("⚠")
@@ -227,8 +248,10 @@ def test_editor_lists_roster_with_problem_marks(qt_app, tmp_path: Path) -> None:
     assert dialog.table.item(0, 0).text() == "微信工作室"
 
 
-def test_editor_matching_search_highlights_and_filters(qt_app, tmp_path: Path) -> None:
-    _db, dialog = make_editor(tmp_path)
+def test_editor_matching_search_highlights_and_filters(
+    qt_app, editor_factory, tmp_path: Path,
+) -> None:
+    _db, dialog = editor_factory(tmp_path)
 
     dialog.search_edit.setText("２０２５ ０００２")
     assert [entry.name for entry in dialog._visible] == ["李四"]
@@ -261,12 +284,14 @@ def test_editor_matching_search_highlights_and_filters(qt_app, tmp_path: Path) -
     assert dialog._selected_entries()[0].name == "张三"
 
 
-def test_editor_delete_key_is_scoped_to_table(qt_app, tmp_path: Path) -> None:
+def test_editor_delete_key_is_scoped_to_table(
+    qt_app, editor_factory, tmp_path: Path,
+) -> None:
     """Delete 键在表格里删除记录，在搜索框里只做文本编辑。"""
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
-    _db, dialog = make_editor(tmp_path)
+    _db, dialog = editor_factory(tmp_path)
     dialog.show()
     qt_app.processEvents()
 
@@ -286,11 +311,33 @@ def test_editor_delete_key_is_scoped_to_table(qt_app, tmp_path: Path) -> None:
     assert len(dialog.entries) == 2
 
 
+def test_editor_double_click_opens_selected_record(
+    qt_app, editor_factory, tmp_path: Path, monkeypatch,
+) -> None:
+    """双击表格行会打开该行的编辑表单（离屏下直接发信号验证绑定关系）。"""
+    from PySide6.QtWidgets import QDialog
+
+    from duty_system import roster_editor
+
+    _db, dialog = editor_factory(tmp_path)
+    opened: dict = {}
+
+    def fake_exec(self) -> int:
+        opened["name"] = self.name_edit.text()
+        return QDialog.Rejected
+
+    monkeypatch.setattr(roster_editor.RosterEntryDialog, "exec", fake_exec)
+    dialog.table.selectRow(1)
+    dialog.table.doubleClicked.emit(dialog.table.model().index(1, 2))
+    qt_app.processEvents()
+    assert opened["name"] == dialog.entries[1].name
+
+
 def test_editor_resets_studio_filter_when_option_disappears(
-    qt_app, tmp_path: Path,
+    qt_app, editor_factory, tmp_path: Path,
 ) -> None:
     """筛选项被删光后自动回到「全部」，避免下拉与表格内容不一致。"""
-    _db, dialog = make_editor(tmp_path)
+    _db, dialog = editor_factory(tmp_path)
     dialog.studio_filter.setCurrentIndex(
         dialog.studio_filter.findData("设计工作室"))
     assert len(dialog._visible) == 2
@@ -305,14 +352,14 @@ def test_editor_resets_studio_filter_when_option_disappears(
 
 
 def test_editor_add_edit_delete_with_undo_redo(
-    qt_app, tmp_path: Path, monkeypatch,
+    qt_app, editor_factory, tmp_path: Path, monkeypatch,
 ) -> None:
     from PySide6.QtWidgets import QDialog
 
     from duty_system import roster_editor
 
     messages: list[str] = []
-    db, dialog = make_editor(tmp_path, on_changed=messages.append)
+    db, dialog = editor_factory(tmp_path, on_changed=messages.append)
 
     def fill_form(studio: str, name: str, student_id: str, position: str):
         def fake_exec(self) -> int:
@@ -410,6 +457,9 @@ def test_editor_blocks_empty_name_and_wires_import_export(
     assert dialog._undo_stack == []
     dialog.request_export()
     assert calls[-1] == "导出"
+    dialog.close()
+    dialog.deleteLater()
+    qt_app.processEvents()
 
 
 # --------------------------------------------------------------------------- #
@@ -439,9 +489,13 @@ def test_file_menu_exposes_roster_editor_action(
                 opened["exec"] = True
                 return 0
 
+            def deleteLater(self) -> None:
+                opened["deleted"] = True
+
         monkeypatch.setattr(appmod, "RosterEditorDialog", FakeDialog)
         window.action_manage_roster.trigger()
         assert opened["exec"] is True
+        assert opened["deleted"] is True
         assert opened["db"] is window.db
         assert callable(opened["on_changed"])
         assert callable(opened["import_callback"])
@@ -494,6 +548,8 @@ def test_editor_change_refreshes_main_window_members(
         member = window.members()[0]
         assert member.studios == ["微信工作室"]
         assert member.phone == "13800000000"
+        dialog.close()
+        dialog.deleteLater()
     finally:
         window.close()
         window.deleteLater()

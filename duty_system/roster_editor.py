@@ -64,9 +64,11 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("来源", "source_file"),
 )
 _SOURCE_COLUMN = len(_COLUMNS) - 1
-_HIGHLIGHT_COLOR = QColor("#fff3bf")
-_MATCH_COLOR = QColor("#1d4ed8")
-_WARNING_COLOR = QColor("#b45309")
+# 颜色只保存十六进制字符串，画刷在填充表格时创建：
+# Qt 对象要在 QApplication 存活期间构造与销毁，避免进程退出阶段销毁 Qt 对象。
+_HIGHLIGHT_HEX = "#fff3bf"
+_MATCH_HEX = "#1d4ed8"
+_WARNING_HEX = "#b45309"
 
 
 def _source_text(entry: RosterEntry) -> str:
@@ -238,7 +240,7 @@ class RosterEditorDialog(QDialog):
         for index in range(len(_COLUMNS)):
             header.setSectionResizeMode(index, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.Stretch)
-        self.table.doubleClicked.connect(lambda _index: self.edit_selected())
+        self.table.doubleClicked.connect(self._on_row_activated)
         self.table.itemSelectionChanged.connect(self._update_buttons)
         layout.addWidget(self.table, stretch=1)
 
@@ -249,12 +251,15 @@ class RosterEditorDialog(QDialog):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        QShortcut(QKeySequence.StandardKey.Find, self,
-                  activated=lambda: self.search_edit.setFocus())
+        # 快捷键对象必须由 Python 侧持有引用，否则包装器被回收后快捷键会失效
+        self._shortcuts: list[QShortcut] = []
+        focus_shortcut = QShortcut(
+            QKeySequence.StandardKey.Find, self, activated=self._focus_search)
         # Delete 只在表格获得焦点时生效，避免在其他输入控件里误删记录
         delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self.table)
         delete_shortcut.setContext(Qt.WidgetShortcut)
         delete_shortcut.activated.connect(self.delete_selected)
+        self._shortcuts += [focus_shortcut, delete_shortcut]
 
         self.search_edit.setAccessibleName("花名册匹配查找")
         self.scope_combo.setAccessibleName("查找范围")
@@ -486,6 +491,9 @@ class RosterEditorDialog(QDialog):
     def _fill_table(self, query: dict[str, str]) -> None:
         duplicate_keys = roster_duplicate_keys(self.entries)
         leader_conflicts = roster_leader_conflicts(self.entries)
+        match_brush = QBrush(QColor(_MATCH_HEX))
+        warning_brush = QBrush(QColor(_WARNING_HEX))
+        highlight_brush = QBrush(QColor(_HIGHLIGHT_HEX))
         self.table.setSortingEnabled(False)
         self.table.clearContents()
         self.table.setRowCount(len(self._visible))
@@ -501,16 +509,16 @@ class RosterEditorDialog(QDialog):
                 if column in highlighted:
                     # 当前主题里 QSS 指定了 QTableWidget::item，模型设置的背景色
                     # 不会绘制；因此用加粗 + 前景色强调，背景色作为主题变化后的兜底。
-                    item.setBackground(QBrush(_HIGHLIGHT_COLOR))
+                    item.setBackground(highlight_brush)
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
-                    item.setForeground(QBrush(_MATCH_COLOR))
+                    item.setForeground(match_brush)
                 if column == 0:
                     item.setData(Qt.UserRole, entry.entry_id)
                     if problem_text:
                         if column not in highlighted:
-                            item.setForeground(QBrush(_WARNING_COLOR))
+                            item.setForeground(warning_brush)
                         item.setToolTip(problem_text)
                         item.setText(f"⚠ {text}")
                 self.table.setItem(row, column, item)
@@ -539,6 +547,13 @@ class RosterEditorDialog(QDialog):
         self.btn_redo.setEnabled(bool(self._redo_stack))
 
     # ---------- 匹配查找 ----------
+
+    def _focus_search(self) -> None:
+        self.search_edit.setFocus(Qt.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
+    def _on_row_activated(self, *_args) -> None:
+        self.edit_selected()
 
     def focus_first_match(self) -> None:
         """按 Enter 时选中并滚动到第一条命中的记录（兼容表格排序后的行序）。"""
