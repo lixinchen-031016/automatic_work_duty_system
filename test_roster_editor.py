@@ -197,9 +197,14 @@ def test_validate_roster_entries_reports_problems() -> None:
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture(autouse=True)
-def no_modal_dialogs(monkeypatch):
-    """离屏运行时不允许弹出真实模态框。"""
-    pytest.importorskip("PySide6.QtWidgets")
+def no_modal_dialogs(request, monkeypatch):
+    """离屏运行时不允许弹出真实模态框（只作用于界面用例）。
+
+    纯逻辑用例（增删改查、匹配查找、筛选校验）不导入 Qt：
+    CI 门禁需要在这种「完全不涉及 Qt」的进程里跑后端用例。
+    """
+    if not {"qt_app", "editor_factory"} & set(request.fixturenames):
+        return
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "information",

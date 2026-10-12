@@ -337,7 +337,23 @@ env -u PYTHONHOME -u PYTHONPATH .venv/bin/python test_system.py   # 只看端到
 `conftest.py` 负责：把仓库根加入 `sys.path`、强制 `QT_QPA_PLATFORM=offscreen`（无显示器也能跑界面测试）、把 `QSettings` 重定向到临时目录（不污染用户真实配置）；
 并在会话结束时先关闭并销毁所有残留窗口，再回收 `QApplication`——否则遗留的 Qt 对象会在解释器退出阶段（`QApplication` 已销毁）析构，某些平台会直接 `abort`（SIGABRT）让整个测试进程失败。
 
+界面用例与后端用例可以分开运行（`conftest.py` 会自动给依赖 Qt fixture 的用例打上 `ui` 标记）：
+
+```bash
+pytest                 # 完整套件（314 个用例，含界面）
+pytest -m ui           # 只跑界面用例（48 个）
+pytest -m "not ui"     # 只跑后端用例（266 个）
+```
+
 CI 中 **测试是打包的前置门禁**：`test` 作业不通过则不会构建/发布任何产物。
+为规避无头 Qt 的退出阶段崩溃，CI 门禁只跑后端用例：
+`pytest -m "not ui" --ignore=test_app_ui.py`（`--ignore` 掉模块级导入 Qt 的文件，
+门禁进程因此完全不涉及 Qt）。原因：部分 Linux + offscreen 环境在用例**全部通过之后**
+的进程退出阶段会触发 `SIGABRT`（exit 134），日志里没有 Python 调用栈，无法定位到具体用例；
+界面用例请在本地或带显示器的环境执行。
+
+> 新增界面用例时：用到 `qt_app` / `window` / `settings` / `editor_factory` 会自动带上 `ui` 标记；
+> 若自行创建 `QApplication`，请显式写 `@pytest.mark.ui`，否则会被 CI 门禁执行到。
 
 ---
 

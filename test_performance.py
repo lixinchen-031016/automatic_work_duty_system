@@ -128,6 +128,8 @@ def test_assignment_write_scales(tmp_path: Path) -> None:
 
 # --------------------------------------------------------------------------- #
 # 界面刷新预算（offscreen）：锁住已优化的路径，防止被改回慢实现
+#   这三个用例自行创建 QApplication，没有使用 conftest 的 Qt fixture，
+#   因此显式标记 ui，便于 CI 用 -m "not ui" 跳过无头界面测试。
 # --------------------------------------------------------------------------- #
 
 def _build_window(tmp_path, n_members: int):
@@ -170,6 +172,7 @@ def _build_window(tmp_path, n_members: int):
     return app, win
 
 
+@pytest.mark.ui
 def test_ui_refresh_budget_with_300_members(tmp_path) -> None:
     """300 名成员时，排班页与甘特图刷新应保持在同一量级（各 < 250ms）
 
@@ -190,6 +193,7 @@ def test_ui_refresh_budget_with_300_members(tmp_path) -> None:
     assert gantt < 0.25, f"甘特图刷新耗时 {gantt:.3f}s，超出预算"
 
 
+@pytest.mark.ui
 def test_gantt_row_toggle_is_cheap(tmp_path) -> None:
     """切换「查看周次」不应重建整表的单元格对象（缓存 + 复用生效）"""
     _app, win = _build_window(tmp_path, 120)
@@ -205,6 +209,7 @@ def test_gantt_row_toggle_is_cheap(tmp_path) -> None:
     assert elapsed / 3 < 0.15, f"单次甘特刷新 {elapsed / 3:.3f}s，超出预算"
 
 
+@pytest.mark.ui
 def test_gap_diagnosis_is_cached(tmp_path) -> None:
     """缺口诊断（逐时段逐成员判定）应缓存，重复刷新不重复计算"""
     _app, win = _build_window(tmp_path, 60)

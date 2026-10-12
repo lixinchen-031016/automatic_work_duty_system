@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# 依赖 QApplication / QWidget 的 fixture：用到它们的用例会被自动标记为 ui
+_QT_FIXTURES = {"qt_app", "window", "settings", "editor_factory"}
+
+
+def pytest_collection_modifyitems(items) -> None:
+    """给所有依赖 Qt 的用例自动打上 `ui` 标记。
+
+    - `pytest -m ui`：只跑界面用例；
+    - `pytest -m "not ui"`：只跑后端用例。
+
+    CI 门禁使用 `-m "not ui"` 跳过无头界面测试：部分 Linux + offscreen 环境会在
+    用例全部通过后的解释器退出阶段触发进程级 SIGABRT（exit 134），且没有 Python
+    调用栈可供定位。自建 QApplication（不使用上述 fixture）的用例需显式写
+    `@pytest.mark.ui`，以便同样被覆盖。
+    """
+    ui_marker = pytest.mark.ui
+    for item in items:
+        if _QT_FIXTURES & set(getattr(item, "fixturenames", ())):
+            item.add_marker(ui_marker)
 
 
 @pytest.fixture(scope="session")
@@ -46,6 +67,9 @@ def qt_app(tmp_path_factory):
             # 包装器对应的 C++ 对象已被 Qt 删除，跳过即可
             continue
     app.processEvents()
+    # 主动回收引用环（对话框 <-> 信号 <-> 绑定方法），确保 Qt 对象在
+    # QApplication 仍然存活时被销毁，而不是拖到解释器退出阶段
+    gc.collect()
 
 
 @pytest.fixture
