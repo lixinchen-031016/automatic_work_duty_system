@@ -176,7 +176,7 @@ def test_calendar_editor_uses_widgets_and_roundtrips(window, qt_app) -> None:
 
 
 def test_member_search_filters_view_without_changing_data(window, qt_app) -> None:
-    """成员搜索仅控制列表可见性，清空后恢复全部并保持双击跳转。"""
+    """成员搜索只改变列表内容（不用隐藏行），清空后恢复全部并保持双击跳转。"""
     people = [
         ("张三", "1001", "一班"),
         ("张小明", "1002", "二班"),
@@ -193,9 +193,10 @@ def test_member_search_filters_view_without_changing_data(window, qt_app) -> Non
     visible = [
         window.member_list.item(i)
         for i in range(window.member_list.count())
-        if not window.member_list.item(i).isHidden()
     ]
     assert [item.text().split("（", 1)[0] for item in visible] == ["张三", "张小明"]
+    # 筛选不再用 setHidden 隐藏行：隐藏行会让 Qt 无障碍层拿到负数子项索引
+    assert not any(item.isHidden() for item in visible)
     assert len(window.members()) == 3, "搜索不应修改底层成员数据"
 
     first_visible = visible[0]
@@ -204,10 +205,73 @@ def test_member_search_filters_view_without_changing_data(window, qt_app) -> Non
 
     window.member_search.clear()
     qt_app.processEvents()
+    assert window.member_list.count() == len(people)
     assert all(
         not window.member_list.item(i).isHidden()
         for i in range(window.member_list.count())
     )
+
+
+def test_member_filter_rebuilds_list_without_hidden_rows(window, qt_app) -> None:
+    """班级/工作室筛选只保留命中成员（不隐藏行），选中成员被筛掉时清除选中态。"""
+    people = [
+        ("甲", "1001", "一班", "图片工作室"),
+        ("乙", "1002", "二班", "图片工作室"),
+        ("丙", "1003", "一班", "短视频工作室"),
+    ]
+    for name, student_id, class_name, _studio in people:
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, class_name=class_name, courses=[]))
+    window.db.replace_roster([
+        RosterEntry(studio=studio, name=name, student_id=student_id)
+        for name, student_id, _class_name, studio in people
+    ])
+    window.invalidate_cache()
+    window.refresh_members()
+
+    def list_names() -> list[str]:
+        return [
+            window.member_list.item(i).text().split("（", 1)[0]
+            for i in range(window.member_list.count())
+        ]
+
+    def row_of(name: str) -> int:
+        for index, text in enumerate(list_names()):
+            if text == name:
+                return index
+        raise AssertionError(f"成员列表中没有 {name}")
+
+    class_index = window.member_class_filter.findData("一班")
+    assert class_index >= 0
+    window.member_class_filter.setCurrentIndex(class_index)
+    qt_app.processEvents()
+    assert list_names() == ["甲", "丙"]
+    # 筛选后列表里只剩命中成员：没有任何一行被隐藏（隐藏行会让 Qt 无障碍层
+    # 拿到负数子项索引，刷出 QAccessibleList::child 一类的告警）
+    assert not any(window.member_list.item(i).isHidden()
+                   for i in range(window.member_list.count()))
+    assert len(window.members()) == 3, "筛选不应修改底层成员数据"
+
+    window.member_class_filter.setCurrentIndex(0)  # 全部
+    qt_app.processEvents()
+    window.member_list.setCurrentRow(row_of("乙"))
+    assert window.member_list.currentItem().text().startswith("乙")
+
+    window.member_class_filter.setCurrentIndex(class_index)
+    qt_app.processEvents()
+    assert list_names() == ["甲", "丙"]
+    assert window.member_list.currentItem() is None, "被筛掉的成员应清除选中态"
+
+    studio_index = window.member_studio_filter.findData("图片工作室")
+    assert studio_index >= 0
+    window.member_studio_filter.setCurrentIndex(studio_index)
+    qt_app.processEvents()
+    assert list_names() == ["甲"], "班级与工作室筛选应为与关系"
+
+    window.member_studio_filter.setCurrentIndex(0)  # 全部
+    window.member_class_filter.setCurrentIndex(0)  # 全部
+    qt_app.processEvents()
+    assert sorted(list_names()) == ["丙", "乙", "甲"]
 
 
 def test_member_participation_dialog_excludes_from_generation(

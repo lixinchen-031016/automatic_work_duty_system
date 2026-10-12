@@ -812,6 +812,9 @@ class MainWindow(QMainWindow):
         self.member_list = QListWidget()
         self.member_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.member_list.setMinimumHeight(120)
+        # 成员列表按 `refresh_members()` 里缓存的 _member_rows 重建，筛选时只放命中
+        # 的成员进列表，不用 setHidden 隐藏行（隐藏行会让 Qt 无障碍层报负数索引）
+        self._member_rows: list[dict] = []
         self.member_list.setToolTip(
             "双击成员可在「成员课表」页查看其课表详情。\n"
             "是否参与排班请在菜单栏「排班 → 设置参与排班…」中设置。")
@@ -1323,11 +1326,9 @@ class MainWindow(QMainWindow):
 
     def refresh_members(self) -> None:
         members = self.members()
-        selected_item = self.member_list.currentItem()
-        selected_id = selected_item.data(Qt.UserRole) if selected_item else None
         selected_class = self.member_class_filter.currentData()
         selected_studio = self.member_studio_filter.currentData()
-        self.member_list.clear()
+        self._member_rows = [self._member_row(m) for m in members]
         self.member_class_filter.blockSignals(True)
         self.member_class_filter.clear()
         self.member_class_filter.addItem("全部", "")
@@ -1351,24 +1352,7 @@ class MainWindow(QMainWindow):
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         for m in members:
-            suffix = "" if m.participates_in_scheduling else " · 不参与排班"
-            studios = self.member_studios(m)
             studio_text = self.member_studio_text(m)
-            item = QListWidgetItem(
-                f"{m.name}（{m.course_count} 门课 · {studio_text}）{suffix}")
-            item.setData(Qt.UserRole, m.id)
-            item.setData(Qt.UserRole + 1, (
-                m.name, m.student_id, m.class_name, tuple(studios)))
-            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
-            if not m.participates_in_scheduling:
-                item.setForeground(QBrush(QColor("#8e8e93")))
-                item.setToolTip("不参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
-            else:
-                item.setToolTip("参与排班；可通过菜单「排班 → 设置参与排班…」修改。")
-            item.setToolTip(
-                item.toolTip() + f"\n工作室：{studio_text}"
-                + ("（已手工锁定）" if m.studio_locked else ""))
-            self.member_list.addItem(item)
             combo_status = "" if m.participates_in_scheduling else " · 不参与排班"
             self.member_combo.addItem(
                 f"{m.name} · {studio_text}"
@@ -1379,11 +1363,7 @@ class MainWindow(QMainWindow):
         self.btn_edit_member_profile.setEnabled(bool(members))
         self.btn_batch_studio.setEnabled(bool(members))
         self.action_export_roster.setEnabled(bool(members or self.roster_entries()))
-        if selected_id is not None:
-            for row in range(self.member_list.count()):
-                if self.member_list.item(row).data(Qt.UserRole) == selected_id:
-                    self.member_list.setCurrentRow(row)
-                    break
+        # 列表按当前筛选条件重建，并尽量保留原先选中的成员
         self._apply_member_filter()
         self._clear_undo_redo()
         if self.member_combo.count():
@@ -1397,27 +1377,76 @@ class MainWindow(QMainWindow):
         self._mark_stale()
 
     def _apply_member_filter(self, *_args) -> None:
-        """按姓名/学号/班级即时过滤成员列表，不修改底层数据。"""
+        """按姓名/学号/班级/工作室即时过滤成员列表，不修改底层数据。"""
+        self._rebuild_member_list()
+
+    def _member_row(self, member) -> dict:
+        """把一个成员转成成员列表的一行数据（筛选时可反复用于重建列表）。"""
+        studios = tuple(self.member_studios(member))
+        studio_text = self.member_studio_text(member)
+        suffix = "" if member.participates_in_scheduling else " · 不参与排班"
+        if member.participates_in_scheduling:
+            tooltip = "参与排班；可通过菜单「排班 → 设置参与排班…」修改。"
+        else:
+            tooltip = "不参与排班；可通过菜单「排班 → 设置参与排班…」修改。"
+        tooltip += f"\n工作室：{studio_text}" + (
+            "（已手工锁定）" if member.studio_locked else "")
+        return {
+            "id": member.id,
+            "text": (
+                f"{member.name}（{member.course_count} 门课 · {studio_text}）{suffix}"),
+            "payload": (
+                member.name, member.student_id, member.class_name, studios),
+            "class_name": member.class_name,
+            "studios": studios,
+            # 姓名/学号/班级/工作室逐段匹配，避免拼接后出现跨字段的误命中
+            "parts": tuple(str(value).casefold() for value in (
+                member.name, member.student_id, member.class_name,
+                "、".join(str(studio) for studio in studios))),
+            "dimmed": not member.participates_in_scheduling,
+            "tooltip": tooltip,
+        }
+
+    @staticmethod
+    def _build_member_item(row: dict) -> QListWidgetItem:
+        item = QListWidgetItem(row["text"])
+        item.setData(Qt.UserRole, row["id"])
+        item.setData(Qt.UserRole + 1, row["payload"])
+        item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+        if row["dimmed"]:
+            item.setForeground(QBrush(QColor("#8e8e93")))
+        item.setToolTip(row["tooltip"])
+        return item
+
+    def _rebuild_member_list(self) -> None:
+        """只把命中的成员放进列表，并尽量保留原先选中的成员。
+
+        这里刻意不用 `item.setHidden(True)` 隐藏不匹配的行：被隐藏的行不会进入视图
+        布局，而 Qt 发无障碍通知用的子项索引是 `QListView::visualIndex()`（模型行号
+        − 其前面已隐藏的行数），行本身被隐藏时该值为负，于是 macOS 桥接层会刷出
+        “QAccessibleList::child: Invalid index at: -7 0”“Invalid child in
+        QAccessibleEvent”“invalid element” 这三条告警。
+        """
+        selected_item = self.member_list.currentItem()
+        selected_id = selected_item.data(Qt.UserRole) if selected_item else None
         query = self.member_search.text().strip().casefold()
         selected_class = self.member_class_filter.currentData() or ""
         selected_studio = self.member_studio_filter.currentData() or ""
-        for row in range(self.member_list.count()):
-            item = self.member_list.item(row)
-            name, student_id, class_name, studios = item.data(Qt.UserRole + 1)
-            studio_text = "、".join(str(studio) for studio in studios)
-            matches_query = (
-                not query
-                or query in str(name).casefold()
-                or query in str(student_id).casefold()
-                or query in str(class_name).casefold()
-                or query in studio_text.casefold()
-            )
-            matches_class = not selected_class or class_name == selected_class
-            matches_studio = (
-                not selected_studio
-                or selected_studio in {str(studio) for studio in studios}
-            )
-            item.setHidden(not (matches_query and matches_class and matches_studio))
+        self.member_list.clear()
+        for row in self._member_rows:
+            if query and not any(query in part for part in row["parts"]):
+                continue
+            if selected_class and row["class_name"] != selected_class:
+                continue
+            if selected_studio and selected_studio not in row["studios"]:
+                continue
+            self.member_list.addItem(self._build_member_item(row))
+        if selected_id is None:
+            return
+        for index in range(self.member_list.count()):
+            if self.member_list.item(index).data(Qt.UserRole) == selected_id:
+                self.member_list.setCurrentRow(index)
+                return
 
     def _on_empty_action(self) -> None:
         if self.members():
@@ -1429,7 +1458,7 @@ class MainWindow(QMainWindow):
         """无排班结果时，给出下一步引导文案"""
         if self.result is not None:
             return
-        member_count = self.member_list.count()
+        member_count = len(self.members())
         scheduling_count = len(self.scheduling_members())
         if member_count == 0:
             self.empty_title.setText("三步完成第一次排班")
@@ -3575,10 +3604,10 @@ class MainWindow(QMainWindow):
             f"已将 {member.name} 的工作室与职位设置为“{display}”，并锁定归属。")
 
     def batch_edit_members_studio(self) -> None:
+        # 列表里只剩当前搜索/筛选命中的成员，可直接按列表内容批量修改
         visible_members = [
             self.member_list.item(row).data(Qt.UserRole)
             for row in range(self.member_list.count())
-            if not self.member_list.item(row).isHidden()
         ]
         member_by_id = {member.id: member for member in self.members()}
         visible_members = [
