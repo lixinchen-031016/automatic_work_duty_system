@@ -319,6 +319,40 @@ def test_member_participation_dialog_excludes_from_generation(
     assert member is not None and member.participates_in_scheduling is True
 
 
+def test_gantt_includes_members_excluded_from_scheduling(window) -> None:
+    """空闲总览展示全部成员；不参与排班不影响查看其课程与空闲时段。"""
+    for name, student_id, studio in (
+        ("排班成员", "2001", "短视频工作室"),
+        ("不排班成员", "2002", "图片工作室"),
+    ):
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, courses=[]))
+    window.db.replace_roster([
+        RosterEntry(studio=studio, name=name, student_id=student_id)
+        for name, student_id, studio in (
+            ("排班成员", "2001", "短视频工作室"),
+            ("不排班成员", "2002", "图片工作室"),
+        )
+    ])
+    window.invalidate_cache()
+    window.refresh_members()
+    excluded = next(m for m in window.members() if m.name == "不排班成员")
+    window.db.set_member_participation(excluded.id, False)
+    window.invalidate_cache()
+    window.refresh_members()
+    window.gantt_week.setValue(1)
+    window.refresh_gantt()
+
+    assert excluded.id not in {m.id for m in window.scheduling_members()}
+    assert {m.name for m in window.gantt_members()} == {
+        "排班成员", "不排班成员"}
+    matrix = window.gantt_matrix
+    assert matrix is not None
+    assert set(matrix.member_names) == {"排班成员", "不排班成员"}
+    assert matrix.member_count == len(window.members())
+    assert all(count <= matrix.member_count for count in matrix.free_counts)
+
+
 def test_national_holiday_import_dialog_previews_builtin_data(
     window, qt_app, monkeypatch,
 ) -> None:

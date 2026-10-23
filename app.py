@@ -412,8 +412,8 @@ class MainWindow(QMainWindow):
         )
 
     def gantt_members(self) -> list:
-        """空闲总览目标成员；兼任成员会出现在其每个业务分组中。"""
-        members = self.scheduling_members()
+        """空闲总览目标成员；不参与排班的成员也保留，便于统一查看空闲时间。"""
+        members = self.members()
         if not self.roster_entries():
             # 老数据未导入花名册时保持原有全量展示，避免升级后页面突然为空。
             return members
@@ -2439,12 +2439,8 @@ class MainWindow(QMainWindow):
             self.gantt_table.setColumnCount(0)
             if all_member_count and not members and self.roster_entries():
                 self.gantt_hint.setText(
-                    f"当前业务分组“{self.gantt_group_label()}”没有参与成员。"
+                    f"当前业务分组“{self.gantt_group_label()}”没有成员。"
                     "请切换业务分组，或到成员列表使用「修改工作室…」检查归属。")
-            elif all_member_count and not members:
-                self.gantt_hint.setText(
-                    "当前没有参与排班的成员；请通过菜单「排班 → 设置参与排班…」"
-                    "选择成员后查看空闲时段总览。")
             else:
                 self.gantt_hint.setText(
                     "请先上传成员课表，并至少勾选一个值班星期和值班时段"
