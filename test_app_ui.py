@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -144,6 +144,11 @@ def test_settings_roundtrip(window, settings) -> None:
 
 def test_calendar_editor_uses_widgets_and_roundtrips(window, qt_app) -> None:
     """学期日历必须通过日期/类型控件编辑，不再依赖文本解析。"""
+    # 「学期起始日」默认取今天所在周的周一，并被用作日历行日期控件的最小值。
+    # 下面写死的 2026-10 日期一旦早于它，QDateEdit 会把两行都 clamp 到边界，
+    # 变成同一天后又被重复日期校验拦下——用例会随真实日期推移而失效。
+    # 这里先固定学期起点，让用例与「今天」解耦。
+    window.term_start.setDate(QDate(2026, 9, 14))
     table = QTableWidget(0, 6)
     off = CalendarEntry(date(2026, 10, 15), "off", note="调休")
     makeup = CalendarEntry(date(2026, 10, 17), "class", 5, 4, "补第5周周四")
@@ -1036,6 +1041,222 @@ def test_gantt_excel_uses_time_rows_and_member_columns(window, qt_app) -> None:
     assert ws.row_dimensions[3].height >= 34
     assert ws.max_row == len(matrix.columns) + 2
     assert ws.max_column == matrix.member_count + 2
+
+
+def select_gantt_members(win, member_ids) -> None:
+    """模拟在「人员」下拉里勾选成员：筛选控件是勾选状态的唯一来源。"""
+    win.gantt_member_filter.set_checked_values(set(member_ids))
+
+
+def test_checklist_menu_button_summarizes_selection(qt_app) -> None:
+    """多选按钮文字规则：全部（人数）/ 部分（列名字 + k/N）/ 未选择。"""
+    from duty_system.ui_utils import ChecklistMenuButton
+
+    button = ChecklistMenuButton()
+    button.set_items([(1, "张三"), (2, "李四"), (3, "王五")])
+    assert button.text() == "人员：全部（3）"
+    assert button.checked_values() == {1, 2, 3}
+
+    button.set_checked_values({1, 2})
+    assert button.text() == "人员：张三、李四 等 2/3"
+
+    button.set_checked_values({2})
+    assert button.text() == "人员：李四 等 1/3"
+
+    button.set_all_checked(False)
+    assert button.text() == "人员：未选择" and button.checked_values() == set()
+
+    # 清单变化时：已存在的项保留勾选，新增项按 default_checked 决定
+    button.set_checked_values({1})
+    button.set_items([(1, "张三"), (2, "李四"), (9, "赵六")], default_checked=False)
+    assert button.checked_values() == {1}
+    assert button.total_count == 3
+    button.set_items([(1, "张三"), (2, "李四"), (9, "赵六"), (10, "周七")],
+                     default_checked=True)
+    assert button.checked_values() == {1, 10}, "已有项保留勾选，只有新项按默认值"
+
+
+def test_checklist_menu_button_click_row_toggles_and_keeps_popup(qt_app) -> None:
+    """点整行即可勾选，且弹层不收起（多选才能连续点）。"""
+    from PySide6.QtTest import QTest
+
+    from duty_system.ui_utils import ChecklistMenuButton
+
+    button = ChecklistMenuButton()
+    button.set_items([(1, "甲"), (2, "乙")])
+    button.show()
+    button._menu.popup(button.mapToGlobal(button.rect().center()))
+    qt_app.processEvents()
+    try:
+        lst = button._list
+        QTest.mouseClick(lst.viewport(), Qt.LeftButton,
+                         pos=lst.visualItemRect(lst.item(0)).center())
+        qt_app.processEvents()
+        assert button.checked_values() == {2}, "点在行内文字上应切换勾选"
+        assert button._menu.isVisible(), "勾选后弹层应保持打开"
+    finally:
+        button._menu.close()
+        button.close()
+        button.deleteLater()
+
+
+def test_gantt_member_filter_narrows_columns_and_summary(window, qt_app) -> None:
+    """勾选人员后：只剩所选成员的列，汇总分母同步变成所选人数。"""
+    seed_members(window, 6)
+    window.tabs.setCurrentIndex(4)
+    window.gantt_week.setValue(1)
+    window.refresh_gantt()
+    assert window.gantt_matrix.member_count == 6
+    assert window.gantt_member_filter.text() == "人员：全部（6）"
+
+    chosen = window.gantt_members()[:2]
+    select_gantt_members(window, [m.id for m in chosen])
+
+    m = window.gantt_matrix
+    assert m is not None
+    assert m.member_names == [member.name for member in chosen]
+    assert window.gantt_table.columnCount() == 3, "2 位成员 + 1 汇总列"
+    header = [window.gantt_table.horizontalHeaderItem(i).text() for i in range(3)]
+    assert header == [chosen[0].name, chosen[1].name, "空闲人数"]
+
+    # 汇总分母与全员空闲判定都按「所选人数」重算
+    assert all(count <= 2 for count in m.free_counts)
+    for i in range(len(m.columns)):
+        assert window.gantt_table.item(i, 2).text() == f"{m.free_counts[i]}/2"
+
+    hint = window.gantt_hint.text()
+    assert "所选 2/6 人" in hint
+    assert "所选人员共同空闲" in hint and "全员空闲" not in hint
+    assert window.gantt_legend_all_free.text() == "所选全空闲", "图例含义要跟着筛选变"
+    assert "等 2/6" in window.gantt_member_filter.text()
+    assert window.btn_export_gantt.isEnabled()
+
+    # 回到全选：文案与图例一并回到全量口径
+    window.gantt_member_filter.set_all_checked(True)
+    assert window.gantt_legend_all_free.text() == "全员空闲"
+    assert "全部 6 人" in window.gantt_hint.text()
+
+
+def test_gantt_member_filter_switch_refreshes_cell_contents(window, qt_app) -> None:
+    """换一批人（人数不变）时必须重算单元格，不能留下上一批人的状态。"""
+    seed_members(window, 6)
+    window.tabs.setCurrentIndex(4)
+    window.gantt_week.setValue(1)
+    pool = window.gantt_members()
+
+    select_gantt_members(window, [pool[0].id, pool[1].id])
+    first_names = list(window.gantt_matrix.member_names)
+
+    select_gantt_members(window, [pool[3].id, pool[4].id])
+    m = window.gantt_matrix
+    assert m.member_names == [pool[3].name, pool[4].name] != first_names
+    assert window.gantt_table.columnCount() == 3, "人数不变不应重建表格结构"
+    assert window.gantt_table.horizontalHeaderItem(0).text() == pool[3].name
+
+    t = window.gantt_table
+    for r in range(m.member_count):
+        for i, column in enumerate(m.columns):
+            item = t.item(i, r)
+            if (r, column.date, column.block) in m.duty_cells:
+                assert item.text() == "值"
+            elif column.is_off:
+                assert item.text() == "假"
+            elif m.free[r][i]:
+                assert item.text() == "" and "空闲" in item.toolTip()
+            else:
+                assert item.text() == "课", "有课单元格被上一批人的缓存污染"
+
+
+def test_gantt_member_filter_empty_selection_blocks_export(window, qt_app) -> None:
+    """一个都不选时不留空表：清空表格、禁用导出、给出明确提示。"""
+    seed_members(window, 4)
+    window.tabs.setCurrentIndex(4)
+    select_gantt_members(window, set())
+
+    assert window.gantt_member_filter.text() == "人员：未选择"
+    assert window.gantt_matrix is None
+    assert window.gantt_table.rowCount() == 0
+    assert window.gantt_table.columnCount() == 0
+    assert not window.btn_export_gantt.isEnabled()
+    assert "0 人" in window.gantt_hint.text()
+
+    window.gantt_member_filter.set_all_checked(True)
+    assert window.gantt_matrix is not None
+    assert window.gantt_matrix.member_count == 4
+    assert window.btn_export_gantt.isEnabled()
+
+
+def test_gantt_group_switch_resets_member_filter(window, qt_app) -> None:
+    """换业务分组后成员完全不同，人员筛选自动回到「全部」。"""
+    pairs = [
+        ("甲成员", "3001", "短视频工作室"),
+        ("乙成员", "3002", "短视频工作室"),
+        ("丙成员", "3003", "设计工作室"),
+    ]
+    for name, student_id, _studio in pairs:
+        window.db.upsert_member(ParsedSchedule(
+            name=name, student_id=student_id, courses=[]))
+    window.db.replace_roster([
+        RosterEntry(studio=studio, name=name, student_id=student_id)
+        for name, student_id, studio in pairs
+    ])
+    window.invalidate_cache()
+    window.refresh_members()
+    window.tabs.setCurrentIndex(4)
+
+    assert set(window.gantt_matrix.member_names) == {"甲成员", "乙成员"}
+    target = next(m for m in window.gantt_members() if m.name == "甲成员")
+    select_gantt_members(window, [target.id])
+    assert window.gantt_matrix.member_names == ["甲成员"]
+
+    window.gantt_group.setCurrentIndex(window.gantt_group.findText("设计"))
+    assert window.gantt_matrix.member_names == ["丙成员"]
+    assert window.gantt_member_filter.text() == "人员：全部（1）"
+
+
+def test_gantt_export_only_contains_selected_members(
+    window, qt_app, monkeypatch, tmp_path: Path,
+) -> None:
+    """导出与筛选状态一致：列 = 所选人员，汇总分母 = 所选人数，并标注筛选范围。"""
+    from openpyxl import load_workbook
+
+    seed_members(window, 5)
+    window.tabs.setCurrentIndex(4)
+    window.gantt_week.setValue(1)
+    pool = window.gantt_members()
+    chosen = [pool[1], pool[3]]
+    select_gantt_members(window, [m.id for m in chosen])
+
+    captured: dict[str, str] = {}
+
+    def fake_dialog(_parent, _caption, directory, _filter):
+        captured["name"] = directory
+        return str(tmp_path / "gantt.xlsx"), ""
+
+    monkeypatch.setattr(appmod.QFileDialog, "getSaveFileName",
+                        staticmethod(fake_dialog))
+    window.export_gantt()
+    assert wait_idle(window, qt_app)
+    assert "筛选2人" in captured["name"], "筛选导出应在文件名里标出人数"
+
+    ws = load_workbook(tmp_path / "gantt.xlsx").active
+    m = window.gantt_matrix
+    assert [ws.cell(1, 2).value, ws.cell(1, 3).value] == [m0.name for m0 in chosen]
+    assert ws.cell(1, 2 + m.member_count).value == "空闲人数"
+    assert ws.max_column == m.member_count + 2, "不应残留未选成员的列"
+    exported_names = {ws.cell(1, column).value for column in range(2, 2 + m.member_count)}
+    assert exported_names.isdisjoint({m0.name for m0 in pool if m0 not in chosen})
+
+    for index in range(len(m.columns)):
+        summary = ws.cell(3 + index, 2 + m.member_count)
+        if m.columns[index].is_off:
+            assert summary.value == "放假"
+        else:
+            assert summary.value == f"{m.free_counts[index]}/{m.member_count}"
+
+    note = ws.cell(ws.max_row, 1).value
+    assert note and "筛选范围" in note and "所选 2/5 人" in note
+    assert ws.max_row == len(m.columns) + 3, "数据行 + 2 行表头 + 1 行说明"
 
 
 def test_table_png_auto_wraps_long_values(qt_app, tmp_path: Path) -> None:

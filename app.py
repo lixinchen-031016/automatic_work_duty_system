@@ -134,6 +134,7 @@ from duty_system.ui_utils import (
     card as _card,
 )
 from duty_system.ui_utils import (
+    ChecklistMenuButton,
     dialog_buttons,
     dialog_header,
     fill_table,
@@ -348,6 +349,12 @@ class MainWindow(QMainWindow):
         self._undo_limit = 50
         # 空闲时段总览单元格上次写入的状态：(行, 列) -> 状态元组，用于跳过无变化单元格
         self._gantt_cell_state: dict = {}
+        # 单元格缓存对应的表格身份：成员列 + 时段列。成员换了但人数不变时
+        # 行列数完全相同，只靠行列数判断会让缓存把旧成员的单元格状态留下来。
+        self._gantt_signature: tuple | None = None
+        # 空闲时段总览的人员筛选：None = 不筛选（分组内全部成员）；
+        # 否则为选中成员 id 集合，空集表示一个都没选。
+        self._gantt_member_selection: set[int] | None = None
         self._dirty_schedule_sections: set[str] = set()
         self._pool = QThreadPool.globalInstance()
         self._busy = False
@@ -427,6 +434,28 @@ class MainWindow(QMainWindow):
             if any(studio.casefold() in targets
                    for studio in self.member_studios(m))
         ]
+
+    def gantt_selected_members(self) -> list:
+        """分组内且被「人员」筛选中勾选的成员；未筛选时等于分组全部成员。
+
+        空闲时段矩阵完全由成员列表驱动（每行一个成员、汇总列按成员数算分母），
+        所以筛选只需要在建矩阵前把成员列表缩小，忙闲判定与排班算法保持一致。
+        """
+        pool = self.gantt_members()
+        selection = self._gantt_member_selection
+        if selection is None:
+            return pool
+        return [m for m in pool if m.id in selection]
+
+    def gantt_export_scope(self) -> str:
+        """导出文件里的范围说明；未筛选时返回空串（不写说明行）。"""
+        if self._gantt_member_selection is None:
+            return ""
+        matrix = self.gantt_matrix
+        selected = matrix.member_count if matrix is not None else 0
+        return (f"筛选范围：所选 {selected}/{len(self.gantt_members())} 人"
+                f"（业务分组“{self.gantt_group_label()}”），"
+                "本表仅包含所选人员的空闲时段。")
 
     def gantt_group_label(self) -> str:
         if hasattr(self, "gantt_group"):
@@ -1241,6 +1270,14 @@ class MainWindow(QMainWindow):
         self.gantt_group.currentIndexChanged.connect(self._on_gantt_filter_changed)
         ctl.addWidget(self.gantt_group)
         ctl.addSpacing(8)
+        self.gantt_member_filter = ChecklistMenuButton(
+            hint="勾选一位或多位成员：表格与导出都只保留所选人员的空闲时段。"
+                 "点「全选」「全不选」可一键切换。")
+        self.gantt_member_filter.setAccessibleName("空闲时段人员筛选")
+        self.gantt_member_filter.selectionChanged.connect(
+            self._on_gantt_member_filter_changed)
+        ctl.addWidget(self.gantt_member_filter)
+        ctl.addSpacing(8)
         ctl.addWidget(QLabel("查看周次"))
         self.gantt_week = QSpinBox()
         self.gantt_week.setRange(1, 25)
@@ -1264,6 +1301,9 @@ class MainWindow(QMainWindow):
             dot.setStyleSheet(f"background:{color};border-radius:3px;")
             label = QLabel(text_value)
             label.setObjectName("legendText")
+            if text_value == "全员空闲":
+                # 人员筛选后橙色的含义变成「所选人员都空闲」，图例文案要跟着改
+                self.gantt_legend_all_free = label
             legend_layout.addWidget(dot, index // 3, (index % 3) * 2)
             legend_layout.addWidget(label, index // 3, (index % 3) * 2 + 1)
         ctl.addWidget(legend)
@@ -2417,15 +2457,52 @@ class MainWindow(QMainWindow):
             self.refresh_charts()
 
     def _on_gantt_filter_changed(self) -> None:
+        # 换业务分组后成员完全不同，人员筛选回到「全部」，避免筛选残留成空表
+        self._gantt_member_selection = None
         if self.tabs.tabText(self.tabs.currentIndex()) == "空闲时段总览":
             self.refresh_gantt()
+
+    def _on_gantt_member_filter_changed(self) -> None:
+        """人员勾选变化即时生效：只重算所选人员的矩阵、表格与导出范围。"""
+        widget = getattr(self, "gantt_member_filter", None)
+        if widget is None:
+            return
+        checked = widget.checked_values()
+        # 全部勾选等价于「不筛选」：这样按钮文案、提示语与导出文件名都能回到全量口径
+        self._gantt_member_selection = (
+            None if len(checked) == widget.total_count else checked)
+        if self.tabs.tabText(self.tabs.currentIndex()) == "空闲时段总览":
+            self.refresh_gantt()
+
+    def _sync_gantt_member_filter(self, pool: list) -> None:
+        """把分组内成员同步到人员筛选控件，并按实际勾选情况回写筛选状态。
+
+        成员被删除或换了业务分组时，失效的 id 直接剔除；筛选控件是勾选状态的
+        唯一来源，页面刷新不会把用户的选择重置掉。
+        """
+        widget = getattr(self, "gantt_member_filter", None)
+        if widget is None:
+            return
+        selection = self._gantt_member_selection
+        if selection is not None:
+            selection = selection & {m.id for m in pool}
+            self._gantt_member_selection = selection
+        widget.set_items(
+            [(m.id, m.name) for m in pool],
+            default_checked=selection is None,
+        )
+        checked = widget.checked_values()
+        self._gantt_member_selection = (
+            None if len(checked) == len(pool) else checked)
 
     def _sync_gantt_week(self, week: int) -> None:
         """值班起始周变化时空闲时段总览跟随，切到总览页即在排班起始周"""
         self.gantt_week.setValue(week)
 
     def refresh_gantt(self) -> None:
-        members = self.gantt_members()
+        pool = self.gantt_members()
+        self._sync_gantt_member_filter(pool)
+        members = self.gantt_selected_members()
         all_member_count = len(self.members())
         checked_weekdays = [
             d for d, cb in self.weekday_checks.items() if cb.isChecked()]
@@ -2437,7 +2514,13 @@ class MainWindow(QMainWindow):
             self.gantt_table.clearContents()
             self.gantt_table.setRowCount(0)
             self.gantt_table.setColumnCount(0)
-            if all_member_count and not members and self.roster_entries():
+            self._gantt_signature = None
+            self._gantt_cell_state = {}
+            if pool and not members:
+                self.gantt_hint.setText(
+                    "「人员」筛选当前为 0 人，表格与导出都没有内容。"
+                    "请在「人员」下拉里勾选至少一位成员，或在弹层里点「全选」。")
+            elif all_member_count and not pool and self.roster_entries():
                 self.gantt_hint.setText(
                     f"当前业务分组“{self.gantt_group_label()}”没有成员。"
                     "请切换业务分组，或到成员列表使用「修改工作室…」检查归属。")
@@ -2460,6 +2543,19 @@ class MainWindow(QMainWindow):
         self._fill_gantt_table(matrix)
 
         all_free = matrix.all_free_columns
+        unfiltered = self._gantt_member_selection is None
+        scope = (
+            f"当前分组“{self.gantt_group_label()}”全部 {matrix.member_count} 人"
+            if unfiltered else
+            f"当前分组“{self.gantt_group_label()}”所选 "
+            f"{matrix.member_count}/{len(pool)} 人")
+        # 筛选后「全员」指的是所选这批人，文案要跟着换，避免误读成整个分组
+        joint = "全员共同" if unfiltered else "所选人员共同"
+        per_slot = "全员" if unfiltered else "所选人员"
+        audience = "全员参加" if unfiltered else "这些人共同参加"
+        legend = getattr(self, "gantt_legend_all_free", None)
+        if legend is not None:
+            legend.setText("全员空闲" if unfiltered else "所选全空闲")
         if all_free:
             text = "、".join(
                 f"{column.date.month}月{column.date.day}日"
@@ -2467,14 +2563,14 @@ class MainWindow(QMainWindow):
                 f" {BLOCK_LABELS[column.block].split(' ')[0]}"
                 for column in all_free)
             self.gantt_hint.setText(
-                f"当前分组“{self.gantt_group_label()}”：第{matrix.week}周全员空闲时段"
+                f"{scope}：第{matrix.week}周{joint}空闲时段"
                 f"共 {len(all_free)} 个（橙色高亮行）：{text}。"
-                "适合安排需要全员参加的任务。")
+                f"适合安排需要{audience}的任务。")
         else:
             self.gantt_hint.setText(
-                f"当前分组“{self.gantt_group_label()}”：第{matrix.week}周没有全员空闲的时段；"
-                "汇总列为各时段空闲人数，选择空闲人数最多的时段最容易凑齐人。")
-        self.btn_export_gantt.setEnabled(True)
+                f"{scope}：第{matrix.week}周没有{joint}空闲的时段；"
+                f"汇总列为各时段{per_slot}空闲人数，选择空闲人数最多的时段最容易凑齐人。")
+        self.btn_export_gantt.setEnabled(matrix.member_count > 0)
 
     @staticmethod
     def _apply_cell(item: QTableWidgetItem, state: tuple) -> None:
@@ -2539,12 +2635,21 @@ class MainWindow(QMainWindow):
 
         columns = m.columns
         rows, cols = len(columns), m.member_count + 1
-        if t.rowCount() != rows or t.columnCount() != cols:
+        # 成员列 + 时段列共同构成表格身份：人员筛选换人后人数可能完全不变，
+        # 若只看行列数就会沿用旧缓存，把上一个成员的单元格状态留在屏幕上。
+        signature = (
+            tuple(m.member_names),
+            tuple((c.date, c.block, c.is_off) for c in columns),
+        )
+        structure_changed = t.rowCount() != rows or t.columnCount() != cols
+        if structure_changed:
             t.clearContents()
             t.setRowCount(rows)
             t.setColumnCount(cols)
+        if structure_changed or signature != self._gantt_signature:
             cache = {}
             self._gantt_cell_state = cache
+            self._gantt_signature = signature
         else:
             cache = self._gantt_cell_state
         t.setHorizontalHeaderLabels(m.member_names + ["空闲人数"])
@@ -2610,19 +2715,24 @@ class MainWindow(QMainWindow):
 
     def export_gantt(self) -> None:
         m = self.gantt_matrix
-        if m is None:
+        if m is None or m.member_count == 0:
+            # 人员筛选为 0 人时矩阵为空，导出一张空表没有意义
             return
         group = self.gantt_group_label().replace("/", "-")
+        # 筛选状态下文件名带人数，避免全量表与筛选表重名、发出去分不清
+        scope = ("" if self._gantt_member_selection is None
+                 else f"_筛选{m.member_count}人")
         path, _ = QFileDialog.getSaveFileName(
             self, "导出空闲时段总览 Excel",
-            f"空闲时段总览_{group}_第{m.week}周.xlsx",
+            f"空闲时段总览_{group}_第{m.week}周{scope}.xlsx",
             "Excel 文件 (*.xlsx)")
         if not path:
             return
         target = Path(path)
+        note = self.gantt_export_scope()
         self.run_async(
             "正在导出空闲时段总览",
-            lambda: target.write_bytes(export_gantt_excel(m)),
+            lambda: target.write_bytes(export_gantt_excel(m, note=note)),
             lambda _r: self.statusBar().showMessage(f"已导出空闲时段总览 Excel：{target}"))
 
     # ---------- 统计图表 ----------

@@ -443,10 +443,31 @@ def build_calendar_availability(
     )
 
 
-def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
-    """导出带填充色的 Excel 空闲时段总览，返回文件字节。"""
+def _write_scope_note(ws, note: str, row: int) -> None:
+    """在表格下方写一行灰色说明，说清「本表只包含哪些人」。
+
+    只在写完数据、跑完 fit_excel_layout 之后调用：说明文字是给读者看的，
+    不参与列宽/行高计算，否则一行长文本会把整表行高撑起来。文字写在第一列
+    且不自动换行，右侧单元格为空时会自然向右溢出，行高保持一行。
+    """
+    if not note:
+        return
+    from openpyxl.styles import Alignment, Font
+
+    cell = ws.cell(row=row, column=1, value=note)
+    cell.font = Font(size=9, italic=True, color="86868B")
+    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    ws.row_dimensions[row].height = 16.0
+
+
+def export_gantt_excel(matrix: AvailabilityMatrix, note: str = "") -> bytes:
+    """导出带填充色的 Excel 空闲时段总览，返回文件字节。
+
+    ``note`` 非空时在表格末尾追加一行范围说明（人员筛选后写清「本表只含
+    所选人员」），让导出的文件脱离界面也能说明自己的口径。
+    """
     if isinstance(matrix, CalendarAvailabilityMatrix):
-        return _export_calendar_gantt_excel(matrix)
+        return _export_calendar_gantt_excel(matrix, note=note)
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -561,12 +582,16 @@ def export_gantt_excel(matrix: AvailabilityMatrix) -> bytes:
         header_rows=2,
         min_row_height=32.0,
     )
+    _write_scope_note(ws, note, row=3 + len(columns))
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
+def _export_calendar_gantt_excel(
+    matrix: CalendarAvailabilityMatrix,
+    note: str = "",
+) -> bytes:
     """导出自然日期周版本的空闲时段总览（横轴=成员，纵轴=日期x时段）。"""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -673,6 +698,7 @@ def _export_calendar_gantt_excel(matrix: CalendarAvailabilityMatrix) -> bytes:
         header_rows=2,
         min_row_height=32.0,
     )
+    _write_scope_note(ws, note, row=3 + len(matrix.columns))
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
